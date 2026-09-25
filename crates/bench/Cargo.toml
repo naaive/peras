@@ -1,0 +1,25 @@
+[package]
+name = "agent-bench"
+description = "Benchmarks and budget checks for the performance budgets in docs/design.md, plus golden replay of vendor encodings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+agent-proto.workspace = true
+agent-kernel.workspace = true
+agent-runtime.workspace = true
+agent-adapters.workspace = true
+agent-sim.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "budgets"
+harness = false
