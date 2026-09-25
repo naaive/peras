@@ -5,6 +5,7 @@ use crate::render::{self, RuleSet};
 use crate::state::State;
 use agent_proto::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,7 +133,7 @@ pub(crate) fn head_tokens(head: &SeqHead) -> u32 {
 }
 
 pub(crate) fn estimated_total(s: &State) -> u32 {
-    let h = s.head.as_ref().map(head_tokens).unwrap_or(0);
+    let h = s.head.as_deref().map(head_tokens).unwrap_or(0);
     h + s.context.iter().map(|e| e.rendered.tokens).sum::<u32>()
 }
 
@@ -199,6 +200,16 @@ pub(crate) fn plan_trims(s: &State, forced: bool) -> Vec<Replacement> {
     };
     let keep = profile(s).preview_bytes as usize;
     let mut out = Vec::new();
+    // Fragments per seq and the last snapshot of each key (one pass, so the
+    // plan stays linear in the context length).
+    let mut per_seq: BTreeMap<Seq, usize> = BTreeMap::new();
+    let mut last_snapshot: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, x) in ctx.iter().enumerate() {
+        *per_seq.entry(x.seq).or_default() += 1;
+        if let EntryKind::Snapshot { key } = &x.kind {
+            last_snapshot.insert(key.as_str(), i);
+        }
+    }
     for (i, e) in ctx.iter().enumerate().take(end) {
         let rep = |kind, content: Vec<Rendered>| Replacement {
             kind,
@@ -208,12 +219,12 @@ pub(crate) fn plan_trims(s: &State, forced: bool) -> Vec<Replacement> {
             content,
         };
         // Replacement fragments share a seq; only touch entries that own theirs.
-        if ctx.iter().filter(|x| x.seq == e.seq).count() != 1 {
+        if per_seq.get(&e.seq) != Some(&1) {
             continue;
         }
         match &e.kind {
             EntryKind::Snapshot { key } => {
-                let superseded = ctx[i + 1..].iter().any(|x| matches!(&x.kind, EntryKind::Snapshot { key: k } if k == key));
+                let superseded = last_snapshot.get(key.as_str()).is_some_and(|&last| last > i);
                 if superseded {
                     out.push(rep(ReplacementKind::Trim, vec![]));
                 }
@@ -243,7 +254,8 @@ pub(crate) fn plan_trims(s: &State, forced: bool) -> Vec<Replacement> {
 #[derive(Debug, Clone)]
 pub(crate) struct SummaryPlan {
     pub range: (Seq, Seq),
-    pub body: Vec<Rendered>,
+    /// The segment is the first `entries` context fragments.
+    pub entries: usize,
 }
 
 fn plan_from(ctx: &[Entry], upto: usize) -> Option<SummaryPlan> {
@@ -257,7 +269,7 @@ fn plan_from(ctx: &[Entry], upto: usize) -> Option<SummaryPlan> {
     }
     let lo = part.iter().map(|e| e.seq).min()?;
     let hi = part.iter().map(|e| e.seq).max()?;
-    Some(SummaryPlan { range: (lo, hi), body: part.iter().map(|e| (*e.rendered).clone()).collect() })
+    Some(SummaryPlan { range: (lo, hi), entries: upto })
 }
 
 /// Pressure path: everything before the verbatim tail.

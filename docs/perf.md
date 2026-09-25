@@ -36,7 +36,44 @@ AGENT_BENCH_REPORT_ONLY=1 cargo test -p agent-bench --release --test budgets -- 
 This is a shared cloud VM, and other builds were running while it was measured,
 so treat tail numbers (p99, max) as upper bounds.
 
-## Results (2026-09-25)
+## Results
+
+### After: requests journaled by reference (event schema 2)
+
+`EffectIssued` for a sample now stores `SampleRef { seq_no, entries,
+max_tokens }` and a compaction stores `CompactRef` (the same plus the
+instruction text), instead of the whole prompt. The kernel rebuilds the
+request from the fold (see [design.md](design.md), "Journal"). The kernel also
+stopped deep-copying session-long lists on every `decide` (context
+operations, checkpoints, irreversible calls and the event index are now
+chunked and shared), and the trim planner is linear in the context length.
+
+Criterion (`cargo bench -p agent-bench`), same machine:
+
+| Metric | Budget | Before | After | Verdict |
+| --- | --- | --- | --- | --- |
+| Kernel decide + evolve per input | p99 < 1 ms | mean 0.52 ms, p99 1.69 ms, max 8.5 ms | mean 0.092 ms, p50 0.066 ms, **p99 0.33 ms**, max 7.6 ms (n = 79101) | within budget |
+| Journal append, SQLite WAL + fsync | p99 < 10 ms | mean 1.52 ms, p99 14.2 ms, max 22 ms | mean 0.45 ms, p50 0.39 ms, **p99 1.5 ms**, max 25 ms (n = 27256) | within budget |
+| Resume a 10k-event session: fold only | < 1 s | 182 ms | **21.7 ms** | within budget |
+| Resume a 10k-event session: SQLite load + fold | < 1 s | 5.0 s | **178 ms** | within budget |
+| Framework overhead to first token, in-memory journal | p99 < 50 ms | mean 5.3 ms, p99 18.9 ms | mean 0.70 ms, **p99 2.7 ms** | within budget |
+| Framework overhead to first token, SQLite journal | p99 < 50 ms | mean 1.5 ms, p99 7.9 ms | mean 1.2 ms, **p99 4.0 ms** | within budget |
+| Journal size, 10,059-event session | (none) | 362 MB (348 MB in sample effects) | **10.5 MB** (0.28 MB in sample/compact effects) | linear |
+
+The shadow snapshot is unaffected by this change (see below).
+
+The budget test (`tests/budgets.rs`, release, `AGENT_BENCH_REPORT_ONLY=1`)
+agrees: kernel p99 0.34 ms (0.46 ms before the chunked lists, 1.7 to 1.9 ms
+before the change), append p99 1.1 ms (was 15.4 ms), fold 21 ms (was 188 ms),
+load + fold 182 ms (was 5.3 s), of which 165 ms is the SQLite load and JSON
+decode, first token p99 1.4 ms (memory) and 2.7 ms (SQLite).
+
+The kernel max (a few ms, on a handful of inputs out of tens of thousands)
+has not been investigated; this VM is shared, see "Machine". Per input kind,
+`Completed(Executed)` has the highest p99 (0.44 ms): it appends 4 KB tool
+results and runs the pressure checks.
+
+### Before (2026-09-25, event schema 1)
 
 | Metric | Budget | Measured | Verdict |
 | --- | --- | --- | --- |
@@ -84,41 +121,44 @@ load + fold 5.3 s, first token p99 7.6 ms (memory) and 11.2 ms (SQLite).
 
 ## Findings
 
-1. **The journal grows quadratically.** Each `EffectIssued(Sample)` event
-   stores the whole prompt inline. In the 10k-event session this adds up to
-   348 MB of the journal's 362 MB of JSON (96%). This one cause explains most
-   of the misses:
-   - SQLite load + fold takes 5 s. Of that, 4.9 s is the load, which reads
-     and JSON-decodes about 362 MB.
-   - The append tail (p99 14 ms) comes from batches that carry a
-     several-hundred-KB prompt.
-   - Building and cloning that prompt in `decide` is probably part of the
-     kernel's p99 as well. This has not been profiled.
-
-   Storing the sample by reference (sequence head plus the seq range of
-   context entries, or a content hash) would make the journal linear and bring
-   resume well under 1 s: the fold alone takes 182 ms.
-2. **Kernel p99 is 1.7x the budget.** The mean (0.52 ms) is fine. The tail
-   comes from inputs late in a context window. It looks linear in the number
-   of context entries (prompt assembly, token estimation, cloning
-   `Rendered`). This has not been profiled yet.
+1. **The journal grew quadratically (fixed).** Each `EffectIssued(Sample)`
+   event stored the whole prompt inline: 348 MB of the 10k-event session's
+   362 MB of JSON (96%). That explained most of the misses: 4.9 s of the 5 s
+   resume was reading and decoding the JSON, the append tail came from batches
+   carrying a several-hundred-KB prompt, and `decide` deep-copied the prompt
+   into the event and `evolve` copied it again into the state. Samples and
+   compactions are now journaled by reference (event schema 2); the read-time
+   upgrader converts old `effect_issued` events, so old journals still load.
+   The dispatched request, the one `outstanding` re-dispatches after a crash
+   and the one the debug consistency check derives are all rebuilt from the
+   fold and compared byte for byte in the kernel tests, the fault-injection
+   test and the golden replay.
+2. **Kernel per-input cost (fixed).** Besides the prompt copies, `decide`
+   clones the state for every input, and some lists in it grew with the whole
+   session (context operations, checkpoints, the event-id index, which was
+   also re-copied in full every 512 events). They are now split into shared
+   chunks, so a clone is proportional to the live context, not to the session.
+   The fold of 10k events went from 182 ms to 21 ms for the same reasons.
 3. **The shadow scan is linear in workspace size** because it does not use a
    file watcher. At 20k files it takes 78 ms, within budget. At 100k files it
    takes 450 ms, over budget. The design's 100k budget assumes that file
    watching is available, and the watcher has not been implemented yet.
-4. **First-token overhead is well within budget.** The SQLite journal is
-   faster here than `MemJournal`, because `MemJournal` round-trips every
-   appended envelope through JSON by default.
+4. **First-token overhead is well within budget.** The SQLite journal was
+   faster here than `MemJournal` before the change, because `MemJournal`
+   round-trips every appended envelope through JSON by default and the
+   envelopes carried the prompt.
 
 ## Golden replay
 
 The fixtures for the golden replay tests are in `crates/sim/tests/golden/`:
 
 - `session.jsonl`: the recorded session, as JSON Lines of `Envelope<Event>`.
-  It is produced once by a deterministic `KernelSim` + `Script` scenario that
+  It was produced once by a deterministic `KernelSim` + `Script` scenario that
   includes tools, an approved edit and a denied edit, trims, a summary and a
-  rewind. The first `user_message` is stored in the old schema-0 shape, so
-  that replay goes through the read-time upgrader.
+  rewind. It is an old recording (event schema 1, every sample and compaction
+  with its full prompt) and is never regenerated: replay goes through the
+  read-time upgrader. The first `user_message` is stored in the schema-0
+  shape.
 - `prompt.json`: the final `agent_kernel::current_prompt`.
 - `requests.anthropic.jsonl`, `requests.openai.jsonl`: the byte-exact output
   of `AnthropicEncoderV1` and `OpenAiEncoderV1` for every `Sample` in the
@@ -127,13 +167,16 @@ The fixtures for the golden replay tests are in `crates/sim/tests/golden/`:
 The checks run in two test files:
 
 - `crates/sim/tests/golden_replay.rs` re-folds the fixture through
-  `agent_proto::upgrade::read_envelope`. It checks that every recorded Sample
-  prompt equals the prompt rebuilt from the fold, and that the final prompt
-  matches byte for byte.
+  `agent_proto::upgrade::read_envelope`. It checks that every sample and
+  compaction, upgraded to a `SampleRef` / `CompactRef`, rebuilds from the fold
+  (and from `Kernel::outstanding`) to exactly the prompt stored in the old
+  recording, that running the scenario today journals exactly the upgraded
+  fixture, and that the final prompt matches byte for byte.
 - `crates/bench/tests/golden_replay.rs` checks the vendor encodings. It lives
   in `crates/bench` because agent-sim does not depend on the adapters.
 
-To regenerate the fixtures after an intentional change:
+To regenerate the expected outputs after an intentional change
+(`session.jsonl` is only created when missing):
 
 ```sh
 UPDATE_GOLDEN=1 cargo test -p agent-sim --test golden_replay

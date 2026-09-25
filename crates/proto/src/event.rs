@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 
 /// Current schema version of [`Event`]. Bump when a variant changes shape and add
 /// an upgrade step in [`crate::upgrade`].
-pub const EVENT_SCHEMA: u16 = 1;
+///
+/// - 0 -> 1: `user_message.attachments`.
+/// - 1 -> 2: `effect_issued` stores `sample_ref` / `compact_ref` instead of the
+///   full `sample` / `compact` prompt (the journal stays linear in length).
+pub const EVENT_SCHEMA: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +84,10 @@ pub enum Event {
 
     // ---- effects / verdicts ----
     /// Written before the effect is dispatched (log first, then act).
+    ///
+    /// Samples and compactions are journaled by reference
+    /// ([`Effect::SampleRef`] / [`Effect::CompactRef`]): the prompt is rebuilt
+    /// from the fold instead of being stored again with every request.
     EffectIssued { id: EffectId, effect: Effect },
     /// An issued effect finished (its content is in the specific event).
     EffectSettled { id: EffectId },

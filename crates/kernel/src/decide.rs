@@ -173,12 +173,20 @@ impl Cx {
         self.emit(Draft { parent: Parent::Head, origin, trust, audience: Audience::Both, body, rendered });
     }
 
+    /// Issue an effect: journal it, then (unless paused) dispatch it. Requests
+    /// (`Sample` / `Compact`) are journaled by reference; the dispatched request
+    /// is rebuilt from what the fold captured, so it is the same one recovery
+    /// would re-dispatch.
     fn issue(&mut self, e: Effect) -> EffectId {
         let id = EffectId { epoch: self.s.epoch, n: self.s.next_n };
         let paused = self.s.paused;
-        self.internal(Event::EffectIssued { id, effect: e.clone() });
+        let plain = (!e.is_journal_ref()).then(|| e.clone());
+        self.internal(Event::EffectIssued { id, effect: e });
         if !paused {
-            self.out.effects.push((id, e));
+            let d = plain.or_else(|| self.s.issued.get(&id).map(|i| i.dispatchable()));
+            if let Some(d) = d {
+                self.out.effects.push((id, d));
+            }
         }
         id
     }
@@ -344,7 +352,7 @@ impl Cx {
                         .s
                         .held
                         .iter()
-                        .filter_map(|id| self.s.issued.get(id).map(|e| (*id, (**e).clone())))
+                        .filter_map(|id| self.s.issued.get(id).map(|e| (*id, e.dispatchable())))
                         .collect();
                     self.user(Event::Resumed);
                     self.out.effects.extend(held);
@@ -541,18 +549,18 @@ impl Cx {
         if id.epoch != self.s.epoch {
             return Ok(false);
         }
-        let Some(eff) = self.s.issued.get(&id).map(|e| (**e).clone()) else { return Ok(false) };
+        let Some(eff) = self.s.issued.get(&id).map(|e| e.effect.clone()) else { return Ok(false) };
         if let EffectResult::Failed { error } = r {
             self.settle(id);
             self.on_failed(eff, error);
             return Ok(true);
         }
         match (eff, r) {
-            (Effect::Sample(_), EffectResult::Sampled(message)) => {
+            (Effect::Sample(_) | Effect::SampleRef(_), EffectResult::Sampled(message)) => {
                 self.settle(id);
                 self.visible(Origin::Model, Trust::Internal, Event::AssistantReplied { message, effect: id });
             }
-            (Effect::Sample(_), EffectResult::SampleFailed(err)) => {
+            (Effect::Sample(_) | Effect::SampleRef(_), EffectResult::SampleFailed(err)) => {
                 self.settle(id);
                 self.sample_failed(err);
             }
@@ -564,13 +572,19 @@ impl Cx {
                 self.settle(id);
                 self.gated(req, verdict, responder, remember);
             }
-            (Effect::Compact(job), EffectResult::Compacted { summary, trust }) => {
+            (
+                Effect::Compact(CompactJob { range, overflow, .. }) | Effect::CompactRef(CompactRef { range, overflow, .. }),
+                EffectResult::Compacted { summary, trust },
+            ) => {
                 self.settle(id);
-                self.compacted(job, summary, trust);
+                self.compacted(range, overflow, summary, trust);
             }
-            (Effect::Compact(job), EffectResult::CompactFailed(err)) => {
+            (
+                Effect::Compact(CompactJob { overflow, .. }) | Effect::CompactRef(CompactRef { overflow, .. }),
+                EffectResult::CompactFailed(err),
+            ) => {
                 self.settle(id);
-                if job.overflow {
+                if overflow {
                     self.fail_turn(format!("context overflow: compaction failed: {err}"));
                 }
             }
@@ -627,9 +641,9 @@ impl Cx {
                 };
                 self.gated(req, v, Responder::Kernel, false);
             }
-            Effect::Sample(_) => self.fail_turn(error),
-            Effect::Compact(job) => {
-                if job.overflow {
+            Effect::Sample(_) | Effect::SampleRef(_) => self.fail_turn(error),
+            Effect::Compact(CompactJob { overflow, .. }) | Effect::CompactRef(CompactRef { overflow, .. }) => {
+                if overflow {
                     self.fail_turn(format!("context overflow: compaction failed: {error}"));
                 }
             }
@@ -856,8 +870,10 @@ impl Cx {
 
     fn issue_compact(&mut self, plan: SummaryPlan, overflow: bool) {
         let cfg = self.cfg().clone();
-        let Some(head) = self.s.head.clone() else { return };
-        let mut body = if overflow { plan.body } else { self.s.context.iter().map(|e| (*e.rendered).clone()).collect() };
+        let Some(seq_no) = self.s.head.as_ref().map(|h| h.seq_no) else { return };
+        // Pressure path: the current request replayed verbatim; overflow path:
+        // only the earliest segment. Both are prefixes of the context.
+        let entries = if overflow { plan.entries } else { self.s.context.len() };
         let preserve = match self.s.turn.as_ref().map(|t| &t.precompact) {
             Some(PreCompact::Ready(p) | PreCompact::Done(p)) => p.clone(),
             _ => vec![],
@@ -870,16 +886,22 @@ impl Cx {
                 instruction.push_str(p.trim());
             }
         }
-        body.push(Rendered::text(Role::User, instruction));
         let max_tokens = self.s.caps.as_ref().map(|c| c.max_output).unwrap_or(cfg.caps.max_output);
-        self.issue(Effect::Compact(CompactJob { prompt: Prompt { head, body, max_tokens }, range: plan.range, overflow }));
+        self.issue(Effect::CompactRef(CompactRef {
+            seq_no,
+            entries: entries as u32,
+            instruction,
+            max_tokens,
+            range: plan.range,
+            overflow,
+        }));
     }
 
-    fn compacted(&mut self, job: CompactJob, summary: String, trust: Trust) {
+    fn compacted(&mut self, range: (Seq, Seq), overflow: bool, summary: String, trust: Trust) {
         if self.s.turn.is_none() {
             return;
         }
-        let entries = context::entries_in(&self.s, job.range);
+        let entries = context::entries_in(&self.s, range);
         if entries.is_empty() {
             return;
         }
@@ -903,14 +925,14 @@ impl Cx {
         }
         let rendered = render::summary(&RuleSet::default(), &self.profile(), &trust, &summary);
         if rendered.tokens >= replaced_tokens {
-            if job.overflow {
+            if overflow {
                 self.fail_turn("context overflow: summary did not shorten history".into());
             }
             return;
         }
         self.replaced(Replacement {
             kind: ReplacementKind::Summary,
-            range: job.range,
+            range,
             sources,
             untrusted_sources: labels,
             content: vec![rendered],
@@ -924,7 +946,7 @@ impl Cx {
         if stale {
             self.open_sequence(false);
         }
-        if job.overflow && context::usage(&self.s) > context::hard_limit(&self.s) {
+        if overflow && context::usage(&self.s) > context::hard_limit(&self.s) {
             if let Some(plan) = context::plan_overflow_segment(&self.s) {
                 self.issue_compact(plan, true);
             }
@@ -1208,18 +1230,16 @@ impl Cx {
                 _ => {}
             }
         }
-        let prompt = self.prompt();
-        match prompt {
-            Some(p) => {
-                self.issue(Effect::Sample(p));
+        // The request is the head plus the whole context (see `current_prompt`).
+        match self.s.head.as_ref().map(|h| h.seq_no) {
+            Some(seq_no) => {
+                let entries = self.s.context.len() as u32;
+                let max_tokens = crate::max_tokens(&self.s);
+                self.issue(Effect::SampleRef(SampleRef { seq_no, entries, max_tokens }));
             }
             None => self.fail_turn("no request sequence open".into()),
         }
         true
-    }
-
-    fn prompt(&self) -> Option<Prompt> {
-        crate::current_prompt(&self.s)
     }
 
     fn snapshots(&mut self) {

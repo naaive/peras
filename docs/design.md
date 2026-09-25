@@ -178,6 +178,7 @@ pub struct Envelope<E> {
 - **Blobs share the port**: long output, attachments, and original file contents are stored as content-addressed Blobs, managed by the same storage port as events; the Blob is written before the event, and garbage is collected by reachability.
 - **Snapshots are only a cache**: the folded state is saved periodically; loading = latest snapshot + the events after it; snapshots can be deleted at any time.
 - **Transient data stays out of the log**: token streams, progress, and heartbeats go through Pulse.
+- **Requests are logged by reference**: a request is a pure function of the sequence head, the stored renderings, and the encoder version, so `EffectIssued` for a sample stores only `SampleRef { seq_no, entries, max_tokens }` (the open sequence and the length of the context prefix it replays), and a compaction stores `CompactRef` (the same plus its instruction text). The dispatched Effect and the one re-dispatched on recovery are both rebuilt from the fold, byte for byte, so the log grows linearly with the session instead of repeating the whole context with every request.
 - **Unknown events**: plugin events can be marked "ignorable"; if an unknown, unmarked event is encountered on read, loading the session is refused rather than silently dropping it.
 - **Deletion**: a tombstone keeps the tree structure and erases the body; summaries and memories derived from it are purged in cascade.
 

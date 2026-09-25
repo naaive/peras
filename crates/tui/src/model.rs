@@ -223,7 +223,7 @@ impl Model {
             Event::UserMessage { text, .. } => self.transcript.push(Entry::User(text)),
             Event::Injected { source, text } => self.transcript.push(Entry::Notice(format!("[{source}] {text}"))),
             Event::EffectIssued { effect, .. } => match effect {
-                Effect::Sample(_) | Effect::Compact(_) => self.phase = Phase::Sampling,
+                Effect::Sample(_) | Effect::SampleRef(_) | Effect::Compact(_) | Effect::CompactRef(_) => self.phase = Phase::Sampling,
                 Effect::Execute(_) => self.phase = Phase::Acting,
                 Effect::Gate(_) if !self.pending.is_empty() => self.phase = Phase::Gated,
                 _ => {}

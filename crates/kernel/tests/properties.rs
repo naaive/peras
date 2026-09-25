@@ -206,7 +206,7 @@ impl Driver {
         }
         let r = match eff {
             Effect::Finish(_) => return,
-            Effect::Sample(_) => {
+            Effect::Sample(_) | Effect::SampleRef(_) => {
                 if benign {
                     EffectResult::Sampled(reply("done", vec![]))
                 } else {
@@ -244,7 +244,7 @@ impl Driver {
                 };
                 EffectResult::Gated { verdict, responder, remember: v % 4 == 0 }
             }
-            Effect::Compact(_) => {
+            Effect::Compact(_) | Effect::CompactRef(_) => {
                 if !benign && v % 10 == 9 {
                     EffectResult::CompactFailed(ModelError::Overloaded)
                 } else {
@@ -649,11 +649,17 @@ fn check_taint_monotone(d: &Driver) {
 fn check_cache_prefix(d: &Driver) {
     let mut last: Option<(u32, Vec<String>)> = None;
     let mut replaced = false;
+    let requests = journal_requests(&d.h.log);
     for e in &d.h.log {
+        let sample = requests.iter().find_map(|(seq, _, r)| match r {
+            Effect::Sample(p) if *seq == e.seq => Some(p),
+            _ => None,
+        });
         match &e.body {
             Event::Replaced(_) | Event::RewindCompleted { .. } | Event::Tombstone { .. } => replaced = true,
             Event::SequenceOpened { .. } => last = None,
-            Event::EffectIssued { effect: Effect::Sample(p), .. } => {
+            Event::EffectIssued { .. } if sample.is_some() => {
+                let p = sample.unwrap();
                 let body: Vec<String> = p.body.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
                 if let Some((seq, prev)) = &last {
                     if !replaced && *seq == p.head.seq_no {
@@ -694,7 +700,7 @@ proptest! {
             let mut kinds: BTreeSet<String> = BTreeSet::new();
             for e in &d.h.log {
                 let k = match &e.body {
-                    Event::EffectIssued { effect: Effect::Compact(j), .. } => format!("compact:{}", j.overflow),
+                    Event::EffectIssued { effect: Effect::CompactRef(j), .. } => format!("compact:{}", j.overflow),
                     Event::EffectIssued { effect: Effect::Gate(g), .. } => format!("gate:{:?}", g.point),
                     Event::Plugin { kind, .. } => format!("plugin:{kind}"),
                     Event::Replaced(r) => format!("replaced:{:?}", r.kind),

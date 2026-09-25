@@ -14,6 +14,29 @@ pub struct H {
     /// Every step taken: journal length before it, and the input (`None` for
     /// an event appended directly, the way the runtime appends tombstones).
     pub steps: Vec<(usize, Option<(Timestamp, Input)>)>,
+    /// Every issued effect as rebuilt from the journal (`rebuild_effect` on the
+    /// fold just before its `EffectIssued`), in issue order.
+    pub requests: Vec<(EffectId, Effect)>,
+}
+
+/// JSON of a value (byte-exact comparisons).
+pub fn json<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v).unwrap()
+}
+
+/// Fold `log` and rebuild every issued effect from the fold just before its
+/// `EffectIssued`: `(seq of the EffectIssued, id, rebuilt effect)`.
+pub fn journal_requests(log: &[Envelope<Event>]) -> Vec<(Seq, EffectId, Effect)> {
+    let mut s = State::default();
+    let mut out = vec![];
+    for e in log {
+        if let Event::EffectIssued { id, effect } = &e.body {
+            let rebuilt = rebuild_effect(&s, effect).unwrap_or_else(|| panic!("{id}: {effect:?} does not rebuild"));
+            out.push((e.seq, *id, rebuilt));
+        }
+        Kernel::evolve(&mut s, e);
+    }
+    out
 }
 
 pub fn cfg() -> KernelConfig {
@@ -87,7 +110,7 @@ pub fn ok(call: &ToolCall, text: &str) -> ToolResult {
 
 impl H {
     pub fn new(c: KernelConfig) -> H {
-        let mut h = H { s: State::default(), log: vec![], at: 1_000, pending: vec![], steps: vec![] };
+        let mut h = H { s: State::default(), log: vec![], at: 1_000, pending: vec![], steps: vec![], requests: vec![] };
         let d = start_session("s1".into(), "hash".into(), c);
         h.apply(d);
         h
@@ -118,8 +141,28 @@ impl H {
                 body: draft.body,
                 rendered: draft.rendered,
             };
+            if let Event::EffectIssued { id, effect } = &env.body {
+                // The journal holds requests by reference only.
+                assert!(
+                    !matches!(effect, Effect::Sample(_) | Effect::Compact(_)),
+                    "{id}: full prompt journaled in EffectIssued"
+                );
+                let rebuilt = rebuild_effect(&self.s, effect).unwrap_or_else(|| panic!("{id}: {effect:?} does not rebuild"));
+                self.requests.push((*id, rebuilt));
+            }
             Kernel::evolve(&mut self.s, &env);
             self.log.push(env);
+        }
+        // Every dispatched effect is, byte for byte, the one rebuilt from the
+        // journal, and the one `outstanding` would re-dispatch after a crash.
+        let outstanding = Kernel::outstanding(&self.s);
+        for (id, eff) in &d.effects {
+            assert!(!eff.is_journal_ref(), "{id}: dispatched a journal reference");
+            let (_, rebuilt) = self.requests.iter().find(|(i, _)| i == id).expect("issued");
+            assert_eq!(json(eff), json(rebuilt), "{id}: dispatched request differs from the journal");
+            if let Some((_, o)) = outstanding.iter().find(|(i, _)| i == id) {
+                assert_eq!(json(eff), json(o), "{id}: outstanding differs from the dispatched request");
+            }
         }
         self.pending.extend(d.effects.iter().cloned());
         d.effects
@@ -184,11 +227,11 @@ impl H {
     }
 
     pub fn last_prompt(&self) -> Prompt {
-        self.log
+        self.requests
             .iter()
             .rev()
-            .find_map(|e| match &e.body {
-                Event::EffectIssued { effect: Effect::Sample(p), .. } => Some(p.clone()),
+            .find_map(|(_, e)| match e {
+                Effect::Sample(p) => Some(p.clone()),
                 _ => None,
             })
             .expect("a sample was issued")

@@ -91,7 +91,7 @@ pub fn context_sources(s: &State) -> Vec<ContextSource> {
 
 /// Head of the current request sequence.
 pub fn current_head(s: &State) -> Option<&SeqHead> {
-    s.head.as_ref()
+    s.head.as_deref()
 }
 
 /// The configuration currently in force.
@@ -106,10 +106,29 @@ pub fn pending_questions(s: &State) -> Vec<Question> {
 
 /// The prompt the next `Sample` would carry (for request/journal consistency
 /// assertions in debug builds).
+///
+/// A `Sample` issued in state `s` is journaled as
+/// `SampleRef { seq_no, entries: context.len(), max_tokens }` and carries
+/// exactly this prompt.
 pub fn current_prompt(s: &State) -> Option<Prompt> {
-    let head = s.head.clone()?;
-    let max_tokens = s.caps.as_ref().map(|c| c.max_output).unwrap_or(8_192);
-    Some(Prompt { head, body: context(s), max_tokens })
+    let head = (**s.head.as_ref()?).clone();
+    Some(Prompt { head, body: context(s), max_tokens: max_tokens(s) })
+}
+
+pub(crate) fn max_tokens(s: &State) -> u32 {
+    s.caps.as_ref().map(|c| c.max_output).unwrap_or(8_192)
+}
+
+/// Rebuild the request a journaled reference (`SampleRef` / `CompactRef`)
+/// stands for, from `s` = the fold of the journal up to (not including) its
+/// `EffectIssued`. Other effects are returned as they are. `None` when the
+/// reference does not match `s` (another sequence, longer than the context).
+///
+/// This is the same rebuild `outstanding` and `decide` use, so it yields the
+/// request that was dispatched, byte for byte.
+pub fn rebuild_effect(s: &State, journaled: &Effect) -> Option<Effect> {
+    let d = state::Issued::capture(s, journaled).dispatchable();
+    (!d.is_journal_ref()).then_some(d)
 }
 
 /// Whether dispatch is paused (`Control::Pause`); effects issued meanwhile are

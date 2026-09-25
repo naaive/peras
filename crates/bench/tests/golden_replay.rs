@@ -1,7 +1,7 @@
 //! Golden replay, vendor side: the recorded session in
 //! `crates/sim/tests/golden/session.jsonl` is re-folded with `Kernel::evolve`
-//! (through the read-time upgrader); for every `Sample` in the journal the
-//! prompt rebuilt from the fold is encoded with the frozen
+//! (through the read-time upgrader); for every `Sample` in the journal (a
+//! `SampleRef` since event schema 2) the prompt rebuilt from the fold is encoded with the frozen
 //! `AnthropicEncoderV1` and `OpenAiEncoderV1`, and the results must equal
 //! `requests.anthropic.jsonl` / `requests.openai.jsonl` byte for byte.
 //! This guards "historical requests are rebuilt byte-for-byte after upgrades".
@@ -14,7 +14,7 @@
 //! (after regenerating the fixture with the agent-sim test, if needed).
 
 use agent_adapters::{AnthropicEncoderV1, OpenAiEncoderV1};
-use agent_kernel::{current_prompt, Decider, Kernel, State};
+use agent_kernel::{current_prompt, rebuild_effect, Decider, Kernel, State};
 use agent_proto::upgrade::read_envelope;
 use agent_proto::*;
 use agent_runtime::Encoder;
@@ -45,12 +45,14 @@ fn rebuilt_prompts() -> Vec<(Seq, Prompt)> {
     let mut s = State::default();
     let mut out = vec![];
     for e in load_fixture() {
-        Kernel::evolve(&mut s, &e);
-        if let Event::EffectIssued { effect: Effect::Sample(recorded), .. } = &e.body {
-            let rebuilt = current_prompt(&s).expect("a sequence is open at every sample");
-            assert_eq!(&rebuilt, recorded, "prompt rebuilt from the fold differs at seq {}", e.seq);
+        // Upgraded to a reference (schema 2): rebuilt from the fold before it,
+        // which is the prompt `current_prompt` gives at that point.
+        if let Event::EffectIssued { effect: r @ Effect::SampleRef(_), .. } = &e.body {
+            let Some(Effect::Sample(rebuilt)) = rebuild_effect(&s, r) else { panic!("seq {}: no rebuild", e.seq) };
+            assert_eq!(Some(&rebuilt), current_prompt(&s).as_ref(), "rebuilt prompt differs at seq {}", e.seq);
             out.push((e.seq, rebuilt));
         }
+        Kernel::evolve(&mut s, &e);
     }
     out
 }

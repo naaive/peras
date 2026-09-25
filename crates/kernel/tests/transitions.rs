@@ -848,3 +848,63 @@ fn perf_smoke_long_session() {
     }
     eprintln!("clone+evolve {:?}; ctx {}", t.elapsed() / 100, context(&h.s).len());
 }
+
+#[test]
+fn samples_are_journaled_by_reference_and_rebuilt_exactly() {
+    let mut h = H::new(cfg());
+    h.submit("read a");
+    h.sample(reply("", vec![read_call("c1", "/ws/a")]));
+    let (id, _) = h.take("execute");
+    let eff = h.complete(id, EffectResult::Executed(vec![ok(&read_call("c1", "/ws/a"), "contents of a")]));
+    let (sid, sample) = eff.iter().find(|(_, e)| matches!(e, Effect::Sample(_))).expect("a sample");
+    let Effect::Sample(p) = sample else { unreachable!() };
+    // The journal holds only the reference: the open sequence and the length
+    // of the context (the whole context is the request body).
+    let issued = h
+        .log
+        .iter()
+        .find_map(|e| match &e.body {
+            Event::EffectIssued { id, effect } if id == sid => Some(effect.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        issued,
+        Effect::SampleRef(SampleRef { seq_no: p.head.seq_no, entries: p.body.len() as u32, max_tokens: p.max_tokens })
+    );
+    assert_eq!(Some(p), current_prompt(&h.s).as_ref());
+    // Crash recovery: a fresh fold re-dispatches the identical request.
+    let json = |e: &Effect| serde_json::to_string(e).unwrap();
+    let find = |s: &State| Kernel::outstanding(s).into_iter().find(|(i, _)| i == sid).map(|(_, e)| json(&e));
+    assert_eq!(find(&h.replay()), Some(json(sample)));
+    // A state snapshot taken while it is outstanding recovers it too.
+    let snap: State = serde_json::from_str(&serde_json::to_string(&h.s).unwrap()).unwrap();
+    assert_eq!(find(&snap), Some(json(sample)));
+    // Pausing holds the effect; resuming dispatches the rebuilt request.
+    let mut h2 = H::new(cfg());
+    h2.control(Control::Pause);
+    assert!(h2.submit("held").is_empty());
+    let resumed = h2.control(Control::Resume);
+    let [(_, Effect::Sample(held))] = &resumed[..] else { panic!("{resumed:?}") };
+    assert_eq!(held.body.len(), 1);
+    assert_eq!(held, &h2.last_prompt());
+}
+
+#[test]
+fn outstanding_request_is_the_one_captured_at_issue() {
+    // The request is captured when its EffectIssued is folded: later context
+    // changes (here a tombstone of the user message) do not alter what
+    // recovery re-dispatches.
+    let mut h = H::new(cfg());
+    let eff = h.submit("secret");
+    let [(sid, Effect::Sample(p))] = &eff[..] else { panic!("{eff:?}") };
+    let user = h.log.iter().find(|e| matches!(e.body, Event::UserMessage { .. })).unwrap().id.clone();
+    h.append(Event::Tombstone { target: user });
+    assert_ne!(current_prompt(&h.s).as_ref(), Some(p), "the tombstone changed the context");
+    for s in [h.s.clone(), h.replay()] {
+        let out = Kernel::outstanding(&s);
+        let [(id, Effect::Sample(o))] = &out[..] else { panic!("{out:?}") };
+        assert_eq!(id, sid);
+        assert_eq!(serde_json::to_string(o).unwrap(), serde_json::to_string(p).unwrap());
+    }
+}

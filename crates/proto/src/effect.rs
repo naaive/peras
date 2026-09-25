@@ -33,6 +33,41 @@ pub struct Prompt {
     pub max_tokens: u32,
 }
 
+/// Journaled form of [`Effect::Sample`] (only inside `Event::EffectIssued`).
+///
+/// The request is a pure function of the sequence head, the stored renderings
+/// and the encoder version, so the journal records only where to find it: the
+/// open sequence (`seq_no`) and the length of the model context when the effect
+/// was issued. The full [`Prompt`] is rebuilt from the fold (the head of
+/// sequence `seq_no` plus the first `entries` context fragments), which keeps the
+/// journal linear in the session length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SampleRef {
+    /// Sequence number of the head the request was built on.
+    pub seq_no: u32,
+    /// Number of context fragments in the request body (a prefix of the
+    /// context at issue time: the whole context).
+    pub entries: u32,
+    pub max_tokens: u32,
+}
+
+/// Journaled form of [`Effect::Compact`] (only inside `Event::EffectIssued`):
+/// the body is the first `entries` context fragments followed by one user
+/// fragment carrying `instruction`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CompactRef {
+    pub seq_no: u32,
+    /// Context fragments replayed before the instruction (the whole context on
+    /// the pressure path, the earliest segment on the overflow path).
+    pub entries: u32,
+    /// Text of the appended user fragment (`Rendered::text(Role::User, ..)`).
+    pub instruction: String,
+    pub max_tokens: u32,
+    /// Seq range (inclusive) of the events being replaced.
+    pub range: (Seq, Seq),
+    pub overflow: bool,
+}
+
 /// A set of tool calls that may run concurrently (no resource conflicts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Batch {
@@ -121,20 +156,61 @@ pub enum Effect {
     Checkpoint(CheckpointScope),
     Restore(RestorePlan),
     Finish(TurnOutcome),
+    /// Journal-only form of `Sample` (see [`SampleRef`]). Never dispatched: the
+    /// kernel hands out the rebuilt `Sample`.
+    SampleRef(SampleRef),
+    /// Journal-only form of `Compact` (see [`CompactRef`]). Never dispatched.
+    CompactRef(CompactRef),
 }
 
 impl Effect {
     /// Short kind name for logs and metrics.
     pub fn kind(&self) -> &'static str {
         match self {
-            Effect::Sample(_) => "sample",
+            Effect::Sample(_) | Effect::SampleRef(_) => "sample",
             Effect::Execute(_) => "execute",
             Effect::Gate(_) => "gate",
-            Effect::Compact(_) => "compact",
+            Effect::Compact(_) | Effect::CompactRef(_) => "compact",
             Effect::Checkpoint(_) => "checkpoint",
             Effect::Restore(_) => "restore",
             Effect::Finish(_) => "finish",
         }
+    }
+
+    /// Whether this is a journal-only reference form (`SampleRef` /
+    /// `CompactRef`) that must be expanded before dispatch.
+    pub fn is_journal_ref(&self) -> bool {
+        matches!(self, Effect::SampleRef(_) | Effect::CompactRef(_))
+    }
+
+    /// The journaled form of a dispatchable effect, given the number of context
+    /// fragments its prompt replays: `Sample` / `Compact` become references,
+    /// everything else is journaled as is. `None` when a compaction prompt does
+    /// not end with its instruction fragment.
+    pub fn journaled(&self) -> Option<Effect> {
+        Some(match self {
+            Effect::Sample(p) => Effect::SampleRef(SampleRef {
+                seq_no: p.head.seq_no,
+                entries: p.body.len() as u32,
+                max_tokens: p.max_tokens,
+            }),
+            Effect::Compact(job) => {
+                let (last, prefix) = job.prompt.body.split_last()?;
+                let instruction = match last.blocks.as_slice() {
+                    [crate::render::RBlock::Text { text }] if last.role == crate::render::Role::User => text.clone(),
+                    _ => return None,
+                };
+                Effect::CompactRef(CompactRef {
+                    seq_no: job.prompt.head.seq_no,
+                    entries: prefix.len() as u32,
+                    instruction,
+                    max_tokens: job.prompt.max_tokens,
+                    range: job.range,
+                    overflow: job.overflow,
+                })
+            }
+            other => other.clone(),
+        })
     }
 }
 

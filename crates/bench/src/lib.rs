@@ -290,6 +290,7 @@ impl SessionDriver {
             },
             Effect::Restore(_) => EffectResult::Restored(RestoreReport::default()),
             Effect::Finish(_) => return None,
+            Effect::SampleRef(_) | Effect::CompactRef(_) => panic!("journal reference dispatched: {effect:?}"),
         })
     }
 
@@ -352,11 +353,20 @@ pub fn journal_bytes(events: &[Envelope<Event>]) -> usize {
     events.iter().map(|e| serde_json::to_string(e).map(|s| s.len()).unwrap_or(0)).sum()
 }
 
-/// Bytes of the `EffectIssued(Sample)` events (each carries its full prompt).
+/// Bytes of the `EffectIssued` events of samples and compactions (journaled by
+/// reference since event schema 2; before that each carried its full prompt).
 pub fn sample_effect_bytes(events: &[Envelope<Event>]) -> usize {
     events
         .iter()
-        .filter(|e| matches!(&e.body, Event::EffectIssued { effect: Effect::Sample(_), .. }))
+        .filter(|e| {
+            matches!(
+                &e.body,
+                Event::EffectIssued {
+                    effect: Effect::Sample(_) | Effect::SampleRef(_) | Effect::Compact(_) | Effect::CompactRef(_),
+                    ..
+                }
+            )
+        })
         .map(|e| serde_json::to_string(e).map(|s| s.len()).unwrap_or(0))
         .sum()
 }

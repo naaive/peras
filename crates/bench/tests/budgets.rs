@@ -66,7 +66,7 @@ fn resume_10k_events_under_1s() {
     let session = build_session(10_000);
     let events = &session.log;
     println!(
-        "  session: {} events, {} JSON bytes ({} in EffectIssued(Sample) events)",
+        "  session: {} events, {} JSON bytes ({} in sample/compact EffectIssued events)",
         events.len(),
         journal_bytes(events),
         sample_effect_bytes(events)

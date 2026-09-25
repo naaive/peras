@@ -4,19 +4,24 @@
 //!
 //! - the final `agent_kernel::current_prompt` equals `golden/prompt.json`
 //!   byte for byte;
-//! - at every recorded `Sample` effect, the prompt rebuilt from the fold equals
-//!   the prompt recorded in the journal (historical requests rebuild exactly).
+//! - the fixture was recorded with event schema 1, where every `Sample` /
+//!   `Compact` effect carried its full prompt. The upgrader turns them into
+//!   `SampleRef` / `CompactRef`; at every one of them, the request rebuilt from
+//!   the fold (`rebuild_effect`, and `Kernel::outstanding` right after) equals
+//!   the prompt recorded in the old journal, byte for byte;
+//! - running the scenario today journals exactly the upgraded fixture.
 //!
 //! The byte-exact vendor encodings of those prompts are checked by
 //! `crates/bench/tests/golden_replay.rs` (agent-sim has no dependency on the
 //! adapters).
 //!
-//! Regenerate (after an intentional change) with
+//! Regenerate the expected outputs (after an intentional change) with
 //! `UPDATE_GOLDEN=1 cargo test -p agent-sim --test golden_replay`, then
 //! `UPDATE_GOLDEN=1 cargo test -p agent-bench --test golden_replay`.
-//! The fixture is produced by the deterministic `scenario()` below.
+//! `session.jsonl` itself is an old recording and is never rewritten (it is
+//! only created, by the deterministic `scenario()` below, when missing).
 
-use agent_kernel::{current_prompt, start_session, Decider, Kernel, State};
+use agent_kernel::{current_prompt, rebuild_effect, start_session, Decider, Kernel, State};
 use agent_proto::upgrade::read_envelope;
 use agent_proto::*;
 use agent_sim::{sample_blocking, KernelSim, Script, SeqIds, VirtualClock, World};
@@ -156,6 +161,7 @@ impl World for Recorded {
             },
             Effect::Restore(_) => EffectResult::Restored(RestoreReport::default()),
             Effect::Finish(_) => return None,
+            Effect::SampleRef(_) | Effect::CompactRef(_) => panic!("journal reference dispatched: {effect:?}"),
         })
     }
 }
@@ -230,30 +236,48 @@ fn to_jsonl(journal: &[Envelope<Event>]) -> String {
 
 // ---------------------------------------------------------------- replay
 
-fn load_fixture() -> Vec<Envelope<Event>> {
+fn raw_fixture() -> Vec<Value> {
     let text = std::fs::read_to_string(golden_dir().join("session.jsonl"))
         .expect("missing fixture: run with UPDATE_GOLDEN=1 to create it");
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let raw: Value = serde_json::from_str(l).expect("fixture line is JSON");
-            read_envelope(raw).expect("fixture event upgrades").expect("no ignorable events in fixture")
-        })
+    text.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("fixture line is JSON")).collect()
+}
+
+fn load_fixture() -> Vec<Envelope<Event>> {
+    raw_fixture()
+        .into_iter()
+        .map(|raw| read_envelope(raw).expect("fixture event upgrades").expect("no ignorable events in fixture"))
         .collect()
 }
 
-/// Fold the journal; returns the final state and, for every `Sample` effect,
-/// `(seq, recorded prompt, prompt rebuilt from the fold at that point)`.
-fn fold(journal: &[Envelope<Event>]) -> (State, Vec<(Seq, Prompt, Option<Prompt>)>) {
+/// A request rebuilt from the fold, next to what the journal says about it.
+struct Rebuilt {
+    seq: Seq,
+    id: EffectId,
+    /// `rebuild_effect` on the fold just before the `EffectIssued`.
+    before: Option<Effect>,
+    /// What `Kernel::outstanding` hands out right after it (crash recovery).
+    outstanding: Option<Effect>,
+}
+
+/// Fold the journal; returns the final state and every request (`Sample` /
+/// `Compact`) rebuilt from the fold.
+fn fold(journal: &[Envelope<Event>]) -> (State, Vec<Rebuilt>) {
     let mut s = State::default();
-    let mut samples = vec![];
+    let mut requests = vec![];
     for e in journal {
+        let issued = match &e.body {
+            Event::EffectIssued { id, effect } if effect.kind() == "sample" || effect.kind() == "compact" => {
+                Some((*id, rebuild_effect(&s, effect)))
+            }
+            _ => None,
+        };
         Kernel::evolve(&mut s, e);
-        if let Event::EffectIssued { effect: Effect::Sample(p), .. } = &e.body {
-            samples.push((e.seq, p.clone(), current_prompt(&s)));
+        if let Some((id, before)) = issued {
+            let outstanding = Kernel::outstanding(&s).into_iter().find(|(i, _)| *i == id).map(|(_, e)| e);
+            requests.push(Rebuilt { seq: e.seq, id, before, outstanding });
         }
     }
-    (s, samples)
+    (s, requests)
 }
 
 fn prompt_json(p: &Option<Prompt>) -> String {
@@ -265,7 +289,7 @@ fn prompt_json(p: &Option<Prompt>) -> String {
 #[test]
 fn golden_replay_is_unchanged() {
     let dir = golden_dir();
-    if updating() {
+    if updating() && !dir.join("session.jsonl").exists() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("session.jsonl"), to_jsonl(&scenario())).unwrap();
     }
@@ -274,13 +298,35 @@ fn golden_replay_is_unchanged() {
     for (i, e) in journal.iter().enumerate() {
         assert_eq!(e.seq, i as u64, "seqs are dense");
         assert_eq!(e.schema, EVENT_SCHEMA, "upgraded on read");
+        if let Event::EffectIssued { effect, .. } = &e.body {
+            assert!(!matches!(effect, Effect::Sample(_) | Effect::Compact(_)), "seq {}: not upgraded to a reference", e.seq);
+        }
     }
 
-    let (state, samples) = fold(&journal);
-    assert!(samples.len() >= 8, "fixture has {} samples", samples.len());
-    for (seq, recorded, rebuilt) in &samples {
-        assert_eq!(rebuilt.as_ref(), Some(recorded), "prompt rebuilt from the fold differs at seq {seq}");
+    // The old recording carries every request in full: the rebuilt ones must
+    // match it byte for byte.
+    let recorded: Vec<(Seq, String)> = raw_fixture()
+        .iter()
+        .filter(|v| v["body"]["type"] == "effect_issued")
+        .filter(|v| v["body"]["effect"]["effect"] == "sample" || v["body"]["effect"]["effect"] == "compact")
+        .map(|v| (v["seq"].as_u64().unwrap(), serde_json::to_string(&v["body"]["effect"]).unwrap()))
+        .collect();
+    let (state, requests) = fold(&journal);
+    assert!(requests.len() >= 8, "fixture has {} requests", requests.len());
+    assert!(
+        recorded.iter().any(|(_, r)| r.contains("\"effect\":\"compact\"")),
+        "fixture must contain a compaction request"
+    );
+    assert_eq!(requests.iter().map(|r| r.seq).collect::<Vec<_>>(), recorded.iter().map(|r| r.0).collect::<Vec<_>>());
+    for (r, (seq, old)) in requests.iter().zip(&recorded) {
+        let json = |e: &Option<Effect>| e.as_ref().map(|e| serde_json::to_string(e).unwrap());
+        assert_eq!(json(&r.before).as_ref(), Some(old), "request {} rebuilt from the fold differs at seq {seq}", r.id);
+        // Unless the same decision already settled it, recovery re-dispatches it identically.
+        if r.outstanding.is_some() {
+            assert_eq!(json(&r.outstanding).as_ref(), Some(old), "outstanding {} differs at seq {seq}", r.id);
+        }
     }
+    assert!(requests.iter().all(|r| r.outstanding.is_some()), "every request is outstanding right after its EffectIssued");
     // Folding again (a resumed driver) gives the same projection.
     let (again, _) = fold(&journal);
     assert_eq!(current_prompt(&again), current_prompt(&state));
@@ -292,6 +338,23 @@ fn golden_replay_is_unchanged() {
     }
     let expected = std::fs::read_to_string(&expected_path).expect("missing golden prompt: run with UPDATE_GOLDEN=1");
     assert!(actual == expected, "final current_prompt differs from {} (UPDATE_GOLDEN=1 to accept)", expected_path.display());
+}
+
+/// Running the scenario with today's kernel journals exactly the upgraded old
+/// recording (requests by reference, same ids, same renderings).
+#[test]
+fn fresh_run_journals_the_upgraded_fixture() {
+    let fresh = scenario();
+    let old = load_fixture();
+    assert_eq!(fresh.len(), old.len(), "event count differs");
+    for (a, b) in fresh.iter().zip(&old) {
+        assert_eq!(serde_json::to_string(a).unwrap(), serde_json::to_string(b).unwrap(), "event {} differs", a.seq);
+    }
+    // And it is linear: no request carries its prompt.
+    let new_bytes = to_jsonl(&fresh).len();
+    let old_bytes: usize = raw_fixture().iter().map(|v| v.to_string().len() + 1).sum();
+    eprintln!("golden journal: {old_bytes} bytes at schema 1, {new_bytes} bytes now");
+    assert!(new_bytes * 10 < old_bytes * 7, "journal did not shrink: {old_bytes} -> {new_bytes} bytes");
 }
 
 /// The scenario itself is deterministic (two runs give identical bytes).

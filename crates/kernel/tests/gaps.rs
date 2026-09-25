@@ -308,7 +308,7 @@ fn rewind_report_lists_irreversible_and_network_calls() {
         (start.clone(), vec![runtime_item.clone(), push_line.clone()], vec![runtime_item.clone(), push_line.clone(), post_line.clone()]),
     ];
     for (i, (to, from_runtime, expected)) in rows.into_iter().enumerate() {
-        let mut h = H { s: h.s.clone(), log: h.log.clone(), at: h.at, pending: vec![], steps: vec![] };
+        let mut h = H { s: h.s.clone(), log: h.log.clone(), at: h.at, pending: vec![], steps: vec![], requests: h.requests.clone() };
         let eff = h.control(Control::Rewind { to: to.clone() });
         let [(rid, Effect::Restore(_))] = &eff[..] else { panic!("row {i}: {eff:?}") };
         h.complete(*rid, EffectResult::Restored(RestoreReport { irreversible: from_runtime, ..RestoreReport::default() }));

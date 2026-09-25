@@ -234,24 +234,114 @@ pub(crate) struct PendingQuestion {
     pub gate: Option<EffectId>,
 }
 
-/// Event id → seq, split so that cloning stays cheap: a large shared frozen part
-/// plus a small recent part merged in chunks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Elements per shared chunk of [`Chunked`] / [`SeqIndex`].
+const CHUNK: usize = 64;
+
+/// An append-only list that is cheap to clone whatever its length: full
+/// chunks are shared (`Arc`), only the short tail is copied. `decide` clones
+/// the whole state for every input, so session-long lists must not be copied
+/// element by element. Serialised as a plain sequence.
+#[derive(Debug, Clone)]
+pub(crate) struct Chunked<T> {
+    full: Vec<Arc<Vec<T>>>,
+    tail: Vec<T>,
+}
+
+impl<T> Default for Chunked<T> {
+    fn default() -> Self {
+        Chunked { full: vec![], tail: vec![] }
+    }
+}
+
+impl<T: Clone> Chunked<T> {
+    pub fn push(&mut self, v: T) {
+        self.tail.push(v);
+        if self.tail.len() >= CHUNK {
+            self.full.push(Arc::new(std::mem::take(&mut self.tail)));
+        }
+    }
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
+        self.full.iter().flat_map(|c| c.iter()).chain(self.tail.iter())
+    }
+    /// Mutable access (copies the shared chunks it touches: rare operations only).
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.full.iter_mut().flat_map(|c| Arc::make_mut(c).iter_mut()).chain(self.tail.iter_mut())
+    }
+}
+
+impl<T: Clone + Serialize> Serialize for Chunked<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.iter())
+    }
+}
+
+impl<'de, T: Clone + Deserialize<'de>> Deserialize<'de> for Chunked<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut c = Chunked::default();
+        for v in Vec::<T>::deserialize(d)? {
+            c.push(v);
+        }
+        Ok(c)
+    }
+}
+
+/// Event id → seq, split so that cloning stays cheap: shared frozen chunks
+/// (never copied again once frozen) plus a small recent part. Serialised as
+/// `{frozen, recent}` maps.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SeqIndex {
-    frozen: Arc<BTreeMap<EventId, Seq>>,
+    frozen: Vec<Arc<BTreeMap<EventId, Seq>>>,
     recent: BTreeMap<EventId, Seq>,
 }
 
 impl SeqIndex {
     pub fn insert(&mut self, id: EventId, seq: Seq) {
         self.recent.insert(id, seq);
-        if self.recent.len() >= 512 {
-            let recent = std::mem::take(&mut self.recent);
-            Arc::make_mut(&mut self.frozen).extend(recent);
+        if self.recent.len() >= 8 * CHUNK {
+            self.frozen.push(Arc::new(std::mem::take(&mut self.recent)));
         }
     }
     pub fn get(&self, id: &EventId) -> Option<Seq> {
-        self.recent.get(id).or_else(|| self.frozen.get(id)).copied()
+        self.recent.get(id).or_else(|| self.frozen.iter().rev().find_map(|c| c.get(id))).copied()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SeqIndexRepr<M> {
+    frozen: M,
+    recent: M,
+}
+
+impl Serialize for SeqIndex {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        struct Frozen<'a>(&'a [Arc<BTreeMap<EventId, Seq>>]);
+        impl Serialize for Frozen<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                // Chunks hold disjoint ids in insertion order: merge in key order.
+                let merged: BTreeMap<&EventId, &Seq> = self.0.iter().flat_map(|c| c.iter()).collect();
+                s.collect_map(merged)
+            }
+        }
+        struct Recent<'a>(&'a BTreeMap<EventId, Seq>);
+        impl Serialize for Recent<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_map(self.0.iter())
+            }
+        }
+        #[derive(Serialize)]
+        struct Out<'a> {
+            frozen: Frozen<'a>,
+            recent: Recent<'a>,
+        }
+        Out { frozen: Frozen(&self.frozen), recent: Recent(&self.recent) }.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for SeqIndex {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let r = SeqIndexRepr::<BTreeMap<EventId, Seq>>::deserialize(d)?;
+        let frozen = if r.frozen.is_empty() { vec![] } else { vec![Arc::new(r.frozen)] };
+        Ok(SeqIndex { frozen, recent: r.recent })
     }
 }
 
@@ -286,6 +376,67 @@ pub struct Subagent {
     pub child: SessionId,
     /// `None` while the child is running.
     pub outcome: Option<TurnOutcome>,
+}
+
+/// An issued, unsettled effect.
+///
+/// `effect` is the journaled form (`SampleRef` / `CompactRef` for requests).
+/// For a request, the head and the context prefix it replays are captured when
+/// the `EffectIssued` is folded, by sharing the renderings (no deep copy), so
+/// [`Issued::dispatchable`] rebuilds exactly the prompt that was dispatched even
+/// if the context changes while the effect is outstanding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Issued {
+    pub effect: Effect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<Arc<SeqHead>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body: Vec<Arc<Rendered>>,
+}
+
+impl Issued {
+    /// Capture an effect at the moment its `EffectIssued` is folded into `s`.
+    pub(crate) fn capture(s: &State, effect: &Effect) -> Issued {
+        let (seq_no, entries) = match effect {
+            Effect::SampleRef(r) => (r.seq_no, r.entries),
+            Effect::CompactRef(r) => (r.seq_no, r.entries),
+            _ => return Issued { effect: effect.clone(), head: None, body: vec![] },
+        };
+        let head = s.head.clone().filter(|h| h.seq_no == seq_no);
+        let entries = entries as usize;
+        let body = if head.is_some() && entries <= s.context.len() {
+            s.context[..entries].iter().map(|e| e.rendered.clone()).collect()
+        } else {
+            vec![]
+        };
+        // An inconsistent reference (unknown sequence, longer than the context)
+        // keeps no head: `dispatchable` then hands out the reference itself,
+        // which no dispatcher accepts.
+        let head = if body.len() == entries { head } else { None };
+        Issued { effect: effect.clone(), head, body }
+    }
+
+    /// The effect to dispatch: requests journaled by reference are rebuilt into
+    /// the full `Sample` / `Compact` (byte-identical to the original dispatch).
+    pub fn dispatchable(&self) -> Effect {
+        let Some(head) = &self.head else { return self.effect.clone() };
+        let body = || self.body.iter().map(|r| (**r).clone()).collect::<Vec<Rendered>>();
+        match &self.effect {
+            Effect::SampleRef(r) => {
+                Effect::Sample(Prompt { head: (**head).clone(), body: body(), max_tokens: r.max_tokens })
+            }
+            Effect::CompactRef(r) => {
+                let mut body = body();
+                body.push(Rendered::text(Role::User, r.instruction.clone()));
+                Effect::Compact(CompactJob {
+                    prompt: Prompt { head: (**head).clone(), body, max_tokens: r.max_tokens },
+                    range: r.range,
+                    overflow: r.overflow,
+                })
+            }
+            other => other.clone(),
+        }
+    }
 }
 
 /// Serialise a map with non-string keys as a list of pairs (JSON object keys
@@ -324,18 +475,18 @@ pub struct State {
     pub(crate) m: MatcherCell,
     /// Caps of the model currently in use (may be a fallback).
     pub(crate) caps: Option<ModelCaps>,
-    pub(crate) head: Option<SeqHead>,
+    pub(crate) head: Option<Arc<SeqHead>>,
     pub(crate) pending_config: Option<KernelConfig>,
     pub(crate) epoch: u32,
     pub(crate) next_n: u64,
     #[serde(with = "pairs")]
-    pub(crate) issued: BTreeMap<EffectId, Arc<Effect>>,
+    pub(crate) issued: BTreeMap<EffectId, Arc<Issued>>,
     /// Issued while paused: dispatched on resume.
     pub(crate) held: Vec<EffectId>,
     pub(crate) paused: bool,
     pub(crate) next_seq: Seq,
     pub(crate) index: SeqIndex,
-    pub(crate) ops: Vec<Arc<Op>>,
+    pub(crate) ops: Chunked<Arc<Op>>,
     pub(crate) abandoned: Vec<(Seq, Seq)>,
     pub(crate) context: Vec<Entry>,
     pub(crate) usage_basis: Option<u32>,
@@ -350,14 +501,14 @@ pub struct State {
     pub(crate) continuations: u32,
     pub(crate) tokens_used: u64,
     pub(crate) cost_used: u64,
-    pub(crate) checkpoints: Arc<Vec<(Seq, CheckpointId)>>,
+    pub(crate) checkpoints: Chunked<(Seq, CheckpointId)>,
     pub(crate) questions: BTreeMap<QuestionId, PendingQuestion>,
     pub(crate) destinations: BTreeSet<String>,
     pub(crate) restoring: Option<(EffectId, EventId)>,
     /// SessionStart hook progress (once per session).
     pub(crate) session_gate: TGate,
     /// Irreversible / network calls dispatched on the journal, in order.
-    pub(crate) irreversible: Arc<Vec<IrreversibleCall>>,
+    pub(crate) irreversible: Chunked<IrreversibleCall>,
     /// Tombstoned events (and summaries derived from them): erased from the context.
     pub(crate) erased: BTreeSet<EventId>,
     /// Sub-agents spawned by this session, by spawning call.
@@ -392,7 +543,7 @@ impl State {
 // ------------------------------------------------------------------ queries
 
 pub fn outstanding(s: &State) -> Vec<(EffectId, Effect)> {
-    s.issued.iter().map(|(k, v)| (*k, (**v).clone())).collect()
+    s.issued.iter().map(|(k, v)| (*k, v.dispatchable())).collect()
 }
 
 pub fn phase(s: &State) -> Phase {
@@ -477,7 +628,7 @@ fn append(s: &mut State, e: Entry) {
 /// and (optionally) everything after `until`.
 pub(crate) fn project(s: &State, until: Option<Seq>) -> Vec<Entry> {
     let mut ctx = Vec::new();
-    for op in &s.ops {
+    for op in s.ops.iter() {
         if s.is_abandoned(op.seq()) || until.map(|u| op.seq() > u).unwrap_or(false) {
             continue;
         }
@@ -535,7 +686,7 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             s.config = Some(config.clone());
         }
         Event::SequenceOpened { head } => {
-            s.head = Some(head.clone());
+            s.head = Some(Arc::new(head.clone()));
             s.usage_basis = None;
         }
         Event::ConfigChanged { profile_hash, config } => {
@@ -605,7 +756,7 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
                     s.session_gate = TGate::None;
                 }
                 s.questions.clear();
-                s.issued.retain(|_, e| matches!(**e, Effect::Checkpoint(_) | Effect::Restore(_)));
+                s.issued.retain(|_, e| matches!(e.effect, Effect::Checkpoint(_) | Effect::Restore(_)));
                 let issued = &s.issued;
                 s.held.retain(|id| issued.contains_key(id));
             }
@@ -718,7 +869,7 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
         Event::DestinationAllowed { destination } => {
             s.destinations.insert(destination.clone());
         }
-        Event::CheckpointTaken { info } => Arc::make_mut(&mut s.checkpoints).push((ev.seq, info.id.clone())),
+        Event::CheckpointTaken { info } => s.checkpoints.push((ev.seq, info.id.clone())),
         Event::RewindPlanned { .. } => {}
         Event::RewindCompleted { to, .. } => {
             s.restoring = None;
@@ -830,7 +981,7 @@ fn on_tombstone(s: &mut State, target: &EventId) {
     // Cascade through summaries (transitively: a summary of a summary).
     loop {
         let mut grew = false;
-        for op in &s.ops {
+        for op in s.ops.iter() {
             if let Op::Replace { id, rep, .. } = &**op {
                 if rep.kind == ReplacementKind::Summary
                     && !erased.contains(id)
@@ -984,7 +1135,8 @@ fn on_reply(s: &mut State, ev: &Envelope<Event>, message: &AssistantMessage, eff
 fn on_issued(s: &mut State, id: EffectId, effect: &Effect, seq: Seq) {
     s.next_n = s.next_n.max(id.n + 1);
     if !matches!(effect, Effect::Finish(_)) {
-        s.issued.insert(id, Arc::new(effect.clone()));
+        let issued = Issued::capture(s, effect);
+        s.issued.insert(id, Arc::new(issued));
         if s.paused {
             s.held.push(id);
         }
@@ -998,7 +1150,7 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect, seq: Seq) {
             }
             for c in &batch.calls {
                 if matches!(c.class, EffectClass::Irreversible | EffectClass::Network) {
-                    Arc::make_mut(&mut s.irreversible).push(IrreversibleCall {
+                    s.irreversible.push(IrreversibleCall {
                         seq,
                         call: c.id.clone(),
                         text: gate::call_summary(c),
@@ -1025,7 +1177,7 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect, seq: Seq) {
     }
     let Some(t) = s.turn.as_mut() else { return };
     match effect {
-        Effect::Sample(_) => {
+        Effect::Sample(_) | Effect::SampleRef(_) => {
             t.sample = Some(id);
             t.reply = None;
             t.slots.clear();
@@ -1076,7 +1228,7 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect, seq: Seq) {
             (GateSubject::PreCompact, _) => t.precompact = PreCompact::Waiting(id),
             _ => {}
         },
-        Effect::Compact(_) => {
+        Effect::Compact(_) | Effect::CompactRef(_) => {
             t.compact = Some(CompactInfo { id });
             if let PreCompact::Ready(p) = &t.precompact {
                 t.precompact = PreCompact::Done(p.clone());
