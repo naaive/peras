@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 agent-proto.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 globset.workspace = true
 

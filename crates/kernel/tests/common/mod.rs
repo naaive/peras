@@ -11,6 +11,9 @@ pub struct H {
     pub at: u64,
     /// Dispatched, not yet completed effects (in dispatch order).
     pub pending: Vec<(EffectId, Effect)>,
+    /// Every step taken: journal length before it, and the input (`None` for
+    /// an event appended directly, the way the runtime appends tombstones).
+    pub steps: Vec<(usize, Option<(Timestamp, Input)>)>,
 }
 
 pub fn cfg() -> KernelConfig {
@@ -84,7 +87,7 @@ pub fn ok(call: &ToolCall, text: &str) -> ToolResult {
 
 impl H {
     pub fn new(c: KernelConfig) -> H {
-        let mut h = H { s: State::default(), log: vec![], at: 1_000, pending: vec![] };
+        let mut h = H { s: State::default(), log: vec![], at: 1_000, pending: vec![], steps: vec![] };
         let d = start_session("s1".into(), "hash".into(), c);
         h.apply(d);
         h
@@ -125,10 +128,19 @@ impl H {
     pub fn input(&mut self, i: Input) -> Result<Vec<(EffectId, Effect)>, Rejection> {
         self.at += 10;
         let at = Timestamp(self.at);
+        self.steps.push((self.log.len(), Some((at, i.clone()))));
         let d = Kernel::decide(&self.s, at, i.clone())?;
         let d2 = Kernel::decide(&self.s, at, i).unwrap();
         assert_eq!(d, d2, "decide is not deterministic");
         Ok(self.apply(d))
+    }
+
+    /// Append an event directly (not decided by the kernel), e.g. a tombstone
+    /// or a sub-agent lifecycle event written by the runtime.
+    pub fn append(&mut self, body: Event) {
+        self.at += 10;
+        self.steps.push((self.log.len(), None));
+        self.apply(Decision { events: vec![Draft { audience: Audience::User, ..Draft::internal(body) }], effects: vec![] });
     }
 
     pub fn go(&mut self, i: Input) -> Vec<(EffectId, Effect)> {

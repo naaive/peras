@@ -2,9 +2,11 @@
 
 use crate::context::{self, Entry, EntryKind, Op};
 use crate::gate::{self, Matchers};
+use crate::render::{self, RuleSet};
 use agent_proto::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, OnceLock};
 
 pub use crate::decide::decide;
 
@@ -14,9 +16,16 @@ pub const PENDING_SIGNAL_KIND: &str = "kernel.pending_signal";
 /// `Event::Plugin` kind used to journal a `Control::Reconfigure` received while
 /// busy; it is applied at the next idle.
 pub const PENDING_CONFIG_KIND: &str = "kernel.pending_config";
+/// `Event::Plugin` kind journaling that the model rejected a request as too
+/// long (the overflow path of pressure relief is in progress for the turn).
+pub const OVERFLOW_KIND: &str = "kernel.context_overflow";
+/// `Event::Plugin` kind used to journal a queued signal the kernel dropped
+/// (data: `{"signal": <Signal>, "reason": <String>}`), e.g. a wake whose
+/// continuation budget is exhausted with no user input queued to reset it.
+pub const SIGNAL_DROPPED_KIND: &str = "kernel.signal_dropped";
 
 /// Execution phase (a projection of state).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Phase {
     Idle,
     Sampling,
@@ -28,7 +37,7 @@ pub enum Phase {
 }
 
 /// Session taint (derived from trust annotations; sticky until `TaintCleared`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Taint {
     pub tainted: bool,
     /// Events that introduced untrusted content.
@@ -39,7 +48,7 @@ pub struct Taint {
     pub private_read: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Mail {
     pub source: String,
     pub key: Option<String>,
@@ -49,14 +58,14 @@ pub(crate) struct Mail {
     pub steer: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum QueueItem {
     User { text: String, attachments: Vec<Attachment> },
     Wake { source: String, reason: String },
 }
 
 /// Gate progress of one call.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum CallGate {
     /// Rings 1–3 still to run.
     Unchecked,
@@ -72,14 +81,14 @@ pub(crate) enum CallGate {
     Deferred,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Exec {
     Idle,
     Running(EffectId),
     Done,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Slot {
     pub call: ToolCall,
     pub gate: CallGate,
@@ -97,33 +106,45 @@ pub(crate) struct Slot {
     pub deferred: Option<Entry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) enum TGate {
+    #[default]
     None,
     Waiting(EffectId),
     Passed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PreCkpt {
     None,
     Pending(EffectId),
     Done,
 }
 
-#[derive(Debug, Clone)]
+/// PreCompact hook progress of the current turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PreCompact {
+    None,
+    Waiting(EffectId),
+    /// Hook answered: the compaction is to be issued with these points to preserve.
+    Ready(Vec<String>),
+    /// Compaction issued; the points still apply to follow-up overflow segments.
+    Done(Vec<String>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Reply {
     pub has_calls: bool,
     pub interrupted: bool,
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CompactInfo {
     pub id: EffectId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Turn {
     pub no: u64,
     pub cause: TurnCause,
@@ -137,6 +158,9 @@ pub(crate) struct Turn {
     pub submit: TGate,
     pub presample: TGate,
     pub stop: TGate,
+    pub precompact: PreCompact,
+    /// The last sample overflowed; compaction runs on the overflow path.
+    pub overflow: bool,
     pub pre_ckpt: PreCkpt,
     pub sp_ckpt: bool,
     pub relief: bool,
@@ -160,6 +184,8 @@ impl Turn {
             submit: TGate::None,
             presample: TGate::None,
             stop: TGate::None,
+            precompact: PreCompact::None,
+            overflow: false,
             pre_ckpt: PreCkpt::None,
             sp_ckpt: false,
             relief: false,
@@ -200,7 +226,7 @@ impl Turn {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PendingQuestion {
     pub question: Question,
     pub subject: GateRef,
@@ -210,7 +236,7 @@ pub(crate) struct PendingQuestion {
 
 /// Event id → seq, split so that cloning stays cheap: a large shared frozen part
 /// plus a small recent part merged in chunks.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct SeqIndex {
     frozen: Arc<BTreeMap<EventId, Seq>>,
     recent: BTreeMap<EventId, Seq>,
@@ -229,22 +255,80 @@ impl SeqIndex {
     }
 }
 
+/// Compiled matchers of the configuration in force. Not serialised: a state
+/// restored from a snapshot recompiles them from `config` on first use.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MatcherCell(OnceLock<Arc<Matchers>>);
+
+impl MatcherCell {
+    fn compiled(cfg: &KernelConfig) -> MatcherCell {
+        let cell = OnceLock::new();
+        let _ = cell.set(Arc::new(Matchers::compile(cfg)));
+        MatcherCell(cell)
+    }
+}
+
+/// A side-effecting call that cannot be undone by a rewind (listed in the
+/// rewind report instead).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IrreversibleCall {
+    /// Seq of the `EffectIssued { Execute }` event that dispatched it.
+    pub seq: Seq,
+    pub call: CallId,
+    /// `name input-summary`.
+    pub text: String,
+}
+
+/// A sub-agent session spawned by a tool call of this session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Subagent {
+    pub call: CallId,
+    pub child: SessionId,
+    /// `None` while the child is running.
+    pub outcome: Option<TurnOutcome>,
+}
+
+/// Serialise a map with non-string keys as a list of pairs (JSON object keys
+/// must be strings). Order is preserved (the map is ordered).
+mod pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(m: &BTreeMap<K, V>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(m.iter())
+    }
+
+    pub fn deserialize<'de, K, V, D>(d: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(d)?.into_iter().collect())
+    }
+}
+
 /// At most this many introducing events are recorded per taint.
 const MAX_TAINT_SOURCES: usize = 256;
 
 /// Kernel state: a fold of the journal. Cloning is cheap (large parts are shared).
-#[derive(Debug, Clone, Default)]
+///
+/// Serialisable so the runtime can persist snapshots (loading = snapshot + the
+/// events after it). All containers are ordered, so the encoding is deterministic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     pub(crate) session: Option<SessionId>,
     pub(crate) profile_hash: String,
     pub(crate) config: Option<KernelConfig>,
-    pub(crate) m: Arc<Matchers>,
+    #[serde(skip)]
+    pub(crate) m: MatcherCell,
     /// Caps of the model currently in use (may be a fallback).
     pub(crate) caps: Option<ModelCaps>,
     pub(crate) head: Option<SeqHead>,
     pub(crate) pending_config: Option<KernelConfig>,
     pub(crate) epoch: u32,
     pub(crate) next_n: u64,
+    #[serde(with = "pairs")]
     pub(crate) issued: BTreeMap<EffectId, Arc<Effect>>,
     /// Issued while paused: dispatched on resume.
     pub(crate) held: Vec<EffectId>,
@@ -270,9 +354,22 @@ pub struct State {
     pub(crate) questions: BTreeMap<QuestionId, PendingQuestion>,
     pub(crate) destinations: BTreeSet<String>,
     pub(crate) restoring: Option<(EffectId, EventId)>,
+    /// SessionStart hook progress (once per session).
+    pub(crate) session_gate: TGate,
+    /// Irreversible / network calls dispatched on the journal, in order.
+    pub(crate) irreversible: Arc<Vec<IrreversibleCall>>,
+    /// Tombstoned events (and summaries derived from them): erased from the context.
+    pub(crate) erased: BTreeSet<EventId>,
+    /// Sub-agents spawned by this session, by spawning call.
+    pub(crate) children: BTreeMap<CallId, Subagent>,
 }
 
 impl State {
+    /// Compiled matchers of the configuration in force.
+    pub(crate) fn m(&self) -> &Matchers {
+        self.m.0.get_or_init(|| Arc::new(self.config.as_ref().map(Matchers::compile).unwrap_or_default()))
+    }
+
     pub(crate) fn hooked(&self, p: HookPoint) -> bool {
         self.config.as_ref().map(|c| c.hooked.contains(&p)).unwrap_or(false)
     }
@@ -316,7 +413,9 @@ pub fn phase(s: &State) -> Phase {
         !sl.result && matches!(sl.gate, CallGate::AwaitHook(..) | CallGate::AwaitHuman(..) | CallGate::NeedHuman(_))
     }) || matches!(t.submit, TGate::Waiting(_))
         || matches!(t.presample, TGate::Waiting(_))
-        || matches!(t.stop, TGate::Waiting(_));
+        || matches!(t.stop, TGate::Waiting(_))
+        || matches!(t.precompact, PreCompact::Waiting(_))
+        || matches!(s.session_gate, TGate::Waiting(_));
     if gated {
         return Phase::Gated;
     }
@@ -363,6 +462,7 @@ fn make_entry(ev: &Envelope<Event>) -> Option<Entry> {
         untrusted,
         source: Some(Arc::new((ev.body.clone(), ev.trust.clone()))),
         trimmed: false,
+        erased: false,
         at: ev.at,
     })
 }
@@ -384,6 +484,14 @@ pub(crate) fn project(s: &State, until: Option<Seq>) -> Vec<Entry> {
         match &**op {
             Op::Append(e) => ctx.push(e.clone()),
             Op::Replace { id, at, rep, .. } => context::apply_replacement(&mut ctx, id, *at, rep),
+        }
+    }
+    if !s.erased.is_empty() {
+        let rules = RuleSet::default();
+        for e in ctx.iter_mut() {
+            if !e.erased && s.erased.contains(&e.id) {
+                *e = context::erase_entry(&rules, e);
+            }
         }
     }
     ctx
@@ -422,7 +530,7 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             }
             s.session = Some(session.clone());
             s.profile_hash = profile_hash.clone();
-            s.m = Arc::new(Matchers::compile(config));
+            s.m = MatcherCell::compiled(config);
             s.caps = Some(config.caps.clone());
             s.config = Some(config.clone());
         }
@@ -432,7 +540,7 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
         }
         Event::ConfigChanged { profile_hash, config } => {
             s.profile_hash = profile_hash.clone();
-            s.m = Arc::new(Matchers::compile(config));
+            s.m = MatcherCell::compiled(config);
             s.caps = Some(config.caps.clone());
             s.config = Some(config.clone());
             s.pending_config = None;
@@ -492,13 +600,17 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             }
             _ => {
                 s.turn = None;
+                if matches!(s.session_gate, TGate::Waiting(_)) {
+                    // The gate effect is dropped with the turn; re-issued next turn.
+                    s.session_gate = TGate::None;
+                }
                 s.questions.clear();
                 s.issued.retain(|_, e| matches!(**e, Effect::Checkpoint(_) | Effect::Restore(_)));
                 let issued = &s.issued;
                 s.held.retain(|id| issued.contains_key(id));
             }
         },
-        Event::EffectIssued { id, effect } => on_issued(s, *id, effect),
+        Event::EffectIssued { id, effect } => on_issued(s, *id, effect, ev.seq),
         Event::EffectSettled { id } => {
             s.issued.remove(id);
             s.held.retain(|h| h != id);
@@ -546,9 +658,13 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
                 s.issued.clear();
                 s.held.clear();
                 s.questions.clear();
+                if matches!(s.session_gate, TGate::Waiting(_)) {
+                    s.session_gate = TGate::None;
+                }
                 if let Some(t) = s.turn.as_mut() {
                     t.sample = None;
                     t.compact = None;
+                    t.precompact = PreCompact::None;
                     t.soft = true;
                     for sl in &mut t.slots {
                         sl.post = None;
@@ -622,10 +738,131 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
                 if let Ok(cfg) = serde_json::from_value::<KernelConfig>(data.clone()) {
                     s.pending_config = Some(cfg);
                 }
+            } else if kind == OVERFLOW_KIND {
+                if let Some(t) = s.turn.as_mut() {
+                    t.overflow = true;
+                }
+            } else if kind == SIGNAL_DROPPED_KIND {
+                if let Some(Ok(sig)) = data.get("signal").map(|v| serde_json::from_value::<Signal>(v.clone())) {
+                    on_dropped_signal(s, sig);
+                }
             }
         }
-        Event::SubagentStarted { .. } | Event::SubagentFinished { .. } | Event::Tombstone { .. } => {}
+        Event::SubagentStarted { call, child } => {
+            s.children.insert(call.clone(), Subagent { call: call.clone(), child: child.clone(), outcome: None });
+        }
+        Event::SubagentFinished { call, child, outcome } => {
+            let e = s
+                .children
+                .entry(call.clone())
+                .or_insert_with(|| Subagent { call: call.clone(), child: child.clone(), outcome: None });
+            e.outcome = Some(outcome.clone());
+        }
+        Event::Tombstone { target } => on_tombstone(s, target),
     }
+}
+
+/// Remove the erased bodies from the stored context operations (so snapshots
+/// no longer carry them). One-to-one replacements (trim / offload / re-render)
+/// are aligned with the entries they replaced by re-running the projection.
+fn scrub_ops(s: &mut State, fresh: &BTreeSet<EventId>) {
+    let rules = RuleSet::default();
+    let abandoned = s.abandoned.clone();
+    let is_abandoned = |seq: Seq| abandoned.iter().any(|(a, b)| seq >= *a && seq <= *b);
+    let mut ctx: Vec<Entry> = Vec::new();
+    for op in s.ops.iter_mut() {
+        let skip = is_abandoned(op.seq());
+        let next = match &**op {
+            Op::Append(e) => fresh.contains(&e.id).then(|| Op::Append(context::erase_entry(&rules, e))),
+            Op::Replace { seq, id, at, rep } => {
+                let touches = fresh.contains(id)
+                    || (rep.kind != ReplacementKind::Summary && rep.sources.iter().any(|src| fresh.contains(src)));
+                if touches {
+                    let mut rep2 = (**rep).clone();
+                    let (a, b) = rep.range;
+                    let removed: Vec<&Entry> = ctx.iter().filter(|e| e.seq >= a && e.seq <= b).collect();
+                    let aligned = !skip && !fresh.contains(id) && removed.len() == rep2.content.len();
+                    for (k, r) in rep2.content.iter_mut().enumerate() {
+                        if !aligned || fresh.contains(&removed[k].id) {
+                            *r = render::erased(&rules, r);
+                        }
+                    }
+                    Some(Op::Replace { seq: *seq, id: id.clone(), at: *at, rep: Arc::new(rep2) })
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(n) = next {
+            *op = Arc::new(n);
+        }
+        if skip {
+            continue;
+        }
+        match &**op {
+            Op::Append(e) => ctx.push(e.clone()),
+            Op::Replace { id, at, rep, .. } => context::apply_replacement(&mut ctx, id, *at, rep),
+        }
+    }
+}
+
+fn on_dropped_signal(s: &mut State, sig: Signal) {
+    let pos = match &sig {
+        Signal::Wake { source, reason } => s.queue.iter().position(
+            |q| matches!(q, QueueItem::Wake { source: a, reason: b } if a == source && b == reason),
+        ),
+        Signal::Submit { text, .. } | Signal::Queue { text } => {
+            s.queue.iter().position(|q| matches!(q, QueueItem::User { text: t, .. } if t == text))
+        }
+        _ => None,
+    };
+    if let Some(i) = pos {
+        s.queue.remove(i);
+    }
+}
+
+/// Erase the body of `target` (and, in cascade, of every summary derived from
+/// it) from the context projection. The journal keeps the tree structure; the
+/// projection keeps tool_use / tool_result pairing with fixed erased renderings.
+fn on_tombstone(s: &mut State, target: &EventId) {
+    let mut erased = s.erased.clone();
+    erased.insert(target.clone());
+    // Cascade through summaries (transitively: a summary of a summary).
+    loop {
+        let mut grew = false;
+        for op in &s.ops {
+            if let Op::Replace { id, rep, .. } = &**op {
+                if rep.kind == ReplacementKind::Summary
+                    && !erased.contains(id)
+                    && rep.sources.iter().any(|src| erased.contains(src))
+                {
+                    erased.insert(id.clone());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let fresh: BTreeSet<EventId> = erased.difference(&s.erased).cloned().collect();
+    s.erased = erased;
+    if fresh.is_empty() {
+        return;
+    }
+    scrub_ops(s, &fresh);
+    s.context = project(s, None);
+    let rules = RuleSet::default();
+    if let Some(t) = s.turn.as_mut() {
+        for sl in &mut t.slots {
+            if let Some(e) = &sl.deferred {
+                if fresh.contains(&e.id) {
+                    sl.deferred = Some(context::erase_entry(&rules, e));
+                }
+            }
+        }
+    }
+    s.usage_basis = None;
 }
 
 fn on_pending_signal(s: &mut State, sig: Signal) {
@@ -744,7 +981,7 @@ fn on_reply(s: &mut State, ev: &Envelope<Event>, message: &AssistantMessage, eff
     }
 }
 
-fn on_issued(s: &mut State, id: EffectId, effect: &Effect) {
+fn on_issued(s: &mut State, id: EffectId, effect: &Effect, seq: Seq) {
     s.next_n = s.next_n.max(id.n + 1);
     if !matches!(effect, Effect::Finish(_)) {
         s.issued.insert(id, Arc::new(effect.clone()));
@@ -758,6 +995,15 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect) {
             let private = batch.calls.iter().any(|c| gate::reads_private(s, c));
             if private {
                 s.taint.private_read = true;
+            }
+            for c in &batch.calls {
+                if matches!(c.class, EffectClass::Irreversible | EffectClass::Network) {
+                    Arc::make_mut(&mut s.irreversible).push(IrreversibleCall {
+                        seq,
+                        call: c.id.clone(),
+                        text: gate::call_summary(c),
+                    });
+                }
             }
             if let Some(t) = s.turn.as_mut() {
                 t.pre_ckpt = PreCkpt::None;
@@ -774,6 +1020,9 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect) {
         }
         _ => {}
     }
+    if let Effect::Gate(GateRequest { subject: GateSubject::SessionStart, .. }) = effect {
+        s.session_gate = TGate::Waiting(id);
+    }
     let Some(t) = s.turn.as_mut() else { return };
     match effect {
         Effect::Sample(_) => {
@@ -782,6 +1031,8 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect) {
             t.slots.clear();
             t.presample = TGate::None;
             t.stop = TGate::None;
+            t.precompact = PreCompact::None;
+            t.overflow = false;
             t.relief = false;
             t.sp_ckpt = false;
             t.pre_ckpt = PreCkpt::None;
@@ -822,11 +1073,14 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect) {
                 }
             }
             (GateSubject::Stop { .. }, _) => t.stop = TGate::Waiting(id),
+            (GateSubject::PreCompact, _) => t.precompact = PreCompact::Waiting(id),
             _ => {}
         },
-        Effect::Compact(job) => {
-            let _ = job;
+        Effect::Compact(_) => {
             t.compact = Some(CompactInfo { id });
+            if let PreCompact::Ready(p) = &t.precompact {
+                t.precompact = PreCompact::Done(p.clone());
+            }
             t.relief = true;
         }
         Effect::Checkpoint(scope) => {
@@ -867,6 +1121,25 @@ fn with_id(mut c: ToolCall, id: &CallId) -> ToolCall {
 }
 
 fn on_verdict(s: &mut State, subject: &GateRef, point: HookPoint, ring: Ring, verdict: &Verdict, responder: &Responder) {
+    if point == HookPoint::PreCompact {
+        // Annotations are points to preserve in the summary, not context.
+        if let Some(t) = s.turn.as_mut() {
+            if let PreCompact::Waiting(_) = t.precompact {
+                // Untrusted annotations never reach the (trusted) summary instruction.
+                let preserve = match verdict {
+                    Verdict::Annotate(ctx) if !ctx.trust.is_untrusted() && !ctx.text.trim().is_empty() => {
+                        vec![ctx.text.clone()]
+                    }
+                    _ => vec![],
+                };
+                t.precompact = PreCompact::Ready(preserve);
+            }
+        }
+        return;
+    }
+    if point == HookPoint::SessionStart {
+        s.session_gate = TGate::Passed;
+    }
     if let Verdict::Annotate(ctx) = verdict {
         annotate(s, responder_source(responder), ctx);
     }

@@ -8,6 +8,8 @@
 //! - [`Decider`], [`Decision`], [`Rejection`]
 //! - [`Kernel`] implements `Decider<State = State>`
 //! - [`render::render`]
+//! - [`State`] is `Serialize + Deserialize` (JSON snapshots: load the snapshot,
+//!   then fold the events after it)
 
 use agent_proto::{Draft, EffectId, Effect, Envelope, Event, Input, Timestamp};
 
@@ -19,7 +21,9 @@ pub mod sched;
 pub mod state;
 
 pub use decide::{config_hash, start_session};
-pub use state::{Phase, State, Taint, PENDING_CONFIG_KIND, PENDING_SIGNAL_KIND};
+pub use state::{
+    Phase, State, Subagent, Taint, OVERFLOW_KIND, PENDING_CONFIG_KIND, PENDING_SIGNAL_KIND, SIGNAL_DROPPED_KIND,
+};
 
 use agent_proto::{KernelConfig, Prompt, Question, Rendered, SeqHead};
 
@@ -34,6 +38,25 @@ pub fn is_tainted(s: &State) -> bool {
 /// Full taint projection (sources, labels, private-data flag).
 pub fn taint(s: &State) -> &Taint {
     &s.taint
+}
+
+/// Destinations allowlisted for this session by a human ("allow this
+/// destination for the session"), in addition to the configured egress allowlist.
+pub fn allowed_destinations(s: &State) -> Vec<String> {
+    s.destinations.iter().cloned().collect()
+}
+
+/// Sub-agents spawned by this session (from `SubagentStarted` /
+/// `SubagentFinished`), ordered by spawning call id. Taint of a child's output is
+/// carried by the trust of the spawning call's tool result.
+pub fn subagents(s: &State) -> Vec<Subagent> {
+    s.children.values().cloned().collect()
+}
+
+/// Whether `Event::Tombstone` erased this event (directly or, for a summary,
+/// in cascade from one of its sources).
+pub fn is_erased(s: &State, id: &agent_proto::EventId) -> bool {
+    s.erased.contains(id)
 }
 
 /// Current execution phase.

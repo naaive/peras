@@ -4,9 +4,10 @@
 use crate::render::{self, RuleSet};
 use crate::state::State;
 use agent_proto::*;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum EntryKind {
     User,
     Assistant,
@@ -17,7 +18,7 @@ pub(crate) enum EntryKind {
 }
 
 /// One rendered fragment of the context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Entry {
     pub seq: Seq,
     pub id: EventId,
@@ -29,11 +30,14 @@ pub(crate) struct Entry {
     /// the entry was trimmed or replaced.
     pub source: Option<Arc<(Event, Trust)>>,
     pub trimmed: bool,
+    /// Tombstoned: the body was erased (rendering is the fixed erased form).
+    #[serde(default)]
+    pub erased: bool,
     pub at: Timestamp,
 }
 
 /// Context operations in application order (used to re-project after a rewind).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Op {
     Append(Entry),
     Replace { seq: Seq, id: EventId, at: Timestamp, rep: Arc<Replacement> },
@@ -77,6 +81,7 @@ pub(crate) fn apply_replacement(ctx: &mut Vec<Entry>, id: &EventId, at: Timestam
                 untrusted: rep.untrusted_sources.clone(),
                 source: None,
                 trimmed: true,
+                erased: false,
                 at,
             })
             .collect()
@@ -84,6 +89,17 @@ pub(crate) fn apply_replacement(ctx: &mut Vec<Entry>, id: &EventId, at: Timestam
     let at_pos = first.min(ctx.len());
     for (k, e) in new.into_iter().enumerate() {
         ctx.insert(at_pos + k, e);
+    }
+}
+
+/// The erased form of an entry (tombstone): fixed rendering, no source.
+pub(crate) fn erase_entry(rules: &RuleSet, e: &Entry) -> Entry {
+    Entry {
+        rendered: Arc::new(render::erased(rules, &e.rendered)),
+        source: None,
+        trimmed: true,
+        erased: true,
+        ..e.clone()
     }
 }
 
@@ -333,6 +349,7 @@ pub(crate) fn source_of(e: &Entry) -> crate::ContextSource {
         EntryKind::Other => "replaced",
     };
     let kind = match (&e.source, &e.kind) {
+        (_, _) if e.erased => format!("{base}:erased"),
         (Some(src), _) => src.0.type_name().to_string(),
         (None, EntryKind::Summary) => base.to_string(),
         (None, _) if e.trimmed => {

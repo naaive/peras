@@ -240,6 +240,39 @@ pub fn offload_images(rules: &RuleSet, r: &Rendered) -> Option<Rendered> {
     Some(Rendered { role: r.role, blocks, tokens, supersedable: r.supersedable })
 }
 
+/// Fixed text that replaces an erased (tombstoned) body.
+pub const ERASED: &str = "[erased]";
+
+/// The fixed rendering of a tombstoned event. Structure needed for tool
+/// pairing survives (tool_use ids and names, tool_result ids); every body is
+/// replaced by [`ERASED`], tool inputs by `{}`, and vendor-private blocks
+/// (thinking, opaque) are dropped.
+pub fn erased(rules: &RuleSet, r: &Rendered) -> Rendered {
+    let mut blocks: Vec<RBlock> = Vec::new();
+    let text = || RBlock::Text { text: ERASED.to_string() };
+    for b in &r.blocks {
+        match b {
+            RBlock::ToolUse { id, name, .. } => {
+                blocks.push(RBlock::ToolUse { id: id.clone(), name: name.clone(), input: serde_json::json!({}) })
+            }
+            RBlock::ToolResult { id, is_error, .. } => {
+                blocks.push(RBlock::ToolResult { id: id.clone(), content: vec![text()], is_error: *is_error })
+            }
+            RBlock::Thinking { .. } | RBlock::Opaque { .. } => {}
+            RBlock::Text { .. } | RBlock::Guidance { .. } | RBlock::Data { .. } | RBlock::Image { .. } => {
+                if !matches!(blocks.last(), Some(RBlock::Text { text }) if text == ERASED) {
+                    blocks.push(text());
+                }
+            }
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(text());
+    }
+    let tokens = estimate_blocks(rules, &blocks);
+    Rendered { role: r.role, blocks, tokens, supersedable: r.supersedable }
+}
+
 /// Rendering of a level-4 summary: the fixed note plus the summary text.
 pub fn summary(rules: &RuleSet, profile: &RenderProfile, trust: &Trust, text: &str) -> Rendered {
     let blocks = vec![RBlock::Guidance { text: SUMMARY_NOTE.to_string() }, frame(profile, trust, text.to_string())];

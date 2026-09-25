@@ -85,6 +85,53 @@ pub fn start_session(session: SessionId, profile_hash: String, config: KernelCon
     }
 }
 
+/// The mid-sequence notice for a Static-layer change (relative to the previous
+/// configuration, so successive updates each describe only their own delta).
+/// Tools added mid-sequence are announced but their definitions only enter the
+/// next sequence head; removed tools are denied at runtime until then.
+fn static_update_notice(old: &KernelConfig, new: &KernelConfig, head: &SeqHead) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if new.system != old.system {
+        parts.push(format!("System instructions updated:\n{}", new.system.join("\n")));
+    }
+    let names = |ts: &[ToolSpec]| ts.iter().map(|t| t.name.clone()).collect::<std::collections::BTreeSet<String>>();
+    let (before, after, in_head) = (names(&old.tools), names(&new.tools), names(&head.tools));
+    let added: Vec<String> = after.difference(&before).cloned().collect();
+    let removed: Vec<String> = before.difference(&after).cloned().collect();
+    let changed: Vec<String> = new
+        .tools
+        .iter()
+        .filter(|t| old.tools.iter().any(|o| o.name == t.name && o != *t))
+        .map(|t| t.name.clone())
+        .collect();
+    if !added.is_empty() {
+        let (known, deferred): (Vec<String>, Vec<String>) = added.into_iter().partition(|n| in_head.contains(n));
+        if !known.is_empty() {
+            parts.push(format!("Tools available again: {}.", known.join(", ")));
+        }
+        if !deferred.is_empty() {
+            parts.push(format!(
+                "Tools added: {}. Their definitions load with the next request sequence; do not call them before then.",
+                deferred.join(", ")
+            ));
+        }
+    }
+    if !removed.is_empty() {
+        parts.push(format!("Tools removed: {}. Do not call them; calls are denied.", removed.join(", ")));
+    }
+    if !changed.is_empty() {
+        parts.push(format!(
+            "Tool definitions changed: {}. The new definitions load with the next request sequence.",
+            changed.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("Configuration updated.\n{}", parts.join("\n")))
+    }
+}
+
 impl Cx {
     // ------------------------------------------------------------ emitting
 
@@ -372,7 +419,7 @@ impl Cx {
             }
         }
         if let (Answer::Allow { remember: true }, Some(d)) = (&answer, &pq.question.remember_destination) {
-            self.user(Event::DestinationAllowed { destination: d.clone() });
+            self.allow_destination(d.clone());
         }
         self.internal(Event::VerdictRecorded {
             subject: pq.subject.clone(),
@@ -385,6 +432,14 @@ impl Cx {
             self.after_turn_verdict(pq.point, Ring::Human, &verdict);
         }
         Ok(())
+    }
+
+    /// Allowlist a destination for the rest of the session (exfiltration
+    /// invariant and egress checks treat it like `egress_allow`).
+    fn allow_destination(&mut self, destination: String) {
+        if !self.s.destinations.contains(&destination) {
+            self.user(Event::DestinationAllowed { destination });
+        }
     }
 
     // ------------------------------------------------------------ sequences / config
@@ -417,6 +472,7 @@ impl Cx {
 
     fn apply_config(&mut self, new: KernelConfig) {
         let head = self.s.head.clone();
+        let old = self.cfg().clone();
         let hash = config_hash(&new);
         self.user(Event::ConfigChanged { profile_hash: hash, config: new.clone() });
         let Some(head) = head else {
@@ -431,13 +487,10 @@ impl Cx {
             self.open_sequence(model_changed);
         } else if static_changed {
             if caps.mid_sequence_updates {
-                let tools: Vec<&str> = new.tools.iter().map(|t| t.name.as_str()).collect();
-                let text = format!(
-                    "Configuration updated.\nSystem instructions:\n{}\nAvailable tools: {}",
-                    new.system.join("\n"),
-                    tools.join(", ")
-                );
-                self.visible(Origin::System, Trust::Guidance, Event::Injected { source: "system-update".into(), text });
+                // The head stays fixed within the sequence; the change is appended.
+                if let Some(text) = static_update_notice(&old, &new, &head) {
+                    self.visible(Origin::System, Trust::Guidance, Event::Injected { source: "system-update".into(), text });
+                }
             } else {
                 self.open_sequence(false);
             }
@@ -507,9 +560,9 @@ impl Cx {
                 self.settle(id);
                 self.executed(batch, results);
             }
-            (Effect::Gate(req), EffectResult::Gated { verdict, responder, .. }) => {
+            (Effect::Gate(req), EffectResult::Gated { verdict, responder, remember }) => {
                 self.settle(id);
-                self.gated(req, verdict, responder);
+                self.gated(req, verdict, responder, remember);
             }
             (Effect::Compact(job), EffectResult::Compacted { summary, trust }) => {
                 self.settle(id);
@@ -525,8 +578,9 @@ impl Cx {
                 self.settle(id);
                 self.user(Event::CheckpointTaken { info });
             }
-            (Effect::Restore(plan), EffectResult::Restored(report)) => {
+            (Effect::Restore(plan), EffectResult::Restored(mut report)) => {
                 self.settle(id);
+                self.complete_report(&plan, &mut report);
                 self.emit(Draft {
                     parent: Parent::Explicit(plan.to.clone()),
                     ..user_draft(Event::RewindCompleted { report, to: plan.to.clone() })
@@ -542,6 +596,17 @@ impl Cx {
             }
         }
         Ok(true)
+    }
+
+    /// Irreversible and network calls dispatched after the rewind target on the
+    /// current branch are listed in the report (they are never undone).
+    fn complete_report(&self, plan: &RestorePlan, report: &mut RestoreReport) {
+        let Some(target) = self.s.index.get(&plan.to) else { return };
+        for c in self.s.irreversible.iter() {
+            if c.seq > target && !self.s.is_abandoned(c.seq) && !report.irreversible.contains(&c.text) {
+                report.irreversible.push(c.text.clone());
+            }
+        }
     }
 
     fn on_failed(&mut self, eff: Effect, error: String) {
@@ -560,7 +625,7 @@ impl Cx {
                     FailureMode::Allow => Verdict::Allow,
                     FailureMode::Block | FailureMode::Human => Verdict::deny(format!("gate failed: {error}")),
                 };
-                self.gated(req, v, Responder::Kernel);
+                self.gated(req, v, Responder::Kernel, false);
             }
             Effect::Sample(_) => self.fail_turn(error),
             Effect::Compact(job) => {
@@ -578,13 +643,18 @@ impl Cx {
         }
         match &err {
             ModelError::Overflow => {
+                self.internal(Event::Plugin { kind: OVERFLOW_KIND.into(), ignorable: true, data: serde_json::Value::Null });
                 let trims = context::plan_trims(&self.s, true);
                 let any = !trims.is_empty();
                 for r in trims {
                     self.replaced(r);
                 }
                 if let Some(plan) = context::plan_overflow_segment(&self.s) {
-                    self.issue_compact(plan, true);
+                    if self.s.hooked(HookPoint::PreCompact) {
+                        self.pre_compact_gate();
+                    } else {
+                        self.issue_compact(plan, true);
+                    }
                 } else if !any {
                     self.fail_turn("context overflow: history cannot be shortened further".into());
                 }
@@ -650,17 +720,22 @@ impl Cx {
         }
     }
 
-    fn gated(&mut self, req: GateRequest, verdict: Verdict, responder: Responder) {
+    fn gated(&mut self, req: GateRequest, verdict: Verdict, responder: Responder, remember: bool) {
         let turn_no = self.s.turn.as_ref().map(|t| t.no).unwrap_or(0);
         let verdict = if req.ring == Ring::Human { self.check_human(&req, verdict, &responder) } else { verdict };
         if req.ring == Ring::Human {
             if let Some(q) = &req.question {
+                // "Allow this destination for the session" only accompanies an allow.
+                let destination = q.remember_destination.clone().filter(|_| remember && verdict == Verdict::Allow);
                 if self.s.questions.contains_key(&q.id) {
-                    self.user(Event::QuestionAnswered {
-                        question: q.id.clone(),
-                        answer: Self::answer_of(&verdict),
-                        responder: responder.clone(),
-                    });
+                    let answer = match (Self::answer_of(&verdict), &destination) {
+                        (Answer::Allow { .. }, Some(_)) => Answer::Allow { remember: true },
+                        (a, _) => a,
+                    };
+                    self.user(Event::QuestionAnswered { question: q.id.clone(), answer, responder: responder.clone() });
+                }
+                if let Some(d) = destination {
+                    self.allow_destination(d);
                 }
             }
         }
@@ -774,11 +849,28 @@ impl Cx {
         }
     }
 
+    fn pre_compact_gate(&mut self) {
+        let req = self.gate_req(HookPoint::PreCompact, Ring::Hook, GateSubject::PreCompact, None);
+        self.issue(Effect::Gate(req));
+    }
+
     fn issue_compact(&mut self, plan: SummaryPlan, overflow: bool) {
         let cfg = self.cfg().clone();
         let Some(head) = self.s.head.clone() else { return };
         let mut body = if overflow { plan.body } else { self.s.context.iter().map(|e| (*e.rendered).clone()).collect() };
-        body.push(Rendered::text(Role::User, cfg.compaction.instruction.clone()));
+        let preserve = match self.s.turn.as_ref().map(|t| &t.precompact) {
+            Some(PreCompact::Ready(p) | PreCompact::Done(p)) => p.clone(),
+            _ => vec![],
+        };
+        let mut instruction = cfg.compaction.instruction.clone();
+        if !preserve.is_empty() {
+            instruction.push_str("\n\nPoints to preserve:");
+            for p in &preserve {
+                instruction.push_str("\n- ");
+                instruction.push_str(p.trim());
+            }
+        }
+        body.push(Rendered::text(Role::User, instruction));
         let max_tokens = self.s.caps.as_ref().map(|c| c.max_output).unwrap_or(cfg.caps.max_output);
         self.issue(Effect::Compact(CompactJob { prompt: Prompt { head, body, max_tokens }, range: plan.range, overflow }));
     }
@@ -823,6 +915,15 @@ impl Cx {
             untrusted_sources: labels,
             content: vec![rendered],
         });
+        // A summary already invalidates the cache: if a mid-sequence update left
+        // the head behind the configuration (tools added / removed), load it now.
+        let stale = match (self.s.head.as_ref(), self.s.config.as_ref()) {
+            (Some(h), Some(c)) => h.tools != c.tools || h.system != c.system,
+            _ => false,
+        };
+        if stale {
+            self.open_sequence(false);
+        }
         if job.overflow && context::usage(&self.s) > context::hard_limit(&self.s) {
             if let Some(plan) = context::plan_overflow_segment(&self.s) {
                 self.issue_compact(plan, true);
@@ -884,7 +985,12 @@ impl Cx {
         if t.sample.is_some() || t.compact.is_some() {
             return false;
         }
-        if matches!(t.submit, TGate::Waiting(_)) || matches!(t.presample, TGate::Waiting(_)) || matches!(t.stop, TGate::Waiting(_)) {
+        if matches!(t.submit, TGate::Waiting(_))
+            || matches!(t.presample, TGate::Waiting(_))
+            || matches!(t.stop, TGate::Waiting(_))
+            || matches!(t.precompact, PreCompact::Waiting(_))
+            || matches!(self.s.session_gate, TGate::Waiting(_))
+        {
             return false;
         }
         if let Some(sl) = t.slots.iter().find(|sl| !sl.result && sl.gate == CallGate::Deferred) {
@@ -1029,6 +1135,11 @@ impl Cx {
             Some(t) => (t.cause, t.submit),
             None => return false,
         };
+        if self.s.hooked(HookPoint::SessionStart) && self.s.session_gate == TGate::None {
+            let req = self.gate_req(HookPoint::SessionStart, Ring::Hook, GateSubject::SessionStart, None);
+            self.issue(Effect::Gate(req));
+            return true;
+        }
         if self.s.hooked(HookPoint::UserSubmit)
             && matches!(cause, TurnCause::User | TurnCause::Queued)
             && submit == TGate::None
@@ -1050,14 +1161,38 @@ impl Cx {
             self.end_turn(TurnOutcome::BudgetExhausted { what });
             return true;
         }
-        let relief = self.s.turn.as_ref().map(|t| t.relief).unwrap_or(true);
-        if !relief && context::under_pressure(&self.s) {
+        let (relief, ready, overflow) = self
+            .s
+            .turn
+            .as_ref()
+            .map(|t| (t.relief, matches!(t.precompact, PreCompact::Ready(_)), t.overflow))
+            .unwrap_or((true, false, false));
+        if ready {
+            // The PreCompact hook answered: issue the summary it was asked about.
+            let plan = if overflow { context::plan_overflow_segment(&self.s) } else { context::plan_summary(&self.s) };
+            match plan {
+                Some(plan) => {
+                    self.issue_compact(plan, overflow);
+                    return true;
+                }
+                None if overflow => {
+                    self.fail_turn("context overflow: history cannot be shortened further".into());
+                    return true;
+                }
+                // Nothing left to summarise: sampling resets the hook state.
+                None => {}
+            }
+        } else if !relief && context::under_pressure(&self.s) {
             for r in context::plan_trims(&self.s, false) {
                 self.replaced(r);
             }
             if context::under_pressure(&self.s) {
                 if let Some(plan) = context::plan_summary(&self.s) {
-                    self.issue_compact(plan, false);
+                    if self.s.hooked(HookPoint::PreCompact) {
+                        self.pre_compact_gate();
+                    } else {
+                        self.issue_compact(plan, false);
+                    }
                     return true;
                 }
             }
@@ -1117,6 +1252,25 @@ impl Cx {
             return true;
         }
         let can_wake = self.s.continuations < self.s.max_continuations();
+        let user_queued = self.s.queue.iter().any(|q| matches!(q, QueueItem::User { .. }));
+        if !can_wake && !user_queued {
+            // Nothing queued can reset the continuation budget before the next
+            // idle point: a waiting wake would stay queued forever. Drop it,
+            // recording why (a later user input does not revive it).
+            if let Some(QueueItem::Wake { source, reason }) =
+                self.s.queue.iter().find(|q| matches!(q, QueueItem::Wake { .. })).cloned()
+            {
+                let data = serde_json::json!({
+                    "signal": Signal::Wake { source: source.clone(), reason },
+                    "reason": "continuation budget exhausted",
+                });
+                self.emit(Draft {
+                    origin: Origin::Session(source),
+                    ..user_draft(Event::Plugin { kind: SIGNAL_DROPPED_KIND.into(), ignorable: true, data })
+                });
+                return true;
+            }
+        }
         let pos = self.s.queue.iter().position(|q| match q {
             QueueItem::User { .. } => true,
             QueueItem::Wake { .. } => can_wake,

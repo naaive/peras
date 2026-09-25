@@ -78,7 +78,7 @@ fn in_workspace(root: &str, path: &str) -> bool {
 pub(crate) fn access_trust(s: &State, call: &ToolCall) -> Trust {
     let Some(cfg) = s.config.as_ref() else { return Trust::Internal };
     let sec = &cfg.security;
-    let m = &s.m;
+    let m = s.m();
     let mut out = Trust::Internal;
     for a in &call.access {
         let uri = a.resource.as_str();
@@ -113,7 +113,7 @@ pub(crate) fn access_trust(s: &State, call: &ToolCall) -> Trust {
 
 /// Does the call read private data?
 pub(crate) fn reads_private(s: &State, call: &ToolCall) -> bool {
-    call.access.iter().any(|a| a.mode == AccessMode::Read && s.m.private.is_match(a.resource.as_str()))
+    call.access.iter().any(|a| a.mode == AccessMode::Read && s.m().private.is_match(a.resource.as_str()))
 }
 
 /// Result of rings 1–3.
@@ -164,6 +164,38 @@ pub(crate) fn call_key(c: &ToolCall) -> String {
     format!("{}\u{0}{}", c.name, canonical(&c.input))
 }
 
+/// Maximum length (bytes) of the input summary in [`call_summary`].
+const SUMMARY_BYTES: usize = 80;
+
+/// `name input` with the canonical input JSON cut to a short prefix (used to
+/// list irreversible operations in rewind reports).
+pub(crate) fn call_summary(c: &ToolCall) -> String {
+    let input = canonical(&c.input);
+    if input.len() <= SUMMARY_BYTES {
+        return format!("{} {input}", c.name);
+    }
+    let mut end = SUMMARY_BYTES;
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} {}...", c.name, &input[..end])
+}
+
+/// A tool whose availability differs between the current sequence head and the
+/// configuration in force after a mid-sequence update: `tool_removed` (still
+/// defined in the head, removed from the configuration) or `tool_not_loaded`
+/// (added by the configuration; its definition enters the next sequence head).
+pub(crate) fn tool_mismatch(s: &State, name: &str) -> Option<&'static str> {
+    let (Some(cfg), Some(head)) = (s.config.as_ref(), s.head.as_ref()) else { return None };
+    let in_head = head.tools.iter().any(|t| t.name == name);
+    let in_cfg = cfg.tools.iter().any(|t| t.name == name);
+    match (in_head, in_cfg) {
+        (true, false) => Some("tool_removed"),
+        (false, true) => Some("tool_not_loaded"),
+        _ => None,
+    }
+}
+
 pub(crate) fn question_id(call: &CallId, rewrites: u32) -> QuestionId {
     QuestionId(format!("q:{}:{}", call, rewrites))
 }
@@ -172,7 +204,7 @@ pub(crate) fn question_id(call: &CallId, rewrites: u32) -> QuestionId {
 pub(crate) fn invariants(s: &State, call: &ToolCall) -> (Vec<String>, Option<String>) {
     let Some(cfg) = s.config.as_ref() else { return (vec![], None) };
     let sec = &cfg.security;
-    let m = &s.m;
+    let m = s.m();
     let tainted = s.taint.tainted;
     let private = s.taint.private_read || reads_private(s, call);
     let mut hits = Vec::new();
@@ -206,13 +238,16 @@ pub(crate) fn policy(s: &State, call: &ToolCall) -> (PolicyAction, Vec<String>) 
     if cfg.read_only_mode && side_effecting(call) {
         return (PolicyAction::Deny, vec!["read_only_mode".into()]);
     }
+    if let Some(why) = tool_mismatch(s, &call.name) {
+        return (PolicyAction::Deny, vec![why.into()]);
+    }
     let mut deny = Vec::new();
     let mut ask = Vec::new();
     let mut allow = Vec::new();
     let mut covered = vec![false; call.access.len()];
     let mut all_covered_by_tool_rule = false;
     for (i, rule) in cfg.rules.iter().enumerate() {
-        let (res_m, tool_m) = match s.m.rules.get(i) {
+        let (res_m, tool_m) = match s.m().rules.get(i) {
             Some(x) => x,
             None => continue,
         };

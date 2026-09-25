@@ -41,6 +41,7 @@ enum Act {
     Submit,
     SwitchModel,
     Rewind(usize),
+    Tombstone(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,7 @@ fn act() -> impl Strategy<Value = Act> {
         3 => Just(Act::Submit),
         1 => Just(Act::SwitchModel),
         1 => any::<usize>().prop_map(Act::Rewind),
+        1 => any::<usize>().prop_map(Act::Tombstone),
     ]
 }
 
@@ -135,7 +137,15 @@ fn config_for(sc: &Scenario) -> KernelConfig {
         1 => Some(OnAsk::Defer),
         _ => Some(OnAsk::Deny),
     };
-    let points = [HookPoint::PreTool, HookPoint::PostTool, HookPoint::Stop, HookPoint::UserSubmit, HookPoint::PreSample];
+    let points = [
+        HookPoint::PreTool,
+        HookPoint::PostTool,
+        HookPoint::Stop,
+        HookPoint::UserSubmit,
+        HookPoint::PreSample,
+        HookPoint::SessionStart,
+        HookPoint::PreCompact,
+    ];
     c.hooked = points.iter().enumerate().filter(|(i, _)| sc.hooked & (1 << i) != 0 && sc.hooked & 0x80 != 0).map(|(_, p)| *p).collect();
     if sc.small_window {
         c.caps.window = 600;
@@ -232,7 +242,7 @@ impl Driver {
                 } else {
                     gate_verdict(&req, v)
                 };
-                EffectResult::Gated { verdict, responder, remember: false }
+                EffectResult::Gated { verdict, responder, remember: v % 4 == 0 }
             }
             Effect::Compact(_) => {
                 if !benign && v % 10 == 9 {
@@ -331,6 +341,12 @@ impl Driver {
                     self.try_input(Input::Control(Control::Rewind { to }));
                 }
             }
+            Act::Tombstone(i) => {
+                if !self.h.log.is_empty() {
+                    let target = self.h.log[i % self.h.log.len()].id.clone();
+                    self.h.append(Event::Tombstone { target });
+                }
+            }
         }
     }
 
@@ -404,6 +420,14 @@ fn gate_verdict(req: &GateRequest, v: u8) -> (Verdict, Responder) {
                     Verdict::Rewrite(Proposal::Result(r))
                 }
                 _ => Verdict::Annotate(agent_proto::Context { text: "post".into(), trust: Trust::Guidance }),
+            };
+            (verdict, Responder::Hook("h".into()))
+        }
+        (GateSubject::SessionStart, _) | (GateSubject::PreCompact, _) => {
+            let verdict = match v % 3 {
+                0 => Verdict::Allow,
+                1 => Verdict::Annotate(agent_proto::Context { text: format!("keep {v}"), trust: Trust::Guidance }),
+                _ => Verdict::deny("ignored"),
             };
             (verdict, Responder::Hook("h".into()))
         }
@@ -627,7 +651,7 @@ fn check_cache_prefix(d: &Driver) {
     let mut replaced = false;
     for e in &d.h.log {
         match &e.body {
-            Event::Replaced(_) | Event::RewindCompleted { .. } => replaced = true,
+            Event::Replaced(_) | Event::RewindCompleted { .. } | Event::Tombstone { .. } => replaced = true,
             Event::SequenceOpened { .. } => last = None,
             Event::EffectIssued { effect: Effect::Sample(p), .. } => {
                 let body: Vec<String> = p.body.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
@@ -671,6 +695,8 @@ proptest! {
             for e in &d.h.log {
                 let k = match &e.body {
                     Event::EffectIssued { effect: Effect::Compact(j), .. } => format!("compact:{}", j.overflow),
+                    Event::EffectIssued { effect: Effect::Gate(g), .. } => format!("gate:{:?}", g.point),
+                    Event::Plugin { kind, .. } => format!("plugin:{kind}"),
                     Event::Replaced(r) => format!("replaced:{:?}", r.kind),
                     Event::TurnEnded { outcome } => format!("ended:{}", serde_json::to_value(outcome).unwrap()["kind"]),
                     b => b.type_name().to_string(),
@@ -679,6 +705,60 @@ proptest! {
             }
             eprintln!("STATS {}", kinds.into_iter().collect::<Vec<_>>().join(" "));
         }
+    }
+}
+
+/// Folding a prefix of the journal, persisting the state as JSON, loading it and
+/// folding the rest must be indistinguishable from the uninterrupted fold: same
+/// decisions for every later input, same prompts, same final state.
+fn check_snapshot_roundtrip(d: &Driver, cut: usize) {
+    let h = &d.h;
+    if h.steps.is_empty() {
+        return;
+    }
+    let first = cut % h.steps.len();
+    let fold = |s: &mut State, from: usize, to: usize| {
+        for e in &h.log[from..to] {
+            Kernel::evolve(s, e);
+        }
+    };
+    let roundtrip = |s: &State| -> State {
+        let json = serde_json::to_string(s).expect("state serialises");
+        serde_json::from_str(&json).expect("state deserialises")
+    };
+    let mut a = State::default();
+    let start = h.steps[first].0;
+    fold(&mut a, 0, start);
+    let mut b = roundtrip(&a);
+    assert_eq!(serde_json::to_value(&a).unwrap(), serde_json::to_value(&b).unwrap());
+    for (k, (before, input)) in h.steps.iter().enumerate().skip(first) {
+        let after = h.steps.get(k + 1).map(|x| x.0).unwrap_or(h.log.len());
+        if let Some((at, i)) = input {
+            let da = Kernel::decide(&a, *at, i.clone());
+            let db = Kernel::decide(&b, *at, i.clone());
+            assert_eq!(da, db, "decision differs after a snapshot round trip (step {k})");
+        }
+        assert_eq!(current_prompt(&a), current_prompt(&b));
+        fold(&mut a, *before, after);
+        fold(&mut b, *before, after);
+        // A second round trip mid-way must not matter either.
+        if k % 7 == 3 {
+            b = roundtrip(&b);
+        }
+    }
+    assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    assert_eq!(context(&a), context(&b));
+    assert_eq!(Kernel::outstanding(&a), Kernel::outstanding(&b));
+    assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&h.s).unwrap());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: std::env::var("KERNEL_PROP_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(100), failure_persistence: None, .. ProptestConfig::default() })]
+
+    #[test]
+    fn snapshot_round_trip_continues_identically(sc in scenario(), cut in any::<usize>()) {
+        let d = run(&sc);
+        check_snapshot_roundtrip(&d, cut);
     }
 }
 
