@@ -23,3 +23,7 @@ reqwest.workspace = true
 bytes = "1"
 libc = "0.2"
 tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"

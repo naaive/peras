@@ -1,15 +1,26 @@
 //! OS sandboxes. [`probe`] detects what the platform offers; [`detect`] picks
-//! the best implementation (bubblewrap on Linux, seatbelt on macOS, else the
-//! unisolated [`DirectExec`] which reports `available = false`).
+//! the best implementation: on Linux bubblewrap, else the landlock + seccomp
+//! fallback ([`LandlockSandbox`], always offline), else the unisolated
+//! [`DirectExec`] (which reports `available = false`); seatbelt on macOS.
+//!
+//! Also here: the [`EgressProxy`] (allowlisted HTTP CONNECT / plain HTTP),
+//! copy-based isolated execution ([`IsolatedCopy`], [`apply_isolated_changes`])
+//! and the disposable [`Container`].
 
 pub mod bwrap;
 pub mod container;
 pub mod direct;
+pub mod egress;
+pub mod isolate;
+pub mod landlock_seccomp;
 pub mod seatbelt;
 
 pub use bwrap::BwrapSandbox;
 pub use container::Container;
 pub use direct::DirectExec;
+pub use egress::{Allowlist, EgressEvent, EgressProxy};
+pub use isolate::{apply_isolated_changes, Change, ChangeKind, IsolatedCopy, IsolatedRun};
+pub use landlock_seccomp::LandlockSandbox;
 pub use seatbelt::{seatbelt_profile, SeatbeltSandbox};
 
 use agent_runtime::{ExecOutput, SandboxPort, SandboxReport};
@@ -22,49 +33,56 @@ use tokio_util::sync::CancellationToken;
 
 /// Probe platform sandbox capability (what `agent doctor` reports).
 pub fn probe() -> SandboxReport {
+    select().1
+}
+
+/// The best available sandbox for this platform.
+pub fn detect() -> Arc<dyn SandboxPort> {
+    select().0
+}
+
+/// Linux preference: bubblewrap > landlock + seccomp > direct. The chosen
+/// report carries the reasons earlier candidates were rejected.
+fn select() -> (Arc<dyn SandboxPort>, SandboxReport) {
     #[cfg(target_os = "macos")]
     {
-        return SeatbeltSandbox::probe_report();
+        let r = SeatbeltSandbox::probe_report();
+        if r.available {
+            return (Arc::new(SeatbeltSandbox::new()), r);
+        }
+        let d = DirectExec::new(r.notes);
+        let r = d.report();
+        return (Arc::new(d), r);
     }
     #[allow(unreachable_code)]
     {
         let mut notes = vec![];
         if cfg!(target_os = "linux") {
             match BwrapSandbox::probe() {
-                Ok(b) => return b.report(),
+                Ok(b) => {
+                    let r = b.report();
+                    return (Arc::new(b), r);
+                }
                 Err(n) => notes.push(n),
             }
-            if landlock_listed() {
-                notes.push("landlock LSM is enabled but the landlock backend is not implemented".into());
-            } else {
-                notes.push("landlock LSM not available".into());
+            match LandlockSandbox::probe() {
+                Ok(l) => {
+                    let mut r = l.report();
+                    notes.push("falling back to landlock + seccomp".into());
+                    notes.append(&mut r.notes);
+                    r.notes = notes;
+                    return (Arc::new(l), r);
+                }
+                Err(n) => notes.push(n),
             }
         } else {
             notes.push(format!("no sandbox backend for {}", std::env::consts::OS));
         }
         notes.push("commands run without isolation; offline-only guarantees are not enforced".into());
-        SandboxReport { implementation: "none".into(), available: false, egress_proxy: false, isolation: false, notes }
+        let d = DirectExec::new(notes);
+        let r = d.report();
+        (Arc::new(d), r)
     }
-}
-
-/// The best available sandbox for this platform.
-pub fn detect() -> Arc<dyn SandboxPort> {
-    #[cfg(target_os = "macos")]
-    {
-        if SeatbeltSandbox::probe_report().available {
-            return Arc::new(SeatbeltSandbox::new());
-        }
-    }
-    if cfg!(target_os = "linux") {
-        if let Ok(b) = BwrapSandbox::probe() {
-            return Arc::new(b);
-        }
-    }
-    Arc::new(DirectExec::new(probe().notes))
-}
-
-fn landlock_listed() -> bool {
-    std::fs::read_to_string("/sys/kernel/security/lsm").map(|s| s.split(',').any(|x| x.trim() == "landlock")).unwrap_or(false)
 }
 
 /// Find an executable in `PATH`.
