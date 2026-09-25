@@ -286,6 +286,13 @@ pub trait GateExecutor: Send + Sync {
     async fn evaluate_in(&self, req: &GateRequest, _ctx: &GateCtx) -> (Verdict, Responder) {
         self.evaluate(req).await
     }
+    /// Called by the driver. Defaults to [`GateExecutor::evaluate_in`] with
+    /// `remember: false`; executors that surface human answers override it to
+    /// carry `Answer::Allow { remember }`. (ADDITIVE)
+    async fn evaluate_outcome(&self, req: &GateRequest, ctx: &GateCtx) -> GateOutcome {
+        let (verdict, responder) = self.evaluate_in(req, ctx).await;
+        GateOutcome::new(verdict, responder)
+    }
 }
 
 /// An observer: event-stream subscriber with its own cursor. At-least-once
@@ -349,4 +356,57 @@ impl<T: ToolName + ?Sized> ToolName for &T {
     fn tool_name(&self) -> String {
         (**self).tool_name()
     }
+}
+
+// ---------------------------------------------------------------- gate outcome (ADDITIVE)
+
+/// Full result of a gate evaluation: the verdict, who gave it, and whether the
+/// human chose "allow this destination for the rest of the session"
+/// (`Answer::Allow { remember: true }`). Carried into
+/// `EffectResult::Gated { remember }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateOutcome {
+    pub verdict: Verdict,
+    pub responder: Responder,
+    pub remember: bool,
+}
+
+impl GateOutcome {
+    pub fn new(verdict: Verdict, responder: Responder) -> Self {
+        GateOutcome { verdict, responder, remember: false }
+    }
+}
+
+// ---------------------------------------------------------------- state snapshots (ADDITIVE)
+
+/// Serialization contract for a decider's state, supplied to the runtime
+/// builder when the state can be snapshotted. Snapshots are only a cache:
+/// a snapshot that fails to decode is ignored and the journal is folded from
+/// the start instead.
+pub trait StateCodec<S>: Send + Sync {
+    fn encode(&self, state: &S) -> Result<Vec<u8>, String>;
+    fn decode(&self, bytes: &[u8]) -> Result<S, String>;
+}
+
+// ---------------------------------------------------------------- request verification (ADDITIVE)
+
+/// Rebuilds, from the journal alone, the prompt the kernel sent with a
+/// `Sample` effect. Used by the debug request-consistency check
+/// (`RuntimeOptions::verify_requests`): the rebuilt and the actual prompt are
+/// both encoded with the model's encoder and must be byte-identical.
+pub trait PromptRebuilder: Send + Sync {
+    /// `events` is the session's journal up to and including the
+    /// `EffectIssued` event of `effect`.
+    fn rebuild(&self, events: &[Envelope<Event>], effect: EffectId) -> Result<Prompt, String>;
+}
+
+// ---------------------------------------------------------------- observer cursors (ADDITIVE)
+
+/// Persisted per-(session, observer) delivery cursors, so observers resume
+/// where they stopped instead of replaying the whole journal after a resume.
+/// A cursor is the next seq to deliver (everything below it was delivered).
+#[async_trait]
+pub trait ObserverCursors: Send + Sync {
+    async fn load(&self, session: &SessionId, observer: &str) -> Result<Option<Seq>, StoreError>;
+    async fn save(&self, session: &SessionId, observer: &str, next: Seq) -> Result<(), StoreError>;
 }

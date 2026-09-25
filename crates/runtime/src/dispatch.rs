@@ -4,12 +4,14 @@
 
 use crate::assemble::Assembler;
 use crate::gate::AskBoard;
+use crate::metrics::Metrics;
 use crate::ports::*;
 use crate::registry::ToolRegistry;
 use agent_proto::*;
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -28,13 +30,41 @@ pub struct RuntimeOptions {
     /// Idempotency keys remembered per session.
     pub dedupe_capacity: usize,
     /// Observers re-receive the whole journal when a session is resumed
-    /// (at-least-once without a persisted cursor).
+    /// (at-least-once without a persisted cursor). Only consulted in
+    /// [`ObserverResume::Cursor`] mode when no cursor store is configured.
     pub observer_replay_on_resume: bool,
     /// Sessions whose crash-recovered Network/Irreversible/Opaque calls should
     /// be re-asked rather than reported. Currently informational: see
     /// `recover_batch` (we always report, so the model re-issues through the
     /// normal, journaled gate path).
     pub interactive: bool,
+    /// Save a state snapshot (through `JournalStore::save_snapshot`) every
+    /// this many events; needs a `StateCodec` on the builder. 0 = never.
+    pub snapshot_every: u64,
+    /// Debug request-consistency check: before each sample, rebuild the prompt
+    /// from the journal with the builder's `PromptRebuilder`, encode both with
+    /// the model's encoder and fail the sample on any byte difference.
+    /// Default: on in debug builds.
+    pub verify_requests: bool,
+    /// `Pulse::Heartbeat` interval while any effect is in flight. 0 = off.
+    pub heartbeat_ms: u64,
+    /// Where observers start when a session is resumed.
+    pub observer_resume: ObserverResume,
+}
+
+/// Where observers start delivering when a session is resumed (new sessions
+/// always start at 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObserverResume {
+    /// From the observer's persisted cursor (builder `observer_cursors`); an
+    /// observer without a saved cursor starts at 0. Without a cursor store this
+    /// falls back to [`RuntimeOptions::observer_replay_on_resume`].
+    #[default]
+    Cursor,
+    /// Replay the whole journal (at-least-once, no cursor needed).
+    Replay,
+    /// Only events appended after the resume.
+    Live,
 }
 
 impl Default for RuntimeOptions {
@@ -48,6 +78,10 @@ impl Default for RuntimeOptions {
             dedupe_capacity: 256,
             observer_replay_on_resume: true,
             interactive: true,
+            snapshot_every: 500,
+            verify_requests: cfg!(debug_assertions),
+            heartbeat_ms: 5000,
+            observer_resume: ObserverResume::Cursor,
         }
     }
 }
@@ -68,6 +102,12 @@ pub struct Env {
     pub ids: Arc<dyn IdGen>,
     pub observers: Vec<Arc<dyn Observer>>,
     pub options: RuntimeOptions,
+    /// Shared runtime metrics.
+    pub metrics: Arc<Metrics>,
+    /// Debug request-consistency check (see [`RuntimeOptions::verify_requests`]).
+    pub rebuilder: Option<Arc<dyn PromptRebuilder>>,
+    /// Persisted observer cursors.
+    pub cursors: Option<Arc<dyn ObserverCursors>>,
 }
 
 /// Where effect tasks send their outputs.
@@ -90,6 +130,8 @@ pub async fn sample(
 ) -> Option<Result<AssistantMessage, ModelError>> {
     let model = env.model.clone();
     let req = model.encoder().encode(&prompt.head, &prompt.body, prompt.max_tokens);
+    let started = Instant::now();
+    let mut first_token = false;
     let mut stream = model.stream(req);
     loop {
         let next = tokio::select! {
@@ -101,6 +143,12 @@ pub async fn sample(
             None => break,
             Some(Err(e)) => return Some(Err(e)),
             Some(Ok(delta)) => {
+                if !first_token
+                    && matches!(delta, Delta::Text(_) | Delta::Thinking(_) | Delta::ToolUseStart { .. } | Delta::Opaque { .. })
+                {
+                    first_token = true;
+                    env.metrics.first_token.observe(started.elapsed());
+                }
                 let pushed = asm.lock().unwrap().push(delta, &env.tools);
                 if let Some(t) = pushed.pulse_text {
                     let _ = pulses.send(Pulse::TextDelta { effect: id, text: t });
@@ -118,7 +166,48 @@ pub async fn sample(
         return None;
     }
     let msg = asm.lock().unwrap().finish();
+    env.metrics.observe_usage(&msg.usage);
     Some(Ok(msg))
+}
+
+/// Debug request-consistency check for the `Sample` effect `id`: rebuild its
+/// prompt from the journal with `rebuilder`, encode both with the model's
+/// encoder and compare the bytes. `Err` carries the mismatch description.
+pub async fn verify_request(
+    env: &Env,
+    rebuilder: &dyn PromptRebuilder,
+    session: &SessionId,
+    id: EffectId,
+    prompt: &Prompt,
+) -> Result<(), String> {
+    let mut events = env.journal.load(session, 0).await.map_err(|e| format!("loading the journal: {e}"))?;
+    let issued = events
+        .iter()
+        .position(|e| matches!(&e.body, Event::EffectIssued { id: i, .. } if *i == id))
+        .ok_or_else(|| format!("EffectIssued for {id} not found in the journal"))?;
+    events.truncate(issued + 1);
+    let rebuilt = rebuilder.rebuild(&events, id).map_err(|e| format!("rebuilding the prompt: {e}"))?;
+    let enc = env.model.encoder();
+    let actual = enc.encode(&prompt.head, &prompt.body, prompt.max_tokens);
+    let derived = enc.encode(&rebuilt.head, &rebuilt.body, rebuilt.max_tokens);
+    let bytes = |r: &Request| {
+        let mut b = serde_json::to_vec(&r.body).unwrap_or_default();
+        b.extend_from_slice(format!("|v{}|max{}", r.encoder_version, r.max_tokens).as_bytes());
+        b
+    };
+    let (a, d) = (bytes(&actual), bytes(&derived));
+    if a == d {
+        return Ok(());
+    }
+    let at = a.iter().zip(&d).position(|(x, y)| x != y).unwrap_or(a.len().min(d.len()));
+    let window = |b: &[u8]| String::from_utf8_lossy(&b[at.saturating_sub(40)..(at + 40).min(b.len())]).into_owned();
+    Err(format!(
+        "request derived from the journal differs from the kernel's request at byte {at} (actual {} bytes, derived {} bytes): actual ...{}... derived ...{}...",
+        a.len(),
+        d.len(),
+        window(&a),
+        window(&d)
+    ))
 }
 
 pub async fn compact(
@@ -223,7 +312,10 @@ pub async fn run_call(
         progress,
         subagents: env.subagents.clone(),
     };
-    match tool.call(call.input.clone(), ctx).await {
+    let started = Instant::now();
+    let r = tool.call(call.input.clone(), ctx).await;
+    env.metrics.tool_calls.observe(started.elapsed());
+    match r {
         Ok(out) => {
             let content = spill(env, out.content).await.map_err(|e| e.to_string())?;
             Ok(ToolResult {
@@ -321,15 +413,22 @@ pub async fn recover_batch(
 
 pub async fn gate(env: &Env, req: &GateRequest, ctx: GateCtx) -> Option<EffectResult> {
     let cancel = ctx.cancel.clone();
-    let (verdict, responder) = tokio::select! {
+    let out = tokio::select! {
         biased;
         _ = cancel.cancelled() => return None,
-        r = env.gates.evaluate_in(req, &ctx) => r,
+        r = env.gates.evaluate_outcome(req, &ctx) => r,
     };
-    Some(EffectResult::Gated { verdict, responder, remember: false })
+    Some(EffectResult::Gated { verdict: out.verdict, responder: out.responder, remember: out.remember })
 }
 
 pub async fn checkpoint(env: &Env, scope: &CheckpointScope) -> EffectResult {
+    let started = Instant::now();
+    let r = checkpoint_inner(env, scope).await;
+    env.metrics.checkpoints.observe(started.elapsed());
+    r
+}
+
+async fn checkpoint_inner(env: &Env, scope: &CheckpointScope) -> EffectResult {
     if !scope.declared_writes.is_empty() {
         if let Err(e) = env.checkpointer.save_originals(&scope.declared_writes).await {
             return EffectResult::Failed { error: format!("save originals: {e}") };

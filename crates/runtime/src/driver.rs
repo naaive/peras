@@ -7,13 +7,23 @@
 //! subscribers -> **then** effects are dispatched as tasks whose results come
 //! back as `Input::Completed`. Rejections write nothing.
 //!
-//! State snapshots are not written: the kernel state has no serialization
-//! contract yet, so load = fold the whole journal.
+//! State snapshots: when the builder is given a [`StateCodec`], the actor saves
+//! the folded state through `JournalStore::save_snapshot` every
+//! `RuntimeOptions::snapshot_every` events, and a resume loads the latest
+//! snapshot plus the events after it. A snapshot that cannot be decoded is
+//! ignored (full fold): snapshots are only a cache.
+//!
+//! Tracing: one `session` span per actor (fields `session.id`,
+//! `session.parent` for sub-agents; it also `follows_from` the span that
+//! created it), a `turn` span from `TurnStarted` to `TurnEnded`, and one
+//! `effect` span per dispatched effect (`session.id`, `effect.kind`,
+//! `effect.id`).
 
 use crate::assemble::Assembler;
-use crate::dispatch::{self, EffectSink, Env, RuntimeOptions};
+use crate::dispatch::{self, EffectSink, Env, ObserverResume, RuntimeOptions};
 use crate::gate::{human_responder, AnswerError, AskBoard, GateChain};
 use crate::mem::*;
+use crate::metrics::Metrics;
 use crate::ports::*;
 use crate::registry::ToolRegistry;
 use agent_kernel::{Decider, Decision};
@@ -22,8 +32,12 @@ use futures::stream::{self, BoxStream, StreamExt};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Span};
+
+type Codec<S> = Option<Arc<dyn StateCodec<S>>>;
 
 // ---------------------------------------------------------------- errors / acks
 
@@ -57,6 +71,49 @@ impl From<StoreError> for DriverError {
     }
 }
 
+fn snap_seq_of(fold_from: Seq) -> Option<Seq> {
+    (fold_from > 0).then_some(fold_from)
+}
+
+/// Runtime frame around the codec's bytes in a stored snapshot:
+/// `MAGIC | u32 BE header length | header JSON | codec bytes`. Snapshots
+/// without the frame are passed to the codec whole.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SnapshotHeader {
+    #[serde(default)]
+    seq: Option<Seq>,
+    #[serde(default)]
+    parent_session: Option<SessionId>,
+}
+
+const SNAPSHOT_MAGIC: &[u8; 8] = b"AGSNAP1\n";
+
+impl SnapshotHeader {
+    fn frame(&self, body: &[u8]) -> Vec<u8> {
+        let header = serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec());
+        let mut out = Vec::with_capacity(SNAPSHOT_MAGIC.len() + 4 + header.len() + body.len());
+        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn split(bytes: &[u8]) -> (SnapshotHeader, &[u8]) {
+        let Some(rest) = bytes.strip_prefix(SNAPSHOT_MAGIC.as_slice()) else {
+            return (SnapshotHeader::default(), bytes);
+        };
+        if rest.len() < 4 {
+            return (SnapshotHeader::default(), bytes);
+        }
+        let n = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        match rest.get(4..4 + n).and_then(|h| serde_json::from_slice::<SnapshotHeader>(h).ok()) {
+            Some(h) => (h, &rest[4 + n..]),
+            None => (SnapshotHeader::default(), bytes),
+        }
+    }
+}
+
 /// Result of an accepted input / command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
@@ -84,16 +141,17 @@ enum Msg {
 pub struct Runtime<D: Decider> {
     env: Arc<Env>,
     sessions: Arc<Mutex<HashMap<SessionId, SessionHandle<D>>>>,
+    codec: Codec<D::State>,
     _d: PhantomData<fn() -> D>,
 }
 
 impl<D: Decider> Clone for Runtime<D> {
     fn clone(&self) -> Self {
-        Runtime { env: self.env.clone(), sessions: self.sessions.clone(), _d: PhantomData }
+        Runtime { env: self.env.clone(), sessions: self.sessions.clone(), codec: self.codec.clone(), _d: PhantomData }
     }
 }
 
-pub struct RuntimeBuilder<D> {
+pub struct RuntimeBuilder<D: Decider> {
     journal: Option<Arc<dyn JournalStore>>,
     blobs: Option<Arc<dyn BlobStore>>,
     model: Option<Arc<dyn ModelPort>>,
@@ -108,10 +166,14 @@ pub struct RuntimeBuilder<D> {
     ids: Option<Arc<dyn IdGen>>,
     observers: Vec<Arc<dyn Observer>>,
     options: RuntimeOptions,
+    codec: Codec<D::State>,
+    metrics: Option<Arc<Metrics>>,
+    rebuilder: Option<Arc<dyn PromptRebuilder>>,
+    cursors: Option<Arc<dyn ObserverCursors>>,
     _d: PhantomData<fn() -> D>,
 }
 
-impl<D> Default for RuntimeBuilder<D> {
+impl<D: Decider> Default for RuntimeBuilder<D> {
     fn default() -> Self {
         RuntimeBuilder {
             journal: None,
@@ -128,6 +190,10 @@ impl<D> Default for RuntimeBuilder<D> {
             ids: None,
             observers: vec![],
             options: RuntimeOptions::default(),
+            codec: None,
+            metrics: None,
+            rebuilder: None,
+            cursors: None,
             _d: PhantomData,
         }
     }
@@ -193,6 +259,28 @@ where
         self.options = o;
         self
     }
+    /// Enables state snapshots (every `RuntimeOptions::snapshot_every` events)
+    /// and snapshot-based resume.
+    pub fn state_codec(mut self, c: Arc<dyn StateCodec<D::State>>) -> Self {
+        self.codec = Some(c);
+        self
+    }
+    /// Share a metrics registry (default: a fresh one per runtime).
+    pub fn metrics(mut self, m: Arc<Metrics>) -> Self {
+        self.metrics = Some(m);
+        self
+    }
+    /// Enables the request-consistency check when
+    /// `RuntimeOptions::verify_requests` is set.
+    pub fn prompt_rebuilder(mut self, r: Arc<dyn PromptRebuilder>) -> Self {
+        self.rebuilder = Some(r);
+        self
+    }
+    /// Persist observer cursors (see `RuntimeOptions::observer_resume`).
+    pub fn observer_cursors(mut self, c: Arc<dyn ObserverCursors>) -> Self {
+        self.cursors = Some(c);
+        self
+    }
 
     /// Never fails: missing ports get in-memory / null defaults
     /// (`MemJournal`, `MemBlobStore`, `NoModel`, empty tools, `GateChain`,
@@ -214,8 +302,11 @@ where
             ids: self.ids.unwrap_or_else(|| Arc::new(UlidGen::new())),
             observers: self.observers,
             options,
+            metrics: self.metrics.unwrap_or_default(),
+            rebuilder: self.rebuilder,
+            cursors: self.cursors,
         };
-        Runtime { env: Arc::new(env), sessions: Arc::default(), _d: PhantomData }
+        Runtime { env: Arc::new(env), sessions: Arc::default(), codec: self.codec, _d: PhantomData }
     }
 }
 
@@ -235,6 +326,10 @@ where
         &self.env.tools
     }
 
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.env.metrics
+    }
+
     /// Live session handle, if this runtime drives it.
     pub fn session(&self, id: &SessionId) -> Option<SessionHandle<D>> {
         self.sessions.lock().unwrap().get(id).cloned()
@@ -248,13 +343,14 @@ where
         if self.env.journal.next_seq(&id).await? != 0 {
             return Err(DriverError::AlreadyExists(id));
         }
-        let (mut actor, handle, rx) = Actor::<D>::new(self.env.clone(), id.clone(), lease, D::State::default(), vec![]);
+        let (mut actor, handle, rx) =
+            Actor::<D>::new(self.env.clone(), self.codec.clone(), id.clone(), lease, D::State::default(), vec![], None);
         let at = self.env.clock.now();
         let (_, effects) = actor.commit_async(initial, at).await?;
         for (eid, eff) in effects {
             actor.dispatch(eid, eff, false);
         }
-        self.start(actor, handle.clone(), rx, 0);
+        self.start(actor, handle.clone(), rx, None);
         Ok(handle)
     }
 
@@ -262,24 +358,43 @@ where
     /// effects (see [`dispatch::recover_batch`] for tool calls).
     pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle<D>, DriverError> {
         let lease = self.env.journal.acquire_lease(&id).await?;
-        let events = self.env.journal.load(&id, 0).await?;
+        let keep = self.env.options.recent_capacity.max(1);
+        let (state, events, snap) = match self.load_snapshot(&id).await? {
+            Some((snap_seq, state, header)) => {
+                let head = self.env.journal.next_seq(&id).await?;
+                // Also load enough history for the in-memory recent window.
+                let from = snap_seq.min(head.saturating_sub(keep as u64));
+                let events = self.env.journal.load(&id, from).await?;
+                (Some((snap_seq, state)), events, Some(header))
+            }
+            None => (None, self.env.journal.load(&id, 0).await?, None),
+        };
         if events.is_empty() {
             return Err(DriverError::NotFound(id));
         }
-        let mut state = D::State::default();
-        for e in &events {
+        let (mut state, fold_from) = match state {
+            Some((seq, s)) => (s, seq),
+            None => (D::State::default(), 0),
+        };
+        let mut parent = snap.and_then(|h| h.parent_session);
+        for e in events.iter().filter(|e| e.seq >= fold_from) {
             D::evolve(&mut state, e);
+            self.env.metrics.prime(&id, e);
+            if let Event::SessionStarted { parent_session: Some(p), .. } = &e.body {
+                parent = Some(p.clone());
+            }
         }
         let outstanding = D::outstanding(&state);
-        let keep = self.env.options.recent_capacity.max(1);
         let recent: Vec<_> = events[events.len().saturating_sub(keep)..].to_vec();
-        let (mut actor, handle, rx) = Actor::<D>::new(self.env.clone(), id.clone(), lease, state, recent);
+        let (mut actor, handle, rx) =
+            Actor::<D>::new(self.env.clone(), self.codec.clone(), id.clone(), lease, state, recent, parent);
+        actor.last_snapshot = fold_from;
         let next = actor.next_seq;
+        tracing::debug!(parent: &actor.span, snapshot = ?snap_seq_of(fold_from), next, "session resumed");
         for (eid, eff) in outstanding {
             actor.dispatch(eid, eff, true);
         }
-        let observe_from = if self.env.options.observer_replay_on_resume { 0 } else { next };
-        self.start(actor, handle.clone(), rx, observe_from);
+        self.start(actor, handle.clone(), rx, Some(next));
         Ok(handle)
     }
 
@@ -307,21 +422,88 @@ where
         }
     }
 
-    fn start(&self, actor: Actor<D>, handle: SessionHandle<D>, rx: mpsc::UnboundedReceiver<Msg>, observe_from: Seq) {
+    /// Latest decodable snapshot: `(seq, state, header)`. Undecodable or
+    /// inconsistent snapshots are ignored (full fold).
+    async fn load_snapshot(&self, id: &SessionId) -> Result<Option<(Seq, D::State, SnapshotHeader)>, DriverError> {
+        let Some(codec) = &self.codec else { return Ok(None) };
+        let (seq, bytes) = match self.env.journal.load_snapshot(id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "loading the state snapshot failed; folding the whole journal");
+                return Ok(None);
+            }
+        };
+        let next = self.env.journal.next_seq(id).await?;
+        if seq == 0 || seq > next {
+            tracing::warn!(session = %id, seq, next, "state snapshot is beyond the journal head; ignored");
+            return Ok(None);
+        }
+        let (header, body) = SnapshotHeader::split(&bytes);
+        if header.seq.is_some_and(|s| s != seq) {
+            tracing::warn!(session = %id, seq, "state snapshot header does not match its seq; ignored");
+            return Ok(None);
+        }
+        match codec.decode(body) {
+            Ok(state) => Ok(Some((seq, state, header))),
+            Err(e) => {
+                tracing::warn!(session = %id, seq, error = %e, "state snapshot does not decode; folding the whole journal");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `resumed_at`: the head seq when the session was resumed (None = new).
+    fn start(&self, actor: Actor<D>, handle: SessionHandle<D>, rx: mpsc::UnboundedReceiver<Msg>, resumed_at: Option<Seq>) {
         for obs in &self.env.observers {
-            let mut events = handle.subscribe(observe_from);
+            let shared = handle.shared.clone();
             let obs = obs.clone();
             let sid = handle.id().clone();
-            tokio::spawn(async move {
-                while let Some(ev) = events.next().await {
-                    if let Err(e) = obs.on_event(&sid, &ev).await {
-                        tracing::warn!(observer = obs.name(), seq = ev.seq, error = %e, "observer failed");
+            let cursors = self.env.cursors.clone();
+            let opts = self.env.options.clone();
+            let span = actor.span.clone();
+            tokio::spawn(
+                async move {
+                    let name = obs.name().to_string();
+                    let from = match resumed_at {
+                        None => 0,
+                        Some(head) => match (opts.observer_resume, &cursors) {
+                            (ObserverResume::Replay, _) => 0,
+                            (ObserverResume::Live, _) => head,
+                            (ObserverResume::Cursor, Some(c)) => match c.load(&sid, &name).await {
+                                Ok(cur) => cur.unwrap_or(0).min(head),
+                                Err(e) => {
+                                    tracing::warn!(observer = %name, error = %e, "loading observer cursor failed; replaying");
+                                    0
+                                }
+                            },
+                            (ObserverResume::Cursor, None) => {
+                                if opts.observer_replay_on_resume {
+                                    0
+                                } else {
+                                    head
+                                }
+                            }
+                        },
+                    };
+                    let mut events = subscribe_shared(shared, from);
+                    while let Some(ev) = events.next().await {
+                        if let Err(e) = obs.on_event(&sid, &ev).await {
+                            tracing::warn!(observer = %name, seq = ev.seq, error = %e, "observer failed");
+                        }
+                        if let Some(c) = &cursors {
+                            if let Err(e) = c.save(&sid, &name, ev.seq + 1).await {
+                                tracing::warn!(observer = %name, seq = ev.seq, error = %e, "saving observer cursor failed");
+                            }
+                        }
                     }
                 }
-            });
+                .instrument(span),
+            );
         }
         self.sessions.lock().unwrap().insert(handle.id().clone(), handle);
-        tokio::spawn(actor.run(rx));
+        let span = actor.span.clone();
+        tokio::spawn(actor.run(rx).instrument(span));
     }
 }
 
@@ -414,6 +596,18 @@ where
     /// live. Ordered, gap-free; a slow subscriber lags, never blocks the driver.
     /// Ends when the session actor stops.
     pub fn subscribe(&self, from_seq: Seq) -> BoxStream<'static, Envelope<Event>> {
+        subscribe_shared(self.shared.clone(), from_seq)
+    }
+
+    /// Transient pulses (token deltas, tool progress, heartbeats). Lossy.
+    pub fn pulses(&self) -> broadcast::Receiver<Pulse> {
+        self.shared.pulses.subscribe()
+    }
+}
+
+/// See [`SessionHandle::subscribe`]. Holds only the shared read side, never
+/// the actor's sender.
+fn subscribe_shared<S: Send + Sync + 'static>(shared: Arc<Shared<S>>, from_seq: Seq) -> BoxStream<'static, Envelope<Event>> {
         struct St<S> {
             shared: Arc<Shared<S>>,
             cursor: Seq,
@@ -422,10 +616,10 @@ where
             closed: bool,
         }
         let st = St {
-            shared: self.shared.clone(),
+            head_rx: shared.head_rx.clone(),
+            shared,
             cursor: from_seq,
             buf: VecDeque::new(),
-            head_rx: self.shared.head_rx.clone(),
             closed: false,
         };
         stream::unfold(st, |mut st| async move {
@@ -462,13 +656,12 @@ where
             }
         })
         .boxed()
-    }
+}
 
-    /// Transient pulses (token deltas, tool progress). Lossy.
-    pub fn pulses(&self) -> broadcast::Receiver<Pulse> {
-        self.shared.pulses.subscribe()
-    }
-
+impl<D: Decider + 'static> SessionHandle<D>
+where
+    D::State: Send + Sync + 'static,
+{
     /// Next seq to be written.
     pub fn next_seq(&self) -> Seq {
         *self.shared.head_rx.borrow()
@@ -529,6 +722,13 @@ where
 
 // ---------------------------------------------------------------- actor
 
+fn spawn_in<F>(span: Span, f: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(f.instrument(span));
+}
+
 struct InFlight {
     cancel: CancellationToken,
     /// Survives hard interrupts (restores run to completion).
@@ -557,6 +757,14 @@ struct Actor<D: Decider> {
     dedupe: VecDeque<(String, Result<Applied, DriverError>)>,
     tx: mpsc::WeakUnboundedSender<Msg>,
     fenced: Option<String>,
+    codec: Codec<D::State>,
+    /// Seq covered by the last saved (or loaded) snapshot.
+    last_snapshot: Seq,
+    parent_session: Option<SessionId>,
+    /// `session` span (see module docs).
+    span: Span,
+    /// `turn` span, open between `TurnStarted` and `TurnEnded`.
+    turn_span: Option<Span>,
 }
 
 impl<D: Decider + 'static> Actor<D>
@@ -565,11 +773,24 @@ where
 {
     fn new(
         env: Arc<Env>,
+        codec: Codec<D::State>,
         id: SessionId,
         lease: LeaseGen,
         state: D::State,
         recent: Vec<Envelope<Event>>,
+        parent_session: Option<SessionId>,
     ) -> (Self, SessionHandle<D>, mpsc::UnboundedReceiver<Msg>) {
+        let span = tracing::info_span!(
+            "session",
+            session.id = %id,
+            session.parent = tracing::field::Empty,
+            lease = lease.0,
+        );
+        // Sub-agents are created from inside the parent's tool effect: link.
+        span.follows_from(Span::current());
+        if let Some(p) = &parent_session {
+            span.record("session.parent", tracing::field::display(p));
+        }
         let next_seq = recent.last().map(|e| e.seq + 1).unwrap_or(0);
         let head = recent.last().map(|e| e.id.clone());
         let (head_tx, head_rx) = watch::channel(next_seq);
@@ -599,12 +820,35 @@ where
             dedupe: VecDeque::new(),
             tx: tx.downgrade(),
             fenced: None,
+            codec,
+            last_snapshot: 0,
+            parent_session,
+            span,
+            turn_span: None,
         };
         (actor, SessionHandle { shared, tx }, rx)
     }
 
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>) {
-        while let Some(msg) = rx.recv().await {
+        let hb = self.env.options.heartbeat_ms;
+        let mut ticker = tokio::time::interval(Duration::from_millis(hb.max(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut was_idle = true;
+        loop {
+            let busy = hb > 0 && !self.inflight.is_empty();
+            if busy && was_idle {
+                // First heartbeat one interval after an effect goes in flight.
+                ticker.reset();
+            }
+            was_idle = !busy;
+            let msg = tokio::select! {
+                m = rx.recv() => m,
+                _ = ticker.tick(), if busy => {
+                    let _ = self.shared.pulses.send(Pulse::Heartbeat { seq: self.next_seq });
+                    continue;
+                }
+            };
+            let Some(msg) = msg else { break };
             match msg {
                 Msg::Input(input, reply) => {
                     let r = self.handle(input).await;
@@ -778,6 +1022,10 @@ where
                 D::evolve(&mut s, e);
             }
         }
+        for e in &envs {
+            self.observe(e);
+        }
+        self.maybe_snapshot().await;
         let n = envs.len();
         {
             let mut recent = self.shared.recent.write().unwrap();
@@ -790,7 +1038,71 @@ where
         Ok((Applied { events: n, next_seq: self.next_seq, effects: 0 }, effects))
     }
 
+    /// Metrics and span bookkeeping for an appended event.
+    fn observe(&mut self, e: &Envelope<Event>) {
+        self.env.metrics.observe_event(&self.shared.id, e);
+        match &e.body {
+            Event::SessionStarted { parent_session: Some(p), .. } => {
+                self.span.record("session.parent", tracing::field::display(p));
+                self.parent_session = Some(p.clone());
+            }
+            Event::TurnStarted { cause } => {
+                self.turn_span = Some(tracing::info_span!(
+                    parent: &self.span,
+                    "turn",
+                    session.id = %self.shared.id,
+                    turn.cause = ?cause,
+                    turn.seq = e.seq,
+                ));
+            }
+            Event::TurnEnded { outcome } => {
+                if let Some(t) = self.turn_span.take() {
+                    tracing::debug!(parent: &t, outcome = ?outcome, "turn ended");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Save a state snapshot when `snapshot_every` events accumulated since
+    /// the last one. Failures are logged only: snapshots are a cache.
+    async fn maybe_snapshot(&mut self) {
+        let Some(codec) = &self.codec else { return };
+        let every = self.env.options.snapshot_every;
+        if every == 0 || self.next_seq < self.last_snapshot + every {
+            return;
+        }
+        let seq = self.next_seq;
+        // Do not retry on every event after a failure.
+        self.last_snapshot = seq;
+        let encoded = {
+            let st = self.shared.state.read().unwrap();
+            codec.encode(&st)
+        };
+        let body = match encoded {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(parent: &self.span, seq, error = %e, "state snapshot encoding failed");
+                return;
+            }
+        };
+        let header = SnapshotHeader { seq: Some(seq), parent_session: self.parent_session.clone() };
+        if let Err(e) = self.env.journal.save_snapshot(&self.shared.id, seq, header.frame(&body)).await {
+            tracing::warn!(parent: &self.span, seq, error = %e, "saving the state snapshot failed");
+        } else {
+            tracing::debug!(parent: &self.span, seq, bytes = body.len(), "state snapshot saved");
+        }
+    }
+
     fn dispatch(&mut self, id: EffectId, effect: Effect, recovering: bool) {
+        let span = tracing::info_span!(
+            parent: self.turn_span.as_ref().unwrap_or(&self.span),
+            "effect",
+            session.id = %self.shared.id,
+            effect.kind = effect.kind(),
+            effect.id = %id,
+            recovering,
+        );
         if let Effect::Finish(outcome) = effect {
             self.finish_tx.send_modify(|f| {
                 f.0 += 1;
@@ -807,12 +1119,27 @@ where
         let session = self.shared.id.clone();
         let pulses = self.shared.pulses.clone();
         let mut flight = InFlight { cancel: cancel.clone(), uncancellable: false, sample: None, question: None };
-        tracing::debug!(effect = %id, kind = effect.kind(), recovering, "dispatch");
+        tracing::debug!(parent: &span, "dispatch");
+        self.env.metrics.effect_dispatched();
         match effect {
             Effect::Sample(prompt) => {
                 let asm = Arc::new(Mutex::new(Assembler::new()));
                 flight.sample = Some(asm.clone());
-                tokio::spawn(async move {
+                let verify = if env.options.verify_requests { env.rebuilder.clone() } else { None };
+                spawn_in(span, async move {
+                    if let Some(rb) = verify {
+                        if let Err(msg) = dispatch::verify_request(&env, rb.as_ref(), &session, id, &prompt).await {
+                            tracing::error!(
+                                session = %session,
+                                effect = %id,
+                                "REQUEST MISMATCH: the request derived from the journal differs from the kernel's; failing the sample. {msg}"
+                            );
+                            env.metrics.request_mismatch();
+                            let err = ModelError::Invalid { message: format!("request consistency check failed: {msg}") };
+                            let _ = tx.send(Msg::Completed(id, EffectResult::SampleFailed(err)));
+                            return;
+                        }
+                    }
                     let sink = TxSink(tx.clone());
                     let r = dispatch::sample(&env, id, &prompt, asm, &cancel, &pulses, Some(&sink)).await;
                     if let Some(r) = r {
@@ -825,14 +1152,14 @@ where
                 });
             }
             Effect::Compact(job) => {
-                tokio::spawn(async move {
+                spawn_in(span, async move {
                     if let Some(r) = dispatch::compact(&env, id, &job, &cancel).await {
                         let _ = tx.send(Msg::Completed(id, r));
                     }
                 });
             }
             Effect::Execute(batch) => {
-                tokio::spawn(async move {
+                spawn_in(span, async move {
                     let r = if recovering {
                         dispatch::recover_batch(&env, &session, &batch, &cancel, &pulses).await
                     } else {
@@ -852,14 +1179,14 @@ where
                     flight.question = Some(q.id.clone());
                 }
                 let ctx = GateCtx { session, asks, cancel };
-                tokio::spawn(async move {
+                spawn_in(span, async move {
                     if let Some(r) = dispatch::gate(&env, &req, ctx).await {
                         let _ = tx.send(Msg::Completed(id, r));
                     }
                 });
             }
             Effect::Checkpoint(scope) => {
-                tokio::spawn(async move {
+                spawn_in(span, async move {
                     let r = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
@@ -872,7 +1199,7 @@ where
                 // Not cancellable mid-way: a restore runs to completion so the
                 // workspace matches the journaled plan (idempotent on re-run).
                 flight.uncancellable = true;
-                tokio::spawn(async move {
+                spawn_in(span, async move {
                     let r = dispatch::restore(&env, &plan).await;
                     let _ = tx.send(Msg::Completed(id, r));
                 });

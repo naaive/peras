@@ -46,11 +46,13 @@ async fn shadow_attribution_restore_conflicts_and_idempotence() {
 
     // The batch runs; meanwhile the user edits b.txt and .git changes.
     fs::write(ws.join("a.txt"), "a1 by agent").unwrap();
-    fs::write(ws.join("target/out"), "o1 by agent").unwrap();
+    // Inside an ignored directory: only the directory's own metadata is
+    // tracked, so an added entry is noticed.
+    fs::write(ws.join("target/new"), "o1 by agent").unwrap();
     fs::write(ws.join("b.txt"), "b1 by user").unwrap();
     fs::write(ws.join(".git/config"), "changed").unwrap();
     let c2 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
-    assert_eq!(c2.agent_changes, vec!["a.txt".to_string(), "target/out".to_string()]);
+    assert_eq!(c2.agent_changes, vec!["a.txt".to_string(), "target/".to_string()]);
     assert_eq!(c2.external_changes, vec!["b.txt".to_string()]);
 
     // Nothing changed: an extra checkpoint reports nothing (only changed files hashed).
@@ -61,10 +63,10 @@ async fn shadow_attribution_restore_conflicts_and_idempotence() {
     let r = ck.restore(&plan(&c1)).await.unwrap();
     assert_eq!(r.restored, vec!["a.txt".to_string()]);
     assert!(r.conflicts.is_empty());
-    assert_eq!(r.unrestored_ignored, vec!["target/out".to_string()]);
+    assert_eq!(r.unrestored_ignored, vec!["target/".to_string()]);
     assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "a0");
     assert_eq!(fs::read_to_string(ws.join("b.txt")).unwrap(), "b1 by user");
-    assert_eq!(fs::read_to_string(ws.join("target/out")).unwrap(), "o1 by agent");
+    assert_eq!(fs::read_to_string(ws.join("target/new")).unwrap(), "o1 by agent");
 
     // Idempotent: same plan again converges to the same report.
     let r2 = ck.restore(&plan(&c1)).await.unwrap();
@@ -172,4 +174,91 @@ fn ulid_gen_is_monotonic() {
         assert!(id > last, "{id} <= {last}");
         last = id;
     }
+}
+
+#[tokio::test]
+async fn shadow_nested_gitignore_negation_and_ignored_dirs() {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let ws = fs::canonicalize(ws_dir.path()).unwrap();
+    fs::write(ws.join(".gitignore"), "*.log\nnode_modules/\n").unwrap();
+    fs::create_dir_all(ws.join("sub")).unwrap();
+    fs::write(ws.join("sub/.gitignore"), "*.tmp\n!keep.tmp\n!important.log\n").unwrap();
+    fs::create_dir_all(ws.join(".git/info")).unwrap();
+    fs::write(ws.join(".git/info/exclude"), "secret.txt\n").unwrap();
+    for f in ["sub/a.tmp", "sub/keep.tmp", "sub/important.log", "x.log", "secret.txt", "plain.txt"] {
+        fs::write(ws.join(f), "v0").unwrap();
+    }
+    fs::create_dir_all(ws.join("node_modules/pkg/deep")).unwrap();
+    fs::write(ws.join("node_modules/pkg/deep/f.js"), "v0").unwrap();
+
+    let ck = ShadowCheckpointer::new(&ws, store_dir.path()).unwrap();
+    ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    let decl = vec![w(&ws.join("**"))];
+    ck.save_originals(&decl).await.unwrap();
+    let c1 = ck.checkpoint(&scope(decl, false)).await.unwrap();
+
+    for f in ["sub/a.tmp", "sub/keep.tmp", "sub/important.log", "x.log", "secret.txt", "plain.txt"] {
+        fs::write(ws.join(f), "v1 by agent").unwrap();
+    }
+    // Deep inside an ignored directory: not descended into, so not seen.
+    fs::write(ws.join("node_modules/pkg/deep/g.js"), "new").unwrap();
+    let c2 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert!(!c2.agent_changes.iter().any(|p| p.starts_with("node_modules")), "{c2:?}");
+    // A new top-level entry (made by the user) changes the ignored directory's own metadata.
+    fs::write(ws.join("node_modules/new.js"), "new").unwrap();
+    let c3 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert_eq!(c3.external_changes, vec!["node_modules/".to_string()]);
+
+    let r = ck.restore(&plan(&c1)).await.unwrap();
+    // Negated (re-included) paths are restored; ignored ones only listed.
+    assert_eq!(r.restored, vec!["plain.txt".to_string(), "sub/important.log".to_string(), "sub/keep.tmp".to_string()]);
+    assert_eq!(
+        r.unrestored_ignored,
+        vec!["secret.txt".to_string(), "sub/a.tmp".to_string(), "x.log".to_string()]
+    );
+    assert_eq!(fs::read_to_string(ws.join("sub/keep.tmp")).unwrap(), "v0");
+    assert_eq!(fs::read_to_string(ws.join("sub/a.tmp")).unwrap(), "v1 by agent");
+    assert!(r.git_refs.is_empty());
+}
+
+#[tokio::test]
+async fn shadow_lists_git_ref_changes_without_restoring_them() {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let ws = fs::canonicalize(ws_dir.path()).unwrap();
+    let git = ws.join(".git");
+    fs::create_dir_all(git.join("refs/heads")).unwrap();
+    fs::create_dir_all(git.join("refs/tags")).unwrap();
+    fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(git.join("refs/heads/main"), "aaa\n").unwrap();
+    fs::write(git.join("packed-refs"), "# pack-refs with: peeled\nbbb refs/heads/old\nccc refs/tags/v1\n^ddd\n").unwrap();
+    fs::write(ws.join("f"), "x").unwrap();
+
+    let ck = ShadowCheckpointer::new(&ws, store_dir.path()).unwrap();
+    let c0 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+
+    // `git checkout -b feature && git commit && git tag -d v1`, and main moves.
+    fs::write(git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    fs::write(git.join("refs/heads/feature"), "eee\n").unwrap();
+    fs::write(git.join("refs/heads/main"), "fff\n").unwrap();
+    fs::write(git.join("packed-refs"), "bbb refs/heads/old\n").unwrap();
+    ck.checkpoint(&scope(vec![], true)).await.unwrap();
+
+    let r = ck.restore(&plan(&c0)).await.unwrap();
+    assert_eq!(
+        r.git_refs,
+        vec![
+            "HEAD: ref: refs/heads/main -> ref: refs/heads/feature".to_string(),
+            "refs/heads/feature: (none) -> eee".to_string(),
+            "refs/heads/main: aaa -> fff".to_string(),
+            "refs/tags/v1: ccc -> (none)".to_string(),
+        ]
+    );
+    // Listed only, never restored.
+    assert_eq!(fs::read_to_string(git.join("HEAD")).unwrap(), "ref: refs/heads/feature\n");
+    // Loose refs override packed ones.
+    let refs = agent_runtime::shadow::read_git_refs(&ws).unwrap();
+    fs::write(git.join("packed-refs"), "bbb refs/heads/old\nzzz refs/heads/main\n").unwrap();
+    assert_eq!(agent_runtime::shadow::read_git_refs(&ws).unwrap(), refs);
 }

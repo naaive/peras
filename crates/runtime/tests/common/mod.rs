@@ -24,6 +24,8 @@ pub struct ToyState {
     pub replies: Vec<AssistantMessage>,
     pub results: Vec<ToolResult>,
     pub verdicts: Vec<(Verdict, Responder)>,
+    /// `remember` flags of gate completions, in order.
+    pub remembers: Vec<bool>,
     pub streamed: Vec<ToolCall>,
     pub other: Vec<EffectResult>,
 }
@@ -183,7 +185,12 @@ impl Decider for Toy {
                         events.push(Draft::internal(Event::EffectSettled { id }));
                         issue(s, 0, Effect::Sample(prompt()), &mut events, &mut effects);
                     }
-                    EffectResult::Gated { verdict, responder, .. } => {
+                    EffectResult::Gated { verdict, responder, remember } => {
+                        events.push(Draft::internal(Event::Plugin {
+                            kind: "remember".into(),
+                            ignorable: true,
+                            data: json!(remember),
+                        }));
                         events.push(Draft::internal(Event::VerdictRecorded {
                             subject: GateRef::Session,
                             point: HookPoint::PreTool,
@@ -221,6 +228,7 @@ impl Decider for Toy {
             Event::Plugin { kind, data, .. } if kind == "streamed" => {
                 s.streamed.push(serde_json::from_value(data.clone()).unwrap())
             }
+            Event::Plugin { kind, data, .. } if kind == "remember" => s.remembers.push(data.as_bool().unwrap()),
             Event::Plugin { kind, data, .. } if kind == "other" => {
                 s.other.push(serde_json::from_value(data.clone()).unwrap())
             }

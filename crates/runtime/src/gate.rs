@@ -11,7 +11,7 @@
 //!   [`AnswerError::AlreadyAnswered`].
 //! - [`GateChain`]: the default [`GateExecutor`].
 
-use crate::ports::{GateCtx, GateExecutor};
+use crate::ports::{GateCtx, GateExecutor, GateOutcome};
 use agent_proto::*;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -113,6 +113,14 @@ pub fn answer_to_verdict(a: &Answer) -> Verdict {
         Answer::AllowWith(p) => Verdict::Rewrite(p.clone()),
         Answer::Deny { reason } => Verdict::deny(reason.clone().unwrap_or_else(|| "denied by user".into())),
     }
+}
+
+/// Map an answer to the full gate outcome: `Answer::Allow { remember: true }`
+/// becomes `remember: true` (the kernel turns it into `DestinationAllowed` when
+/// the question offered a destination).
+pub fn answer_to_outcome(a: &Answer, responder: Responder) -> GateOutcome {
+    let remember = matches!(a, Answer::Allow { remember: true });
+    GateOutcome { verdict: answer_to_verdict(a), responder, remember }
 }
 
 /// `Control::Answer::responder` string -> [`Responder`] ("code" = embedding code).
@@ -321,7 +329,7 @@ impl GateChain {
         best.unwrap_or((Verdict::Allow, Responder::Kernel))
     }
 
-    async fn ask_human(&self, req: &GateRequest, ctx: Option<&GateCtx>) -> (Verdict, Responder) {
+    async fn ask_human(&self, req: &GateRequest, ctx: Option<&GateCtx>) -> GateOutcome {
         let question = req.question.clone().unwrap_or_else(|| Question {
             id: QuestionId(format!("gate:{:?}", req.point)),
             prompt: format!("Approve {:?}?", req.point),
@@ -350,7 +358,7 @@ impl GateChain {
                 let _ = ctx.asks.answer(&question.id, a, resp);
             }
         } else if let Some((a, resp)) = auto {
-            return (answer_to_verdict(&a), resp);
+            return answer_to_outcome(&a, resp);
         }
 
         let unattended_fallback = |this: &Self| -> (Verdict, Responder) {
@@ -370,7 +378,10 @@ impl GateChain {
         };
 
         match ctx {
-            None => unattended_fallback(self),
+            None => {
+                let (v, r) = unattended_fallback(self);
+                GateOutcome::new(v, r)
+            }
             Some(ctx) => {
                 if self.unattended.is_some() && !ctx.asks.is_answered(&question.id) {
                     let (v, resp) = unattended_fallback(self);
@@ -386,16 +397,16 @@ impl GateChain {
                         }
                     };
                     if locked.is_ok() {
-                        return (v, resp);
+                        return GateOutcome::new(v, resp);
                     }
                     // Lost the race to a real answer: fall through and use it.
                 }
                 tokio::select! {
                     r = ctx.asks.wait(&question.id) => match r {
-                        Some((a, resp)) => (answer_to_verdict(&a), resp),
-                        None => (Verdict::Defer, Responder::Kernel),
+                        Some((a, resp)) => answer_to_outcome(&a, resp),
+                        None => GateOutcome::new(Verdict::Defer, Responder::Kernel),
                     },
-                    _ = ctx.cancel.cancelled() => (Verdict::Defer, Responder::Kernel),
+                    _ = ctx.cancel.cancelled() => GateOutcome::new(Verdict::Defer, Responder::Kernel),
                 }
             }
         }
@@ -408,15 +419,27 @@ impl GateExecutor for GateChain {
     /// unattended fallback.
     async fn evaluate(&self, req: &GateRequest) -> (Verdict, Responder) {
         match req.ring {
-            Ring::Human => self.ask_human(req, None).await,
+            Ring::Human => {
+                let o = self.ask_human(req, None).await;
+                (o.verdict, o.responder)
+            }
             _ => self.run_hooks(req).await,
         }
     }
 
     async fn evaluate_in(&self, req: &GateRequest, ctx: &GateCtx) -> (Verdict, Responder) {
+        let o = self.evaluate_outcome(req, ctx).await;
+        (o.verdict, o.responder)
+    }
+
+    /// Ring 5 carries the human's `Answer::Allow { remember }` through.
+    async fn evaluate_outcome(&self, req: &GateRequest, ctx: &GateCtx) -> GateOutcome {
         match req.ring {
             Ring::Human => self.ask_human(req, Some(ctx)).await,
-            _ => self.run_hooks(req).await,
+            _ => {
+                let (v, r) = self.run_hooks(req).await;
+                GateOutcome::new(v, r)
+            }
         }
     }
 }

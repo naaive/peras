@@ -2,9 +2,18 @@
 //! directory OUTSIDE the workspace, fully separate from the user's `.git`.
 //!
 //! - **Scan**: walks the workspace (skipping `.git`), hashing only files whose
-//!   size/mtime changed since the last scan. Paths matched by the root
-//!   `.gitignore` (simple parser: no negation, no nested ignore files) are
-//!   recorded as path + metadata only (content not saved, never restored).
+//!   size/mtime changed since the last scan. Ignore rules follow git: every
+//!   `.gitignore` on the way down (nested files, negations, directory-only
+//!   patterns, via the `ignore` crate) plus `.git/info/exclude`. Ignored
+//!   files are recorded as path + metadata only (content not saved, never
+//!   restored). An ignored directory is recorded once, as `dir/` with its own
+//!   metadata, and never descended into (so a huge `target/` or
+//!   `node_modules/` costs one `stat`); changes inside it are only noticed when
+//!   the directory's own mtime changes (entries added, removed or renamed).
+//! - **Git refs**: every checkpoint records `HEAD` and all refs (loose files
+//!   under `.git/refs/` and `packed-refs`). `restore` lists ref changes since
+//!   the target checkpoint in `RestoreReport::git_refs` as
+//!   `"<ref>: <before> -> <after>"`; refs are never restored automatically.
 //! - **Declared writes**: `save_originals` stores the exact original bytes of
 //!   declared write paths before a batch runs and registers the declared
 //!   patterns (globs allowed, e.g. an Opaque call's `fs:///ws/**`).
@@ -27,6 +36,8 @@ use crate::ports::Checkpointer;
 use agent_proto::*;
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -41,6 +52,9 @@ struct FileMeta {
     /// Content hash (None for ignored paths).
     sha: Option<String>,
     ignored: bool,
+    /// An ignored directory recorded without descending (key ends in `/`).
+    #[serde(default)]
+    dir: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +74,9 @@ struct Record {
     agent_ignored: Vec<String>,
     external_ignored: Vec<String>,
     internal: bool,
+    /// `HEAD` and refs at this checkpoint (None: not recorded / no `.git`).
+    #[serde(default)]
+    git_refs: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -113,6 +130,8 @@ fn build_globs(patterns: &[String]) -> GlobSet {
 
 /// Very small `.gitignore` subset: comments, blank lines, `dir/`, anchored
 /// (`/x`, `a/b`) and unanchored (`*.log`) patterns. Negations are ignored.
+///
+/// Legacy helper: the scanner now uses full git semantics (see module docs).
 pub fn parse_gitignore(text: &str) -> Vec<String> {
     let mut out = vec![];
     for line in text.lines() {
@@ -134,6 +153,110 @@ pub fn parse_gitignore(text: &str) -> Vec<String> {
         out.push(format!("{base}/**"));
     }
     out
+}
+
+fn mtime_ns(md: &fs::Metadata) -> u64 {
+    md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
+
+/// Deepest matcher with an opinion wins (git semantics; negations whitelist).
+fn is_ignored(matchers: &[Gitignore], path: &Path, is_dir: bool) -> bool {
+    for m in matchers.iter().rev() {
+        match m.matched(path, is_dir) {
+            Match::Ignore(_) => return true,
+            Match::Whitelist(_) => return false,
+            Match::None => {}
+        }
+    }
+    false
+}
+
+/// The repository's git directory: `.git/`, or the target of a `.git` file
+/// (`gitdir: <path>`, used by worktrees and submodules).
+fn git_dir(root: &Path) -> Option<PathBuf> {
+    let dot = root.join(".git");
+    let md = fs::metadata(&dot).ok()?;
+    if md.is_dir() {
+        return Some(dot);
+    }
+    let text = fs::read_to_string(&dot).ok()?;
+    let p = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let p = Path::new(p);
+    Some(if p.is_absolute() { p.to_path_buf() } else { root.join(p) })
+}
+
+/// `HEAD` plus every ref (`refs/...` name -> value). Loose refs override
+/// `packed-refs`. For worktrees, `HEAD` comes from the worktree's git
+/// directory and refs from the common directory. `None` without a git
+/// directory.
+pub fn read_git_refs(root: &Path) -> Option<BTreeMap<String, String>> {
+    let gd = git_dir(root)?;
+    let common = match fs::read_to_string(gd.join("commondir")) {
+        Ok(c) => {
+            let p = Path::new(c.trim());
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                gd.join(p)
+            }
+        }
+        Err(_) => gd.clone(),
+    };
+    let mut refs = BTreeMap::new();
+    if let Ok(text) = fs::read_to_string(common.join("packed-refs")) {
+        for line in text.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((sha, name)) = line.trim().split_once(' ') {
+                refs.insert(name.trim().to_string(), sha.trim().to_string());
+            }
+        }
+    }
+    let mut stack = vec![common.join("refs")];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            match ent.file_type() {
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() => {
+                    let Ok(rel) = p.strip_prefix(&common) else { continue };
+                    let name = rel.to_string_lossy().replace('\\', "/");
+                    if name.ends_with(".lock") {
+                        continue;
+                    }
+                    if let Ok(v) = fs::read_to_string(&p) {
+                        refs.insert(name, v.trim().to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Ok(head) = fs::read_to_string(gd.join("HEAD")) {
+        refs.insert("HEAD".into(), head.trim().to_string());
+    }
+    Some(refs)
+}
+
+/// `"<ref>: <before> -> <after>"` for every ref that changed (`(none)` for
+/// created / deleted refs), sorted by ref name.
+pub fn diff_refs(before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) -> Vec<String> {
+    let names: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    names
+        .into_iter()
+        .filter_map(|n| {
+            let (b, a) = (before.get(n), after.get(n));
+            (b != a).then(|| {
+                format!(
+                    "{n}: {} -> {}",
+                    b.map(String::as_str).unwrap_or("(none)"),
+                    a.map(String::as_str).unwrap_or("(none)")
+                )
+            })
+        })
+        .collect()
 }
 
 impl Inner {
@@ -179,16 +302,29 @@ impl Inner {
         Some(if rest.is_empty() { "**".into() } else { rest.to_string() })
     }
 
-    fn ignore_set(&self) -> GlobSet {
-        let text = fs::read_to_string(self.root.join(".gitignore")).unwrap_or_default();
-        build_globs(&parse_gitignore(&text))
+    /// Matchers that apply at the workspace root: `.git/info/exclude`.
+    fn root_matchers(&self) -> Vec<Gitignore> {
+        let mut v = vec![];
+        if let Some(gd) = git_dir(&self.root) {
+            let p = gd.join("info").join("exclude");
+            if p.is_file() {
+                let mut b = GitignoreBuilder::new(&self.root);
+                if let Some(e) = b.add(&p) {
+                    tracing::debug!(path = %p.display(), error = %e, "bad exclude file");
+                }
+                if let Ok(g) = b.build() {
+                    v.push(g);
+                }
+            }
+        }
+        v
     }
 
     fn scan(&self, old: &BTreeMap<String, FileMeta>) -> Result<BTreeMap<String, FileMeta>, String> {
-        let ignore = self.ignore_set();
         let mut out = BTreeMap::new();
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
+        // (directory, matchers in effect for its entries: shallowest first).
+        let mut stack: Vec<(PathBuf, Arc<Vec<Gitignore>>)> = vec![(self.root.clone(), Arc::new(self.root_matchers()))];
+        while let Some((dir, inherited)) = stack.pop() {
             let rd = match fs::read_dir(&dir) {
                 Ok(rd) => rd,
                 Err(e) => {
@@ -196,41 +332,67 @@ impl Inner {
                     continue;
                 }
             };
+            let matchers = {
+                let gi = dir.join(".gitignore");
+                if gi.is_file() {
+                    let (g, err) = Gitignore::new(&gi);
+                    if let Some(e) = err {
+                        tracing::debug!(path = %gi.display(), error = %e, "bad .gitignore line(s)");
+                    }
+                    let mut v = (*inherited).clone();
+                    v.push(g);
+                    Arc::new(v)
+                } else {
+                    inherited
+                }
+            };
             for ent in rd {
                 let ent = ent.map_err(io)?;
                 let path = ent.path();
-                let md = fs::symlink_metadata(&path).map_err(io)?;
+                let md = match fs::symlink_metadata(&path) {
+                    Ok(md) => md,
+                    // Vanished between listing and stat.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.to_string()),
+                };
                 let rel = path.strip_prefix(&self.root).map_err(io)?.to_string_lossy().replace('\\', "/");
                 if md.file_type().is_symlink() {
                     continue;
                 }
-                if md.is_dir() {
-                    if ent.file_name() == ".git" {
-                        continue;
+                let is_dir = md.is_dir();
+                if is_dir && ent.file_name() == ".git" {
+                    continue;
+                }
+                if !is_dir && !md.is_file() {
+                    continue;
+                }
+                let ignored = is_ignored(&matchers, &path, is_dir);
+                let mtime_ns = mtime_ns(&md);
+                if is_dir {
+                    if ignored {
+                        out.insert(
+                            format!("{rel}/"),
+                            FileMeta { size: md.len(), mtime_ns, sha: None, ignored: true, dir: true },
+                        );
+                    } else {
+                        stack.push((path, matchers.clone()));
                     }
-                    stack.push(path);
                     continue;
                 }
-                if !md.is_file() {
-                    continue;
-                }
-                let mtime_ns = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
                 let size = md.len();
-                let ignored = ignore.is_match(&rel);
                 let sha = if ignored {
                     None
                 } else {
                     match old.get(&rel) {
                         Some(m) if !m.ignored && m.size == size && m.mtime_ns == mtime_ns && m.sha.is_some() => m.sha.clone(),
-                        _ => Some(self.put_object(&fs::read(&path).map_err(io)?)?),
+                        _ => match fs::read(&path) {
+                            Ok(b) => Some(self.put_object(&b)?),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(e) => return Err(e.to_string()),
+                        },
                     }
                 };
-                out.insert(rel, FileMeta { size, mtime_ns, sha, ignored });
+                out.insert(rel, FileMeta { size, mtime_ns, sha, ignored, dir: false });
             }
         }
         Ok(out)
@@ -248,6 +410,7 @@ impl Inner {
             agent_ignored: vec![],
             external_ignored: vec![],
             internal,
+            git_refs: read_git_refs(&self.root),
         };
         if !first {
             let paths: BTreeSet<&String> = st.scan.keys().chain(new.keys()).collect();
@@ -262,7 +425,12 @@ impl Inner {
                 if !changed {
                     continue;
                 }
-                let agent = patterns.is_match(p.as_str());
+                // An ignored directory is the agent's when a declared write
+                // falls inside it.
+                let agent = patterns.is_match(p.as_str())
+                    || (p.ends_with('/')
+                        && (patterns.is_match(p.trim_end_matches('/'))
+                            || st.pending_patterns.iter().any(|pat| pat.starts_with(p.as_str()))));
                 match (ignored, agent) {
                     (true, true) => rec.agent_ignored.push(p.clone()),
                     (true, false) => rec.external_ignored.push(p.clone()),
@@ -392,6 +560,17 @@ impl Inner {
             }
         }
         report.unrestored_ignored = ignored.into_iter().collect();
+        // Git refs: listed, never restored. Baseline = the target checkpoint
+        // (or the first one); current = the checkpoint just taken.
+        let baseline = match start {
+            0 => st.records.first(),
+            n => st.records.get(n - 1),
+        };
+        if let (Some(before), Some(after)) =
+            (baseline.and_then(|r| r.git_refs.as_ref()), st.records.last().and_then(|r| r.git_refs.as_ref()))
+        {
+            report.git_refs = diff_refs(before, after);
+        }
         if !undo.is_empty() {
             // Refresh scan entries of rewritten files so they are not seen as
             // external changes, and record the restore as agent changes.
@@ -399,15 +578,15 @@ impl Inner {
                 let p = self.root.join(&c.path);
                 match fs::symlink_metadata(&p) {
                     Ok(md) => {
-                        let mtime_ns = md
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0);
                         st.scan.insert(
                             c.path.clone(),
-                            FileMeta { size: md.len(), mtime_ns, sha: c.after.clone(), ignored: false },
+                            FileMeta {
+                                size: md.len(),
+                                mtime_ns: mtime_ns(&md),
+                                sha: c.after.clone(),
+                                ignored: false,
+                                dir: false,
+                            },
                         );
                     }
                     Err(_) => {
@@ -424,6 +603,7 @@ impl Inner {
                 agent_ignored: vec![],
                 external_ignored: vec![],
                 internal: true,
+                git_refs: None,
             });
         }
         self.persist(&st)?;
