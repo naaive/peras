@@ -1,0 +1,16 @@
+[package]
+name = "agent-sim"
+description = "Deterministic simulation: virtual clock, scripted model, controllable scheduling, fault injection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-proto.workspace = true
+agent-kernel.workspace = true
+agent-runtime.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

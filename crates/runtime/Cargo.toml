@@ -1,0 +1,26 @@
+[package]
+name = "agent-runtime"
+description = "Driver loop, port traits, task registry, snapshots, observer dispatch."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-proto.workspace = true
+agent-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ulid.workspace = true
+globset.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

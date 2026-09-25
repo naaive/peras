@@ -1,0 +1,15 @@
+[package]
+name = "agent-kernel"
+description = "Pure decision kernel: state machine, scheduling, built-in gates, taint, write-time rendering. No IO."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+globset.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
