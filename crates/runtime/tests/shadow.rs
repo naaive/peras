@@ -1,7 +1,7 @@
 use agent_proto::*;
 use agent_runtime::assemble::Assembler;
 use agent_runtime::dispatch::preview;
-use agent_runtime::shadow::parse_gitignore;
+use agent_runtime::shadow::{parse_gitignore, ChangeDetection, ShadowOptions};
 use agent_runtime::*;
 use std::fs;
 use std::path::Path;
@@ -261,4 +261,367 @@ async fn shadow_lists_git_ref_changes_without_restoring_them() {
     let refs = agent_runtime::shadow::read_git_refs(&ws).unwrap();
     fs::write(git.join("packed-refs"), "bbb refs/heads/old\nzzz refs/heads/main\n").unwrap();
     assert_eq!(agent_runtime::shadow::read_git_refs(&ws).unwrap(), refs);
+}
+
+// ---------------------------------------------------------------- change detection
+
+fn changes(c: &CheckpointInfo) -> (Vec<String>, Vec<String>) {
+    let mut a = c.agent_changes.clone();
+    let mut e = c.external_changes.clone();
+    a.sort();
+    e.sort();
+    (a, e)
+}
+
+#[tokio::test]
+async fn shadow_watcher_detects_create_modify_delete_rename() {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let ws = fs::canonicalize(ws_dir.path()).unwrap();
+    fs::write(ws.join(".gitignore"), "target/\n*.log\n").unwrap();
+    fs::create_dir_all(ws.join("src/deep")).unwrap();
+    fs::create_dir_all(ws.join("target/debug")).unwrap();
+    fs::write(ws.join("src/a.rs"), "a").unwrap();
+    fs::write(ws.join("src/b.rs"), "b").unwrap();
+    fs::write(ws.join("src/deep/c.rs"), "c").unwrap();
+    fs::write(ws.join("gone.txt"), "g").unwrap();
+
+    let ck = ShadowCheckpointer::new(&ws, store_dir.path()).unwrap();
+    let d = ck.detection();
+    assert_eq!(d.mode, ChangeDetection::Watcher, "{d:?}");
+    ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert_eq!(ck.detection().last_full_scan.as_deref(), Some("first checkpoint"));
+
+    // Create, modify, delete, rename a file; move a directory; a new nested
+    // directory; entries inside an ignored directory.
+    fs::write(ws.join("new.txt"), "n").unwrap();
+    fs::write(ws.join("src/a.rs"), "a changed").unwrap();
+    fs::remove_file(ws.join("gone.txt")).unwrap();
+    fs::rename(ws.join("src/b.rs"), ws.join("src/b2.rs")).unwrap();
+    fs::rename(ws.join("src/deep"), ws.join("moved")).unwrap();
+    fs::create_dir_all(ws.join("fresh/x/y")).unwrap();
+    fs::write(ws.join("fresh/x/y/z.txt"), "z").unwrap();
+    fs::write(ws.join("target/new.o"), "o").unwrap();
+    fs::write(ws.join("target/debug/deep.o"), "o").unwrap();
+    fs::write(ws.join("x.log"), "l").unwrap();
+    let c1 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    let d = ck.detection();
+    assert_eq!(d.last_full_scan, None, "incremental expected: {d:?}");
+    assert!(d.reliable);
+    assert_eq!(
+        changes(&c1).1,
+        vec![
+            "fresh/x/y/z.txt",
+            "gone.txt",
+            "moved/c.rs",
+            "new.txt",
+            "src/a.rs",
+            "src/b.rs",
+            "src/b2.rs",
+            "src/deep/c.rs",
+            "target/",
+            "x.log"
+        ]
+    );
+
+    // Changes inside the moved and the new directory are seen afterwards.
+    fs::write(ws.join("moved/c.rs"), "c changed").unwrap();
+    fs::write(ws.join("fresh/x/w.txt"), "w").unwrap();
+    // A .gitignore change re-walks its directory.
+    fs::write(ws.join("src/.gitignore"), "*.rs\n").unwrap();
+    let c2 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert_eq!(ck.detection().last_full_scan, None);
+    assert_eq!(
+        changes(&c2).1,
+        vec!["fresh/x/w.txt", "moved/c.rs", "src/.gitignore"],
+        "now-ignored but unchanged files are not changes"
+    );
+
+    // Delete a directory tree; nothing else.
+    fs::remove_dir_all(ws.join("fresh")).unwrap();
+    let c3 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert_eq!(changes(&c3).1, vec!["fresh/x/w.txt", "fresh/x/y/z.txt"]);
+    let c4 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert!(c4.agent_changes.is_empty() && c4.external_changes.is_empty(), "{c4:?}");
+    assert_eq!(ck.detection().counts, (1, 4));
+}
+
+#[tokio::test]
+async fn shadow_watcher_overflow_falls_back_to_full_scan() {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let ws = fs::canonicalize(ws_dir.path()).unwrap();
+    fs::write(ws.join("a"), "0").unwrap();
+    let ck = ShadowCheckpointer::new(&ws, store_dir.path()).unwrap();
+    ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert!(ck.detection().reliable);
+
+    // Events are lost: the change is still found, by a full scan.
+    fs::write(ws.join("a"), "changed").unwrap();
+    fs::write(ws.join("b"), "new").unwrap();
+    ck.inject_watch_overflow();
+    let c1 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert_eq!(changes(&c1).1, vec!["a", "b"]);
+    let d = ck.detection();
+    assert!(d.last_full_scan.as_deref().unwrap().contains("injected overflow"), "{d:?}");
+    assert_eq!(d.mode, ChangeDetection::Watcher);
+    assert!(d.reliable, "reliable again after the full scan");
+
+    // Back to incremental.
+    fs::remove_file(ws.join("b")).unwrap();
+    let c2 = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert_eq!(changes(&c2).1, vec!["b"]);
+    assert_eq!(ck.detection().last_full_scan, None);
+}
+
+#[tokio::test]
+async fn shadow_scan_mode_option() {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let ws = fs::canonicalize(ws_dir.path()).unwrap();
+    fs::write(ws.join("a"), "0").unwrap();
+    let ck = ShadowCheckpointer::with_options(&ws, store_dir.path(), ShadowOptions { watch: false }).unwrap();
+    let d = ck.detection();
+    assert_eq!(d.mode, ChangeDetection::Scan);
+    assert_eq!(d.watcher_off.as_deref(), Some("disabled by options"));
+    ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    fs::write(ws.join("a"), "1").unwrap();
+    let c = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+    assert_eq!(changes(&c).1, vec!["a"]);
+    let d = ck.detection();
+    assert!(!d.reliable && d.last_full_scan.is_some() && d.counts == (2, 0), "{d:?}");
+}
+
+/// xorshift64*
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn pick<T: Clone>(&mut self, v: &[T]) -> Option<T> {
+        (!v.is_empty()).then(|| v[self.below(v.len())].clone())
+    }
+}
+
+/// (files, dirs) under `root`, relative, not following symlinks, skipping `.git`.
+fn tree(root: &Path) -> (Vec<String>, Vec<String>) {
+    let (mut files, mut dirs) = (vec![], vec![]);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().to_string();
+            let t = e.file_type().unwrap();
+            if t.is_dir() && e.file_name() != ".git" {
+                dirs.push(rel);
+                stack.push(p);
+            } else if t.is_file() {
+                files.push(rel);
+            }
+        }
+    }
+    files.sort();
+    dirs.sort();
+    (files, dirs)
+}
+
+/// Random edit sequences: the watcher-driven checkpointer reports exactly
+/// what the scanning one does, checkpoint by checkpoint.
+#[tokio::test]
+async fn shadow_watcher_matches_scan_on_random_edits() {
+    for seed in 1..=6u64 {
+        let ws_dir = tempfile::tempdir().unwrap();
+        let (s1, s2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let ws = fs::canonicalize(ws_dir.path()).unwrap();
+        fs::create_dir_all(ws.join(".git/info")).unwrap();
+        fs::write(ws.join(".gitignore"), "target/\n*.log\n").unwrap();
+        fs::create_dir_all(ws.join("target")).unwrap();
+        for i in 0..30 {
+            let d = ws.join(format!("d{}/e{}", i % 4, i % 3));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join(format!("f{i}.txt")), format!("v{i}")).unwrap();
+        }
+        let watched = ShadowCheckpointer::new(&ws, s1.path()).unwrap();
+        let scanned = ShadowCheckpointer::with_options(&ws, s2.path(), ShadowOptions { watch: false }).unwrap();
+        assert_eq!(watched.detection().mode, ChangeDetection::Watcher);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+        let mut counter = 0u32;
+        for step in 0..60 {
+            let n_ops = 1 + rng.below(6);
+            let mut declared = vec![];
+            for _ in 0..n_ops {
+                counter += 1;
+                let (files, dirs) = tree(&ws);
+                let dir = rng.pick(&dirs).map(|d| ws.join(d)).unwrap_or_else(|| ws.clone());
+                match rng.below(14) {
+                    0 | 1 => {
+                        let _ = fs::write(dir.join(format!("n{counter}.txt")), "new");
+                    }
+                    2..=4 => {
+                        if let Some(f) = rng.pick(&files) {
+                            // Size-changing rewrite (same-size rewrites within one
+                            // mtime tick are invisible to both modes alike).
+                            let old = fs::read(ws.join(&f)).unwrap_or_default();
+                            let _ = fs::write(ws.join(&f), format!("{}{counter}", String::from_utf8_lossy(&old)));
+                        }
+                    }
+                    5 => {
+                        if let Some(f) = rng.pick(&files) {
+                            let _ = fs::remove_file(ws.join(f));
+                        }
+                    }
+                    6 => {
+                        if let Some(f) = rng.pick(&files) {
+                            let _ = fs::rename(ws.join(&f), dir.join(format!("r{counter}")));
+                        }
+                    }
+                    7 => {
+                        if let Some(d) = rng.pick(&dirs) {
+                            let to = ws.join(format!("m{counter}"));
+                            let _ = fs::rename(ws.join(d), to);
+                        }
+                    }
+                    8 => {
+                        let nd = dir.join(format!("nd{counter}/sub"));
+                        let _ = fs::create_dir_all(&nd);
+                        let _ = fs::write(nd.join("x"), "x");
+                    }
+                    9 => {
+                        if let Some(d) = rng.pick(&dirs) {
+                            if d != "target" {
+                                let _ = fs::remove_dir_all(ws.join(d));
+                            }
+                        }
+                    }
+                    10 => {
+                        let t = ws.join("target");
+                        let _ = fs::create_dir_all(t.join("deep"));
+                        let _ = fs::write(t.join(if rng.below(2) == 0 { "deep/o" } else { "o" }), format!("{counter}"));
+                        let _ = fs::write(ws.join(format!("l{counter}.log")), "log");
+                    }
+                    11 => {
+                        // Toggle an ignore rule in a nested .gitignore.
+                        let gi = dir.join(".gitignore");
+                        if gi.exists() {
+                            let _ = fs::remove_file(gi);
+                        } else {
+                            let _ = fs::write(gi, "*.txt\n!n*.txt\n");
+                        }
+                    }
+                    12 => {
+                        // A file turns into a directory, or a symlink appears.
+                        if let Some(f) = rng.pick(&files) {
+                            let p = ws.join(&f);
+                            if fs::remove_file(&p).is_ok() {
+                                if rng.below(2) == 0 {
+                                    let _ = fs::create_dir_all(&p);
+                                    let _ = fs::write(p.join("inner"), "i");
+                                } else {
+                                    #[cfg(unix)]
+                                    let _ = std::os::unix::fs::symlink(&ws, &p);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if rng.below(3) == 0 {
+                            let _ = fs::write(ws.join(".git/info/exclude"), format!("*.e{counter}\n"));
+                        } else if let Some(f) = rng.pick(&files) {
+                            declared.push(ws.join(&f));
+                        }
+                    }
+                }
+            }
+            let sp = step % 3 != 0;
+            // Declared writes name files (reading originals of a directory fails in both modes).
+            let declared: Vec<Access> = declared.iter().filter(|p| p.is_file()).map(|p| w(p)).collect();
+            if !declared.is_empty() {
+                watched.save_originals(&declared).await.unwrap();
+                scanned.save_originals(&declared).await.unwrap();
+            }
+            let a = watched.checkpoint(&scope(declared.clone(), sp)).await.unwrap();
+            let b = scanned.checkpoint(&scope(declared, sp)).await.unwrap();
+            assert_eq!(a.id, b.id);
+            assert_eq!(changes(&a), changes(&b), "seed {seed} step {step}: {:?}", watched.detection());
+        }
+        let d = watched.detection();
+        assert!(d.counts.1 > 20, "mostly incremental checkpoints: {d:?}");
+        // Rewinding gives the same outcome in both modes.
+        // (Both may fail alike, e.g. a file to restore is now a directory.)
+        let all = RestorePlan { to: EventId::new("e"), checkpoint: None };
+        let r = watched.restore(&all).await.map(|r| (r.conflicts, r.unrestored_ignored));
+        let r2 = scanned.restore(&all).await.map(|r| (r.conflicts, r.unrestored_ignored));
+        assert_eq!(r, r2, "seed {seed}");
+    }
+}
+
+/// Timing harness (not a budget check): incremental safe-point checkpoint of
+/// a synthetic workspace shaped like `agent-bench`'s (300-byte files, 200 per
+/// directory, an ignored `target/`), 3 files rewritten per round, in scan and
+/// watcher mode. `AGENT_BENCH_FILES` (default 20000), `AGENT_BENCH_ROUNDS`
+/// (default 50). Run in release:
+/// `cargo test -p agent-runtime --release --test shadow -- --ignored --nocapture shadow_timing`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn shadow_timing() {
+    use std::time::{Duration, Instant};
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (files, rounds) = (env("AGENT_BENCH_FILES", 20_000), env("AGENT_BENCH_ROUNDS", 50));
+    let ws_dir = tempfile::tempdir().unwrap();
+    let ws = fs::canonicalize(ws_dir.path()).unwrap();
+    let path = |i: usize| ws.join(format!("pkg{:03}/mod{:03}/f{i:06}.rs", i / 2_000, (i / 200) % 10));
+    let text = |i: usize, round: usize| {
+        let mut s = format!("// round {round}\n");
+        let mut k = 0;
+        while s.len() < 300 + round % 50 {
+            s.push_str(&format!("fn item_{i}_{k}(x: u32) -> u32 {{ x.wrapping_mul({k}) }}\n"));
+            k += 1;
+        }
+        s
+    };
+    fs::write(ws.join(".gitignore"), "target/\n*.log\n").unwrap();
+    fs::create_dir_all(ws.join("target")).unwrap();
+    for i in 0..20 {
+        fs::write(ws.join(format!("target/obj{i}.o")), [0u8; 512]).unwrap();
+    }
+    for i in 0..files {
+        if i % 200 == 0 {
+            fs::create_dir_all(path(i).parent().unwrap()).unwrap();
+        }
+        fs::write(path(i), text(i, 0)).unwrap();
+    }
+    let stats = |v: &mut Vec<Duration>| {
+        v.sort();
+        let pct = |p: f64| v[(((v.len() - 1) as f64) * p).round() as usize];
+        let mean = v.iter().sum::<Duration>() / v.len() as u32;
+        format!("mean {mean:.1?}, p50 {:.1?}, p99 {:.1?}, max {:.1?}", pct(0.5), pct(0.99), v[v.len() - 1])
+    };
+    let mut round = 0;
+    for watch in [false, true] {
+        let store = tempfile::tempdir().unwrap();
+        let ck = ShadowCheckpointer::with_options(&ws, store.path(), ShadowOptions { watch }).unwrap();
+        let t = Instant::now();
+        ck.checkpoint(&scope(vec![], true)).await.unwrap();
+        let full = t.elapsed();
+        let mut v = vec![];
+        for _ in 0..rounds {
+            round += 1;
+            for j in 0..3 {
+                let i = (round * 7_919 + j * 104_729) % files;
+                fs::write(path(i), text(i + round, round)).unwrap();
+            }
+            let t = Instant::now();
+            let c = ck.checkpoint(&scope(vec![], true)).await.unwrap();
+            v.push(t.elapsed());
+            assert_eq!(c.external_changes.len(), 3);
+        }
+        let d = ck.detection();
+        eprintln!("[timing] {files} files, {:?}: first full scan {full:.1?}; incremental: {} ({d:?})", d.mode, stats(&mut v));
+    }
 }

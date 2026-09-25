@@ -1204,6 +1204,13 @@ where
                     let _ = tx.send(Msg::Completed(id, r));
                 });
             }
+            Effect::SampleRef(_) | Effect::CompactRef(_) => {
+                // A decider must hand out the rebuilt request: a reference only
+                // exists in the journal (`EffectIssued`).
+                tracing::error!(parent: &span, "journal-only effect reference dispatched; failing it");
+                let error = format!("`{}` effect {id} was dispatched as a journal reference", effect.kind());
+                let _ = tx.send(Msg::Completed(id, EffectResult::Failed { error }));
+            }
             Effect::Finish(_) => unreachable!(),
         }
         self.inflight.insert(id, flight);

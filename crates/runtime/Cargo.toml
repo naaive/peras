@@ -22,6 +22,7 @@ hex.workspace = true
 ulid.workspace = true
 globset.workspace = true
 ignore = "0.4"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 # `otel` feature: OpenTelemetry export of the session / turn / effect spans.
 opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["trace"] }

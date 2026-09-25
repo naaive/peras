@@ -10,6 +10,21 @@
 //!   metadata, and never descended into (so a huge `target/` or
 //!   `node_modules/` costs one `stat`); changes inside it are only noticed when
 //!   the directory's own mtime changes (entries added, removed or renamed).
+//! - **Change detection**: by default a file-system watcher (inotify,
+//!   FSEvents; see [`watch`]) runs from construction and collects dirty paths
+//!   between checkpoints, so an incremental checkpoint only stats (and, when
+//!   size/mtime changed, hashes) those paths: new or moved directories are
+//!   walked as a subtree, a changed `.gitignore` re-walks its directory, a
+//!   path inside an ignored directory re-stats that directory only. The
+//!   result is the same as a full scan's. A full metadata scan is done
+//!   instead for the first checkpoint of an instance, after lost events
+//!   (queue overflow, watcher error, fence timeout, too many paths) or a
+//!   changed `.git/info/exclude`; the watcher counts as unreliable until that
+//!   scan completes. [`ShadowOptions::watch`] = false, or a watcher that
+//!   cannot start or hits the platform's watch limit, means a full scan at
+//!   every checkpoint; [`ShadowCheckpointer::detection`] reports the mode.
+//!   Not seen by the watcher (use scan mode there): writes through a hard
+//!   link outside the workspace, and remote changes on network file systems.
 //! - **Git refs**: every checkpoint records `HEAD` and all refs (loose files
 //!   under `.git/refs/` and `packed-refs`). `restore` lists ref changes since
 //!   the target checkpoint in `RestoreReport::git_refs` as
@@ -39,11 +54,15 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::Match;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
+
+mod watch;
+use watch::{AddError, FsWatch};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileMeta {
@@ -95,10 +114,127 @@ struct State {
     scanned_once: bool,
 }
 
+/// Options for [`ShadowCheckpointer::with_options`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowOptions {
+    /// Use a file-system watcher for incremental checkpoints (default true).
+    /// false: every checkpoint scans the workspace's metadata.
+    pub watch: bool,
+}
+
+impl Default for ShadowOptions {
+    fn default() -> Self {
+        ShadowOptions { watch: true }
+    }
+}
+
+/// How changes are detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeDetection {
+    /// File-system events; full scans only when needed (see module docs).
+    Watcher,
+    /// Full metadata scan at every checkpoint.
+    Scan,
+}
+
+/// See [`ShadowCheckpointer::detection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectionStatus {
+    pub mode: ChangeDetection,
+    /// Why the watcher is not in use (disabled, unavailable, watch limit).
+    pub watcher_off: Option<String>,
+    /// The next checkpoint can rely on watcher events (no full scan needed).
+    pub reliable: bool,
+    /// Why the last checkpoint did a full scan (None: incremental, or no
+    /// checkpoint yet).
+    pub last_full_scan: Option<String>,
+    /// Checkpoints so far by this instance: (full scans, incremental).
+    pub counts: (u64, u64),
+}
+
+/// Watcher state; never persisted.
+struct Live {
+    watch: Option<FsWatch>,
+    watcher_off: Option<String>,
+    /// All changes since the last checkpoint are under a collected path.
+    reliable: bool,
+    /// A watch could not be added during the current checkpoint.
+    add_failed: Option<String>,
+    exclude_sig: Option<(PathBuf, u64, u64)>,
+    last_full_scan: Option<String>,
+    counts: (u64, u64),
+}
+
+impl Live {
+    fn watch_dir(&mut self, dir: &Path) {
+        let Some(w) = self.watch.as_mut() else { return };
+        match w.watch_dir(dir) {
+            Ok(()) => {}
+            Err(AddError::Limit(e)) => {
+                tracing::warn!(error = %e, "shadow watcher disabled; falling back to scanning");
+                self.watch = None;
+                self.watcher_off = Some(e);
+            }
+            Err(AddError::Other(e)) => {
+                tracing::debug!(error = %e, "shadow watch failed");
+                self.add_failed.get_or_insert(e);
+            }
+        }
+    }
+}
+
 struct Inner {
     root: PathBuf,
     store: PathBuf,
     state: Mutex<State>,
+    live: Mutex<Live>,
+}
+
+/// Status of a directory for incremental rechecks.
+#[derive(Clone)]
+enum DirStatus {
+    /// Tracked; the matchers in effect for its entries.
+    Tracked(Arc<Vec<Gitignore>>),
+    /// This (workspace-relative) ancestor is an ignored directory.
+    Ignored(PathBuf),
+    /// This ancestor is not a tracked directory (missing, symlink, file, `.git`).
+    Gone(PathBuf),
+}
+
+/// Incremental recheck could not decide; do a full scan.
+struct NeedFullScan(String);
+
+/// Changes found by a checkpoint.
+enum Scanned {
+    Full(BTreeMap<String, FileMeta>),
+    /// Touched keys only (None = absent now).
+    Partial(BTreeMap<String, Option<FileMeta>>),
+}
+
+fn rel_key(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Identity of `.git/info/exclude` (path, size, mtime).
+fn exclude_sig(root: &Path) -> Option<(PathBuf, u64, u64)> {
+    let p = git_dir(root)?.join("info").join("exclude");
+    let md = fs::metadata(&p).ok()?;
+    Some((p, md.len(), mtime_ns(&md)))
+}
+
+/// `inherited` plus `dir/.gitignore`, if any.
+fn with_gitignore(dir: &Path, inherited: Arc<Vec<Gitignore>>) -> Arc<Vec<Gitignore>> {
+    let gi = dir.join(".gitignore");
+    if !gi.is_file() {
+        return inherited;
+    }
+    let (g, err) = Gitignore::new(&gi);
+    if let Some(e) = err {
+        tracing::debug!(path = %gi.display(), error = %e, "bad .gitignore line(s)");
+    }
+    let mut v = (*inherited).clone();
+    v.push(g);
+    Arc::new(v)
 }
 
 /// See module docs.
@@ -320,11 +456,47 @@ impl Inner {
         v
     }
 
-    fn scan(&self, old: &BTreeMap<String, FileMeta>) -> Result<BTreeMap<String, FileMeta>, String> {
-        let mut out = BTreeMap::new();
-        // (directory, matchers in effect for its entries: shallowest first).
-        let mut stack: Vec<(PathBuf, Arc<Vec<Gitignore>>)> = vec![(self.root.clone(), Arc::new(self.root_matchers()))];
+    /// Metadata (and, when size/mtime changed, content hash) of a regular
+    /// file. `None`: it vanished meanwhile.
+    fn file_meta(
+        &self,
+        rel: &str,
+        path: &Path,
+        md: &fs::Metadata,
+        ignored: bool,
+        old: &BTreeMap<String, FileMeta>,
+    ) -> Result<Option<FileMeta>, String> {
+        let (size, mtime_ns) = (md.len(), mtime_ns(md));
+        let sha = if ignored {
+            None
+        } else {
+            match old.get(rel) {
+                Some(m) if !m.ignored && m.size == size && m.mtime_ns == mtime_ns && m.sha.is_some() => m.sha.clone(),
+                _ => match fs::read(path) {
+                    Ok(b) => Some(self.put_object(&b)?),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e.to_string()),
+                },
+            }
+        };
+        Ok(Some(FileMeta { size, mtime_ns, sha, ignored, dir: false }))
+    }
+
+    /// Walks the tree at `start`, whose entries' parent had `inherited` in
+    /// effect, emitting every recorded entry. `on_dir` is called for each
+    /// directory before it is listed and for each ignored directory.
+    fn walk(
+        &self,
+        start: PathBuf,
+        inherited: Arc<Vec<Gitignore>>,
+        old: &BTreeMap<String, FileMeta>,
+        emit: &mut dyn FnMut(String, FileMeta),
+        on_dir: &mut dyn FnMut(&Path),
+    ) -> Result<(), String> {
+        // (directory, matchers in effect for its parent's entries: shallowest first).
+        let mut stack: Vec<(PathBuf, Arc<Vec<Gitignore>>)> = vec![(start, inherited)];
         while let Some((dir, inherited)) = stack.pop() {
+            on_dir(&dir);
             let rd = match fs::read_dir(&dir) {
                 Ok(rd) => rd,
                 Err(e) => {
@@ -332,20 +504,7 @@ impl Inner {
                     continue;
                 }
             };
-            let matchers = {
-                let gi = dir.join(".gitignore");
-                if gi.is_file() {
-                    let (g, err) = Gitignore::new(&gi);
-                    if let Some(e) = err {
-                        tracing::debug!(path = %gi.display(), error = %e, "bad .gitignore line(s)");
-                    }
-                    let mut v = (*inherited).clone();
-                    v.push(g);
-                    Arc::new(v)
-                } else {
-                    inherited
-                }
-            };
+            let matchers = with_gitignore(&dir, inherited);
             for ent in rd {
                 let ent = ent.map_err(io)?;
                 let path = ent.path();
@@ -355,7 +514,7 @@ impl Inner {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(e.to_string()),
                 };
-                let rel = path.strip_prefix(&self.root).map_err(io)?.to_string_lossy().replace('\\', "/");
+                let rel = rel_key(path.strip_prefix(&self.root).map_err(io)?);
                 if md.file_type().is_symlink() {
                     continue;
                 }
@@ -367,40 +526,254 @@ impl Inner {
                     continue;
                 }
                 let ignored = is_ignored(&matchers, &path, is_dir);
-                let mtime_ns = mtime_ns(&md);
                 if is_dir {
                     if ignored {
-                        out.insert(
+                        on_dir(&path);
+                        emit(
                             format!("{rel}/"),
-                            FileMeta { size: md.len(), mtime_ns, sha: None, ignored: true, dir: true },
+                            FileMeta { size: md.len(), mtime_ns: mtime_ns(&md), sha: None, ignored: true, dir: true },
                         );
                     } else {
                         stack.push((path, matchers.clone()));
                     }
                     continue;
                 }
-                let size = md.len();
-                let sha = if ignored {
-                    None
-                } else {
-                    match old.get(&rel) {
-                        Some(m) if !m.ignored && m.size == size && m.mtime_ns == mtime_ns && m.sha.is_some() => m.sha.clone(),
-                        _ => match fs::read(&path) {
-                            Ok(b) => Some(self.put_object(&b)?),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(e) => return Err(e.to_string()),
-                        },
-                    }
-                };
-                out.insert(rel, FileMeta { size, mtime_ns, sha, ignored, dir: false });
+                if let Some(m) = self.file_meta(&rel, &path, &md, ignored, old)? {
+                    emit(rel, m);
+                }
             }
         }
+        Ok(())
+    }
+
+    fn scan(&self, old: &BTreeMap<String, FileMeta>, on_dir: &mut dyn FnMut(&Path)) -> Result<BTreeMap<String, FileMeta>, String> {
+        let mut out = BTreeMap::new();
+        let mut emit = |k, m| {
+            out.insert(k, m);
+        };
+        self.walk(self.root.clone(), Arc::new(self.root_matchers()), old, &mut emit, on_dir)?;
         Ok(out)
+    }
+
+    /// Status of the workspace-relative directory `rel` (cached per checkpoint).
+    fn dir_status(&self, rel: &Path, cache: &mut HashMap<PathBuf, DirStatus>) -> DirStatus {
+        if let Some(s) = cache.get(rel) {
+            return s.clone();
+        }
+        let s = match rel.parent() {
+            None => DirStatus::Tracked(with_gitignore(&self.root, Arc::new(self.root_matchers()))),
+            Some(parent) => match self.dir_status(parent, cache) {
+                DirStatus::Tracked(pm) => {
+                    let abs = self.root.join(rel);
+                    match fs::symlink_metadata(&abs) {
+                        Ok(md) if md.is_dir() && rel.file_name().is_some_and(|n| n != ".git") => {
+                            if is_ignored(&pm, &abs, true) {
+                                DirStatus::Ignored(rel.to_path_buf())
+                            } else {
+                                DirStatus::Tracked(with_gitignore(&abs, pm))
+                            }
+                        }
+                        _ => DirStatus::Gone(rel.to_path_buf()),
+                    }
+                }
+                other => other,
+            },
+        };
+        cache.insert(rel.to_path_buf(), s.clone());
+        s
+    }
+
+    /// Brings every key at or under `rel` in line with the disk (what a full
+    /// scan would record), writing them to `up`. `pm`: matchers in effect for
+    /// the entries of `rel`'s parent. `deep`: walk `rel` if it is a tracked
+    /// directory. Returns whether it walked.
+    #[allow(clippy::too_many_arguments)]
+    fn recheck(
+        &self,
+        rel: &Path,
+        deep: bool,
+        pm: &Arc<Vec<Gitignore>>,
+        old: &BTreeMap<String, FileMeta>,
+        up: &mut BTreeMap<String, Option<FileMeta>>,
+        on_dir: &mut dyn FnMut(&Path),
+    ) -> Result<bool, NeedFullScan> {
+        let key = rel_key(rel);
+        let abs = self.root.join(rel);
+        let md = match fs::symlink_metadata(&abs) {
+            Ok(md) => Some(md),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(NeedFullScan(format!("stat {key}: {e}"))),
+        };
+        let dir_key = format!("{key}/");
+        let clear = |up: &mut BTreeMap<String, Option<FileMeta>>| {
+            if old.contains_key(&key) {
+                up.insert(key.clone(), None);
+            }
+            for (k, _) in
+                old.range::<str, _>((Bound::Included(dir_key.as_str()), Bound::Unbounded)).take_while(|(k, _)| k.starts_with(&dir_key))
+            {
+                up.insert(k.clone(), None);
+            }
+        };
+        let Some(md) = md else {
+            clear(up);
+            return Ok(false);
+        };
+        let ft = md.file_type();
+        if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) || (ft.is_dir() && rel.file_name().is_some_and(|n| n == ".git")) {
+            clear(up);
+            return Ok(false);
+        }
+        if ft.is_dir() {
+            if is_ignored(pm, &abs, true) {
+                clear(up);
+                on_dir(&abs);
+                up.insert(dir_key, Some(FileMeta { size: md.len(), mtime_ns: mtime_ns(&md), sha: None, ignored: true, dir: true }));
+                return Ok(false);
+            }
+            if !(deep || old.contains_key(&key) || old.contains_key(&dir_key)) {
+                // Metadata of a tracked directory: nothing is recorded for it.
+                return Ok(false);
+            }
+            clear(up);
+            let mut emit = |k, m| {
+                up.insert(k, Some(m));
+            };
+            self.walk(abs, pm.clone(), old, &mut emit, on_dir).map_err(NeedFullScan)?;
+            return Ok(true);
+        }
+        clear(up);
+        let ignored = is_ignored(pm, &abs, false);
+        if let Some(m) = self.file_meta(&key, &abs, &md, ignored, old).map_err(NeedFullScan)? {
+            up.insert(key, Some(m));
+        }
+        Ok(false)
+    }
+
+    /// Incremental checkpoint from the watcher's dirty paths.
+    fn refresh(
+        &self,
+        old: &BTreeMap<String, FileMeta>,
+        dirty: HashMap<PathBuf, bool>,
+        on_dir: &mut dyn FnMut(&Path),
+    ) -> Result<BTreeMap<String, Option<FileMeta>>, NeedFullScan> {
+        let mut targets: BTreeMap<PathBuf, bool> = BTreeMap::new();
+        for (abs, deep) in dirty {
+            let Ok(rel) = abs.strip_prefix(&self.root) else { continue };
+            // Inside a `.git` directory: not snapshotted.
+            if rel.parent().is_some_and(|p| p.components().any(|c| c.as_os_str() == ".git")) {
+                continue;
+            }
+            // Ignore rules changed: re-walk the directory they apply to.
+            let (rel, deep) = if rel.file_name().is_some_and(|n| n == ".gitignore") {
+                (rel.parent().unwrap_or(Path::new("")), true)
+            } else {
+                (rel, deep)
+            };
+            if rel.as_os_str().is_empty() {
+                if deep {
+                    return Err(NeedFullScan("workspace root changed".into()));
+                }
+                continue;
+            }
+            *targets.entry(rel.to_path_buf()).or_insert(false) |= deep;
+        }
+        let mut up = BTreeMap::new();
+        let mut cache = HashMap::new();
+        // Paths whose whole subtree is already up to date.
+        let mut done: HashSet<PathBuf> = HashSet::new();
+        // Sorted: ancestors come before descendants.
+        for (rel, deep) in targets {
+            if rel.ancestors().any(|a| done.contains(a)) {
+                continue;
+            }
+            let parent = rel.parent().unwrap_or(Path::new(""));
+            let (target, deep, pm) = match self.dir_status(parent, &mut cache) {
+                DirStatus::Tracked(pm) => (rel, deep, pm),
+                // Under an ignored directory (only its own metadata is
+                // recorded) or under a path that is no longer a tracked
+                // directory: recheck that ancestor as a whole.
+                DirStatus::Ignored(a) | DirStatus::Gone(a) => {
+                    let DirStatus::Tracked(pm) = self.dir_status(a.parent().unwrap_or(Path::new("")), &mut cache) else {
+                        return Err(NeedFullScan("inconsistent directory status".into()));
+                    };
+                    (a, true, pm)
+                }
+            };
+            if done.contains(&target) {
+                continue;
+            }
+            let walked = self.recheck(&target, deep, &pm, old, &mut up, on_dir)?;
+            if walked || deep {
+                done.insert(target);
+            }
+        }
+        Ok(up)
+    }
+
+    /// Decides between a full scan (reason) and an incremental checkpoint
+    /// (dirty paths), draining the watcher.
+    fn plan(&self, live: &mut Live, scanned_once: bool) -> Result<HashMap<PathBuf, bool>, String> {
+        let sig = exclude_sig(&self.root);
+        let sig_changed = sig != live.exclude_sig;
+        live.exclude_sig = sig;
+        let Some(w) = live.watch.as_mut() else {
+            return Err("scan mode".into());
+        };
+        let fenced = w.fence();
+        let drained = w.drain();
+        // Whatever happens now, the drained paths are gone.
+        let was_reliable = std::mem::replace(&mut live.reliable, false);
+        if !scanned_once {
+            return Err("first checkpoint".into());
+        }
+        if !was_reliable {
+            return Err("watcher not yet synchronized".into());
+        }
+        if let Some(lost) = drained.lost {
+            return Err(format!("events lost: {lost}"));
+        }
+        if !fenced {
+            return Err("watcher fence timed out".into());
+        }
+        if sig_changed {
+            return Err(".git/info/exclude changed".into());
+        }
+        Ok(drained.dirty)
     }
 
     fn checkpoint(&self, scope: &CheckpointScope, internal: bool) -> Result<CheckpointInfo, String> {
         let mut st = self.state.lock().unwrap();
-        let new = self.scan(&st.scan)?;
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let live = &mut *live;
+        live.add_failed = None;
+        let plan = self.plan(live, st.scanned_once);
+        let scanned = {
+            let mut on_dir = |d: &Path| live.watch_dir(d);
+            let partial = match plan {
+                Ok(dirty) => match self.refresh(&st.scan, dirty, &mut on_dir) {
+                    Ok(up) => Ok(up),
+                    Err(NeedFullScan(why)) => Err(why),
+                },
+                Err(why) => Err(why),
+            };
+            match partial {
+                Ok(up) => {
+                    live.last_full_scan = None;
+                    Scanned::Partial(up)
+                }
+                Err(why) => {
+                    let new = self.scan(&st.scan, &mut on_dir)?;
+                    live.last_full_scan = Some(why);
+                    Scanned::Full(new)
+                }
+            }
+        };
+        match &scanned {
+            Scanned::Full(_) => live.counts.0 += 1,
+            Scanned::Partial(_) => live.counts.1 += 1,
+        }
+        live.reliable = live.watch.is_some() && live.add_failed.is_none();
         let first = !st.scanned_once;
         let patterns = build_globs(&st.pending_patterns);
         let mut rec = Record {
@@ -413,9 +786,7 @@ impl Inner {
             git_refs: read_git_refs(&self.root),
         };
         if !first {
-            let paths: BTreeSet<&String> = st.scan.keys().chain(new.keys()).collect();
-            for p in paths {
-                let (o, n) = (st.scan.get(p), new.get(p));
+            let mut attribute = |p: &String, o: Option<&FileMeta>, n: Option<&FileMeta>| {
                 let ignored = o.map(|m| m.ignored).unwrap_or(false) || n.map(|m| m.ignored).unwrap_or(false);
                 let changed = if ignored {
                     o.map(|m| (m.size, m.mtime_ns)) != n.map(|m| (m.size, m.mtime_ns))
@@ -423,7 +794,7 @@ impl Inner {
                     o.and_then(|m| m.sha.clone()) != n.and_then(|m| m.sha.clone())
                 };
                 if !changed {
-                    continue;
+                    return;
                 }
                 // An ignored directory is the agent's when a declared write
                 // falls inside it.
@@ -445,9 +816,36 @@ impl Inner {
                     }),
                     (false, false) => rec.external.push(p.clone()),
                 }
+            };
+            match &scanned {
+                Scanned::Full(new) => {
+                    let paths: BTreeSet<&String> = st.scan.keys().chain(new.keys()).collect();
+                    for p in paths {
+                        attribute(p, st.scan.get(p), new.get(p));
+                    }
+                }
+                Scanned::Partial(up) => {
+                    for (p, n) in up {
+                        attribute(p, st.scan.get(p), n.as_ref());
+                    }
+                }
             }
         }
-        st.scan = new;
+        match scanned {
+            Scanned::Full(new) => st.scan = new,
+            Scanned::Partial(up) => {
+                for (p, n) in up {
+                    match n {
+                        Some(m) => {
+                            st.scan.insert(p, m);
+                        }
+                        None => {
+                            st.scan.remove(&p);
+                        }
+                    }
+                }
+            }
+        }
         st.scanned_once = true;
         // Open the next interval.
         let mut next_patterns = std::mem::take(&mut st.staged_patterns);
@@ -615,7 +1013,17 @@ impl ShadowCheckpointer {
     /// `workspace`: the directory to snapshot. `store`: shadow store directory,
     /// which must be outside the workspace (created if missing). Existing state
     /// in `store` is loaded.
+    ///
+    /// Change detection uses a file-system watcher when available (see
+    /// [`ShadowCheckpointer::with_options`]).
     pub fn new(workspace: impl AsRef<Path>, store: impl AsRef<Path>) -> Result<Self, String> {
+        Self::with_options(workspace, store, ShadowOptions::default())
+    }
+
+    /// Like [`ShadowCheckpointer::new`]. With `options.watch`, the watcher
+    /// starts now, so changes made from here on are collected; if it cannot
+    /// start, checkpoints scan (see [`ShadowCheckpointer::detection`]).
+    pub fn with_options(workspace: impl AsRef<Path>, store: impl AsRef<Path>, options: ShadowOptions) -> Result<Self, String> {
         let root = fs::canonicalize(workspace.as_ref()).map_err(|e| format!("workspace: {e}"))?;
         fs::create_dir_all(store.as_ref()).map_err(io)?;
         let store = fs::canonicalize(store.as_ref()).map_err(io)?;
@@ -626,7 +1034,49 @@ impl ShadowCheckpointer {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("state.json: {e}"))?,
             Err(_) => State::default(),
         };
-        Ok(ShadowCheckpointer { inner: Arc::new(Inner { root, store, state: Mutex::new(state) }) })
+        let (watch, watcher_off) = if options.watch {
+            match FsWatch::start(&root, &store) {
+                Ok(w) => (Some(w), None),
+                Err(e) => {
+                    tracing::warn!(error = %e, "shadow watcher unavailable; falling back to scanning");
+                    (None, Some(format!("watcher unavailable: {e}")))
+                }
+            }
+        } else {
+            (None, Some("disabled by options".into()))
+        };
+        let live = Live {
+            watch,
+            watcher_off,
+            reliable: false,
+            add_failed: None,
+            exclude_sig: None,
+            last_full_scan: None,
+            counts: (0, 0),
+        };
+        Ok(ShadowCheckpointer { inner: Arc::new(Inner { root, store, state: Mutex::new(state), live: Mutex::new(live) }) })
+    }
+
+    /// Which change detection is active, and how the last checkpoint went.
+    pub fn detection(&self) -> DetectionStatus {
+        let live = self.inner.live.lock().unwrap_or_else(|e| e.into_inner());
+        DetectionStatus {
+            mode: if live.watch.is_some() { ChangeDetection::Watcher } else { ChangeDetection::Scan },
+            watcher_off: live.watcher_off.clone(),
+            reliable: live.reliable,
+            last_full_scan: live.last_full_scan.clone(),
+            counts: live.counts,
+        }
+    }
+
+    /// Test hook: drops the watcher's pending paths as if its event queue
+    /// had overflowed.
+    #[doc(hidden)]
+    pub fn inject_watch_overflow(&self) {
+        let live = self.inner.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = &live.watch {
+            w.inject_loss("injected overflow");
+        }
     }
 
     pub fn workspace(&self) -> &Path {
