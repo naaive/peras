@@ -28,6 +28,7 @@ mod error;
 mod gate;
 mod hooks;
 mod observe;
+mod rebuild;
 mod run;
 mod session;
 mod subagent;

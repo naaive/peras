@@ -52,9 +52,12 @@ impl Ask {
     pub fn allow(&self) {
         self.answer(Answer::Allow { remember: false });
     }
-    /// Allow and remember the destination for the rest of the session.
+    /// Allow and remember the destination for the rest of the session. Only
+    /// offered for egress questions (`question.remember_destination`); for
+    /// other questions this is a plain allow.
     pub fn allow_always(&self) {
-        self.answer(Answer::Allow { remember: true });
+        let remember = self.question.remember_destination.is_some();
+        self.answer(Answer::Allow { remember });
     }
     pub fn deny(&self, reason: impl Into<String>) {
         self.answer(Answer::Deny { reason: Some(reason.into()) });

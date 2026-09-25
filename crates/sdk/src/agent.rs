@@ -292,6 +292,11 @@ impl Agent {
         Ok(self.built().await?.profile.clone())
     }
 
+    /// Runtime metrics (latency, cache hit ratio, approvals per rule...).
+    pub async fn metrics(&self) -> Result<MetricsSnapshot, Error> {
+        Ok(self.built().await?.rt.metrics().snapshot())
+    }
+
     /// The underlying runtime (sessions, subscriptions, server integration).
     pub async fn runtime(&self) -> Result<Runtime<Kernel>, Error> {
         Ok(self.built().await?.rt.clone())
@@ -474,7 +479,21 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
         Arc::new(NullCheckpointer::default())
     };
 
+    let data = data_dir();
+    let cursors: Arc<dyn ObserverCursors> = match std::fs::create_dir_all(&data)
+        .map_err(|e| e.to_string())
+        .and_then(|_| FileCursors::open(data.join("observer-cursors.json")).map_err(|e| e.to_string()))
+    {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "persistent observer cursors unavailable; using in-memory cursors");
+            Arc::new(MemCursors::new())
+        }
+    };
     let mut builder = Runtime::<Kernel>::builder()
+        .state_codec(Arc::new(JsonCodec::<agent_kernel::State>::new(1)))
+        .prompt_rebuilder(Arc::new(crate::rebuild::KernelRebuilder))
+        .observer_cursors(cursors)
         .journal(journal)
         .blobs(blobs)
         .model(model)
@@ -500,12 +519,17 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     Ok(Arc::new(Built { rt, config: kc, profile_hash, profile }))
 }
 
+/// Framework data directory (`$AGENT_DATA_DIR`, else `~/.agent`).
+fn data_dir() -> PathBuf {
+    std::env::var_os("AGENT_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agent")))
+        .unwrap_or_else(|| std::env::temp_dir().join("agent"))
+}
+
 /// Shadow snapshot store: outside the workspace, keyed by its path.
 fn shadow_dir(workspace: &Path) -> PathBuf {
-    let base = std::env::var_os("AGENT_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agent").join("shadow")))
-        .unwrap_or_else(|| std::env::temp_dir().join("agent-shadow"));
+    let base = data_dir().join("shadow");
     let key: String = workspace
         .display()
         .to_string()

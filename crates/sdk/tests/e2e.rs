@@ -156,3 +156,21 @@ async fn subagent_is_a_tool() {
     assert!(tool_text.contains("looks good"), "{tool_text}");
     assert_eq!(out, Some(TurnOutcome::Done { text: "reviewed".into() }));
 }
+
+/// In debug builds every sample's request is rebuilt from the journal and
+/// compared byte-for-byte; a multi-turn session with tools must never mismatch.
+#[tokio::test]
+async fn requests_rebuild_from_journal() {
+    let d = ws();
+    let model = Script::new()
+        .call(read, json!({ "file": "README.md" }))
+        .say("first")
+        .say("second");
+    let agent = Agent::new(model).workspace(d.path()).tools((read,)).allow("**");
+    let chat = agent.session("verify");
+    assert_eq!(chat.send("one").await.unwrap(), "first");
+    assert_eq!(chat.send("two").await.unwrap(), "second");
+    let m = agent.metrics().await.unwrap();
+    assert_eq!(m.samples, 3);
+    assert_eq!(m.request_mismatches, 0);
+}
