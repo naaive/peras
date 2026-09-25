@@ -10,14 +10,22 @@
 //!   request came from.
 //! - `agent doctor`: sandbox probe, credentials, configuration warnings.
 //! - `agent config explain <key>`: final value and the layer it came from.
+//! - `agent tui [--connect ws://host:port] [--session <id>]`: terminal UI, on an
+//!   in-process server over the agent discovered in `--dir` (journal `--db`),
+//!   or on a remote server.
+//! - `agent serve --listen 127.0.0.1:PORT`: WebSocket session server over the
+//!   discovered agent.
 
 use agent::kernel::{Decider, Kernel};
 use agent::prelude::*;
 use agent::proto::{exit_code, Envelope, Event, SessionId};
 use agent::runtime::JournalStore;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use agent::runtime::{DriverError, Runtime, SessionHandle};
+use agent_server::{Server, SessionOpener};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "agent", version, about = "Rust coding-agent framework CLI")]
@@ -69,6 +77,47 @@ enum Cmd {
     },
     /// List sessions in the journal.
     Sessions,
+    /// Interactive terminal UI.
+    Tui {
+        /// Connect to a remote server (`ws://host:port`) instead of running
+        /// one in-process.
+        #[arg(long)]
+        connect: Option<String>,
+        /// Session to open (created if missing); a new one by default.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Serve sessions over WebSocket.
+    Serve {
+        /// Address to listen on (port 0 picks a free port).
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        listen: String,
+    },
+}
+
+/// Opens sessions through the SDK so new ones get the agent's compiled
+/// configuration (created if missing, resumed otherwise).
+struct AgentOpener(Agent);
+
+#[async_trait::async_trait]
+impl SessionOpener<Kernel> for AgentOpener {
+    async fn open(&self, rt: &Runtime<Kernel>, id: &SessionId) -> Result<SessionHandle<Kernel>, DriverError> {
+        let _ = rt;
+        self.0.open_session(id.as_str()).await.map_err(|e| match e {
+            agent::Error::Driver(d) => d,
+            other => DriverError::Store(other.to_string()),
+        })
+    }
+}
+
+/// A session server over the agent discovered in `dir`, journaling to `db`.
+async fn local_server(dir: &Path, db: &Path) -> anyhow::Result<Server<Kernel>> {
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let agent = Agent::discover(dir).journal(Sqlite(db));
+    let rt = agent.runtime().await?;
+    Ok(Server::new(Arc::new(rt), AgentOpener(agent)))
 }
 
 #[derive(Subcommand)]
@@ -219,6 +268,23 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
                     Ok(exit_code::FAILED)
                 }
             }
+        }
+        Cmd::Tui { connect, session } => {
+            let session = SessionId::new(session.unwrap_or_else(|| ulid::Ulid::new().to_string()));
+            let conn = match connect {
+                Some(url) => agent_tui::ws(url),
+                None => agent_tui::in_process(local_server(&cli.dir, &cli.db).await?),
+            };
+            agent_tui::run(session.clone(), conn).await?;
+            eprintln!("session {session}");
+            Ok(exit_code::OK)
+        }
+        Cmd::Serve { listen } => {
+            let server = local_server(&cli.dir, &cli.db).await?;
+            let listener = tokio::net::TcpListener::bind(&listen).await?;
+            eprintln!("listening on ws://{}", listener.local_addr()?);
+            server.serve_ws_listener(listener).await?;
+            Ok(exit_code::OK)
         }
         Cmd::Run { prompt, resume, on_ask, pulses } => {
             if let Some(parent) = cli.db.parent() {

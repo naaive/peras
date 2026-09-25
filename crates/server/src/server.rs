@@ -1,36 +1,88 @@
 //! The session service: one [`Server`] per [`Runtime`], any number of
 //! connections, any number of connections per session.
+//!
+//! Each connection runs three independent parts:
+//!
+//! - a **reader** that decodes client messages and hands them to the processor;
+//! - a **processor** that handles one request at a time and spawns one event
+//!   pump per subscription;
+//! - a **writer** task that drains the bounded outgoing queue into the
+//!   transport's write half.
+//!
+//! A client that stops reading therefore never stops the server from reading
+//! its requests. Backpressure is explicit instead: pulses are dropped once the
+//! outgoing queue is backed up (lossy), and a reliable message (event, ack,
+//! error) that cannot enter the queue within [`ServerOptions::stall_timeout`]
+//! disconnects the client with an `Error` telling it which `from_seq` to
+//! resubscribe from.
 
-use crate::transport::{channel, ChannelClient, JsonLines, Transport, TransportError, WsTransport};
+use crate::transport::{channel, ChannelClient, JsonLines, Transport, TransportError, TransportRead, TransportWrite, WsTransport};
 use agent_kernel::{Decider, Decision};
 use agent_proto::*;
 use agent_runtime::{AnswerError, DriverError, Runtime, SessionHandle};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::{TcpListener, ToSocketAddrs};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Protocol versions this server speaks.
 pub const SUPPORTED_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
 
-/// Outgoing buffer per connection. Events wait for room (reliable); pulses are
-/// dropped when it is full (lossy).
+/// Default outgoing buffer per connection (see [`ServerOptions`]).
 pub const OUTGOING_CAPACITY: usize = 1024;
+
+/// Default time a reliable message may wait for room in the outgoing queue
+/// before the connection is dropped as a slow consumer.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Answer idempotency keys remembered per session.
 const ANSWER_DEDUPE: usize = 1024;
 
+/// Closed question ids remembered per connection.
+const CLOSED_DEDUPE: usize = 4096;
+
+/// Requests decoded ahead of the processor.
+const REQUEST_BUFFER: usize = 64;
+
 /// Ack error text for the losers of an approval race.
 pub const ALREADY_ANSWERED: &str = "already answered";
+
+/// Prefix of the `Error` sent to a client disconnected for not reading.
+pub const SLOW_CONSUMER: &str = "slow consumer";
 
 /// Highest version both sides support.
 pub fn negotiate(client: &[u32], server: &[u32]) -> Option<u32> {
     client.iter().copied().filter(|v| server.contains(v)).max()
+}
+
+/// Per-connection flow control.
+#[derive(Debug, Clone)]
+pub struct ServerOptions {
+    /// Outgoing queue per connection (events, acks, pulses).
+    pub outgoing_capacity: usize,
+    /// Pulses are dropped while fewer than this many queue slots are free, so
+    /// a backed-up connection keeps room for reliable messages.
+    pub pulse_headroom: usize,
+    /// How long a reliable message may wait for queue room before the client
+    /// is disconnected as a slow consumer.
+    pub stall_timeout: Duration,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        ServerOptions {
+            outgoing_capacity: OUTGOING_CAPACITY,
+            pulse_headroom: OUTGOING_CAPACITY / 4,
+            stall_timeout: STALL_TIMEOUT,
+        }
+    }
 }
 
 // ---------------------------------------------------------------- opener
@@ -72,16 +124,139 @@ where
     }
 }
 
+// ---------------------------------------------------------------- outgoing
+
+/// The connection is gone (or being dropped); stop producing for it.
+struct Gone;
+
+/// Producer side of a connection's outgoing queue.
+#[derive(Clone)]
+struct Outgoing {
+    tx: mpsc::Sender<ServerMessage>,
+    kill: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    stall: Duration,
+    headroom: usize,
+}
+
+impl Outgoing {
+    /// Queue a reliable message; waits up to the stall timeout for room, then
+    /// disconnects the client with `overflow()` as the reason.
+    async fn reliable(&self, msg: ServerMessage, overflow: impl FnOnce() -> String) -> Result<(), Gone> {
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(Gone),
+            Err(TrySendError::Full(msg)) => match tokio::time::timeout(self.stall, self.tx.send(msg)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(Gone),
+                Err(_) => {
+                    self.disconnect(overflow());
+                    Err(Gone)
+                }
+            },
+        }
+    }
+
+    /// Queue a lossy message: dropped when the queue is backed up.
+    fn lossy(&self, msg: ServerMessage) {
+        if self.tx.capacity() > self.headroom {
+            let _ = self.tx.try_send(msg);
+        }
+    }
+
+    fn disconnect(&self, reason: String) {
+        if let Some(k) = self.kill.lock().unwrap().take() {
+            let _ = k.send(reason);
+        }
+    }
+}
+
+fn slow_consumer(detail: impl std::fmt::Display) -> String {
+    format!("{SLOW_CONSUMER}: outgoing queue overflowed; {detail}")
+}
+
+/// Drain the outgoing queue into the transport. Ends when every producer is
+/// gone (`Ok`), the transport fails, or the connection is killed.
+async fn write_loop<W: TransportWrite>(
+    mut w: W,
+    mut rx: mpsc::Receiver<ServerMessage>,
+    mut kill: oneshot::Receiver<String>,
+    stall: Duration,
+) -> Result<(), ConnError> {
+    // The kill sender outlives this loop (the connection keeps it), so the
+    // receiver only resolves on an actual kill.
+    let result = loop {
+        tokio::select! {
+            biased;
+            reason = &mut kill => {
+                let Ok(reason) = reason else { break Ok(()) };
+                // Best effort: the peer may not be reading at all.
+                let grace = stall.min(Duration::from_secs(1));
+                let msg = ServerMessage::Error { message: reason.clone() };
+                let _ = tokio::time::timeout(grace, w.send(msg)).await;
+                break Err(ConnError::SlowConsumer(reason));
+            }
+            m = rx.recv() => {
+                let Some(m) = m else { break Ok(()) };
+                // A blocked write must still notice a kill.
+                let sent = tokio::select! {
+                    biased;
+                    reason = &mut kill => Err(reason),
+                    r = w.send(m) => Ok(r),
+                };
+                match sent {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => break Err(e.into()),
+                    Err(Ok(reason)) => break Err(ConnError::SlowConsumer(reason)),
+                    Err(Err(_)) => break Ok(()),
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(stall.min(Duration::from_secs(1)), w.close()).await;
+    result
+}
+
 // ---------------------------------------------------------------- server
 
 type Ack = (bool, Option<String>);
+
+/// Question ids already closed for one connection (bounded).
+#[derive(Default)]
+struct ClosedSet {
+    set: HashSet<QuestionId>,
+    order: VecDeque<QuestionId>,
+}
+
+impl ClosedSet {
+    /// `true` when newly closed.
+    fn insert(&mut self, q: &QuestionId) -> bool {
+        if !self.set.insert(q.clone()) {
+            return false;
+        }
+        self.order.push_back(q.clone());
+        while self.order.len() > CLOSED_DEDUPE {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+type Closed = Arc<Mutex<ClosedSet>>;
+
+#[derive(Clone)]
+struct Subscriber {
+    out: Outgoing,
+    closed: Closed,
+}
 
 /// Per-session fan-out state (outlives session handles: a closed and reopened
 /// session keeps its subscribers' registrations).
 #[derive(Default)]
 struct Hub {
     /// Connections subscribed to this session.
-    subscribers: Mutex<HashMap<u64, mpsc::Sender<ServerMessage>>>,
+    subscribers: Mutex<HashMap<u64, Subscriber>>,
     /// Answer idempotency; the lock also serializes answers per session.
     answers: tokio::sync::Mutex<VecDeque<(String, Ack)>>,
 }
@@ -89,6 +264,7 @@ struct Hub {
 struct Inner<D: Decider> {
     rt: Arc<Runtime<D>>,
     opener: Box<dyn SessionOpener<D>>,
+    options: ServerOptions,
     hubs: Mutex<HashMap<SessionId, Arc<Hub>>>,
     open_lock: tokio::sync::Mutex<()>,
     next_conn: AtomicU64,
@@ -109,8 +285,23 @@ impl<D: Decider> Clone for Server<D> {
 pub enum ConnError {
     #[error("no common protocol version (client {client:?}, server {server:?})")]
     NoCommonVersion { client: Vec<u32>, server: Vec<u32> },
+    /// The client did not read fast enough and was disconnected.
+    #[error("{0}")]
+    SlowConsumer(String),
     #[error(transparent)]
     Transport(#[from] TransportError),
+}
+
+fn joined(r: Result<Result<(), ConnError>, tokio::task::JoinError>, what: &str) -> Result<(), ConnError> {
+    match r {
+        Ok(r) => r,
+        Err(e) => {
+            if e.is_panic() {
+                tracing::error!(error = %e, "connection {what} panicked");
+            }
+            Ok(())
+        }
+    }
 }
 
 impl<D> Server<D>
@@ -119,10 +310,15 @@ where
     D::State: Send + Sync + 'static,
 {
     pub fn new(rt: Arc<Runtime<D>>, opener: impl SessionOpener<D> + 'static) -> Self {
+        Self::with_options(rt, opener, ServerOptions::default())
+    }
+
+    pub fn with_options(rt: Arc<Runtime<D>>, opener: impl SessionOpener<D> + 'static, options: ServerOptions) -> Self {
         Server {
             inner: Arc::new(Inner {
                 rt,
                 opener: Box::new(opener),
+                options,
                 hubs: Mutex::new(HashMap::new()),
                 open_lock: tokio::sync::Mutex::new(()),
                 next_conn: AtomicU64::new(1),
@@ -132,6 +328,10 @@ where
 
     pub fn runtime(&self) -> &Arc<Runtime<D>> {
         &self.inner.rt
+    }
+
+    pub fn options(&self) -> &ServerOptions {
+        &self.inner.options
     }
 
     /// The live handle for `id`, opening it through the [`SessionOpener`].
@@ -150,67 +350,96 @@ where
         self.inner.hubs.lock().unwrap().entry(id.clone()).or_default().clone()
     }
 
-    /// Serve one connection until the peer disconnects (or version
-    /// negotiation fails).
-    pub async fn serve<T: Transport>(&self, mut transport: T) -> Result<(), ConnError> {
+    /// Serve one connection until the peer disconnects, version negotiation
+    /// fails, or the peer is dropped as a slow consumer.
+    pub async fn serve<T: Transport>(&self, transport: T) -> Result<(), ConnError> {
+        let (mut reader, writer) = transport.split();
+        let opts = &self.inner.options;
         let conn_id = self.inner.next_conn.fetch_add(1, Ordering::Relaxed);
-        let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(OUTGOING_CAPACITY);
-        let (req_tx, req_rx) = mpsc::channel::<ClientMessage>(64);
-        let conn = Conn { server: self.clone(), id: conn_id, out: out_tx, client: None, subs: HashMap::new() };
-        let mut processor = tokio::spawn(conn.run(req_rx));
-        let mut req_tx = Some(req_tx);
-        let mut pending: Option<ClientMessage> = None;
+        let (tx, rx) = mpsc::channel::<ServerMessage>(opts.outgoing_capacity.max(1));
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let out = Outgoing {
+            tx,
+            kill: Arc::new(Mutex::new(Some(kill_tx))),
+            stall: opts.stall_timeout,
+            headroom: opts.pulse_headroom.min(opts.outgoing_capacity.saturating_sub(1)),
+        };
+        // Held until the connection ends so the writer's kill receiver never
+        // sees a dropped sender.
+        let _kill_keep = out.kill.clone();
+        let mut writer = tokio::spawn(write_loop(writer, rx, kill_rx, opts.stall_timeout));
 
-        // IO loop: never blocks on request processing, so outgoing messages
-        // always drain (no deadlock between acks and a full outgoing queue).
+        let (req_tx, req_rx) = mpsc::channel::<ClientMessage>(REQUEST_BUFFER);
+        let conn = Conn {
+            server: self.clone(),
+            id: conn_id,
+            out: out.clone(),
+            closed: Closed::default(),
+            client: None,
+            subs: HashMap::new(),
+        };
+        let mut processor = tokio::spawn(conn.run(req_rx));
+
+        // Reader: independent of the writer; only waits for the processor,
+        // which itself never waits longer than the stall timeout.
+        let mut reading = Box::pin({
+            let out = out.clone();
+            async move {
+                loop {
+                    match reader.recv().await {
+                        Ok(Some(m)) => {
+                            if req_tx.send(m).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        // Dropping `req_tx` lets the processor finish.
+                        Ok(None) => return Ok(()),
+                        Err(TransportError::Decode(e)) => {
+                            let msg = ServerMessage::Error { message: format!("bad message: {e}") };
+                            if out.reliable(msg, || slow_consumer("reconnect")).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => return Err(ConnError::from(e)),
+                    }
+                }
+            }
+        });
+        drop(out);
+
+        let mut reading_done = false;
         let result = loop {
-            let reserve = match (&pending, &req_tx) {
-                (Some(_), Some(tx)) => Some(tx.clone().reserve_owned()),
-                _ => None,
-            };
-            let reserving = reserve.is_some();
             tokio::select! {
                 biased;
-                done = &mut processor => {
-                    break match done {
-                        Ok(r) => r,
-                        Err(e) => { tracing::error!(conn = conn_id, error = %e, "connection processor panicked"); Ok(()) }
-                    };
+                w = &mut writer => {
+                    // Transport failure or slow consumer: tear everything down.
+                    processor.abort();
+                    return joined(w, "writer");
                 }
-                Some(msg) = out_rx.recv() => {
-                    if let Err(e) = transport.send(msg).await {
-                        break Err(e.into());
+                p = &mut processor => break joined(p, "processor"),
+                r = &mut reading, if !reading_done => {
+                    reading_done = true;
+                    if let Err(e) = r {
+                        processor.abort();
+                        writer.abort();
+                        return Err(e);
                     }
                 }
-                permit = async move { reserve.unwrap().await }, if reserving => {
-                    match permit {
-                        Ok(p) => { p.send(pending.take().unwrap()); }
-                        Err(_) => { pending = None; req_tx = None; }
-                    }
-                }
-                r = transport.recv(), if pending.is_none() && req_tx.is_some() => match r {
-                    Ok(Some(m)) => pending = Some(m),
-                    Ok(None) => req_tx = None, // processor sees EOF, cleans up, ends
-                    Err(TransportError::Decode(e)) => {
-                        if let Err(e) = transport.send(ServerMessage::Error { message: format!("bad message: {e}") }).await {
-                            break Err(e.into());
-                        }
-                    }
-                    Err(e) => break Err(e.into()),
-                },
             }
         };
-        processor.abort();
-        // Flush what was queued before the processor finished (e.g. the
-        // version error), best effort.
-        if matches!(result, Ok(()) | Err(ConnError::NoCommonVersion { .. })) {
-            while let Ok(msg) = out_rx.try_recv() {
-                if transport.send(msg).await.is_err() {
-                    break;
-                }
+        // The processor finished (EOF or version failure): flush what it
+        // queued, then close the transport.
+        drop(reading);
+        match tokio::time::timeout(opts.stall_timeout, &mut writer).await {
+            Ok(w) => {
+                let w = joined(w, "writer");
+                result.and(w)
+            }
+            Err(_) => {
+                writer.abort();
+                result
             }
         }
-        result
     }
 
     /// Spawn a connection over an in-process channel and return its client end.
@@ -269,7 +498,9 @@ impl Drop for Task {
 struct Conn<D: Decider> {
     server: Server<D>,
     id: u64,
-    out: mpsc::Sender<ServerMessage>,
+    out: Outgoing,
+    /// Questions already closed on this connection (never close twice).
+    closed: Closed,
     /// Client name, set by `Hello`.
     client: Option<String>,
     subs: HashMap<SessionId, Task>,
@@ -299,7 +530,7 @@ where
     }
 
     async fn reply(&self, msg: ServerMessage) {
-        let _ = self.out.send(msg).await;
+        let _ = self.out.reliable(msg, || slow_consumer("reconnect and resubscribe")).await;
     }
 
     async fn error(&self, message: impl Into<String>) {
@@ -357,10 +588,13 @@ where
         // Resubscribing replaces the previous subscription.
         self.subs.remove(&session);
         let hub = self.server.hub(&session);
-        hub.subscribers.lock().unwrap().insert(self.id, self.out.clone());
+        hub.subscribers
+            .lock()
+            .unwrap()
+            .insert(self.id, Subscriber { out: self.out.clone(), closed: self.closed.clone() });
         let events = handle.subscribe(from_seq);
         let pulses = pulses.then(|| handle.pulses());
-        let task = tokio::spawn(pump(session.clone(), events, pulses, self.out.clone()));
+        let task = tokio::spawn(pump(session.clone(), events, pulses, self.out.clone(), self.closed.clone()));
         self.subs.insert(session, Task(task));
     }
 
@@ -385,28 +619,41 @@ where
                     seen.pop_front();
                 }
                 if ack.0 {
-                    let others: Vec<_> = hub
+                    // Close the dialog everywhere now (the journaled
+                    // `QuestionAnswered` follows later and is deduplicated);
+                    // the winner already knows.
+                    self.closed.lock().unwrap().insert(&question);
+                    let others: Vec<Subscriber> = hub
                         .subscribers
                         .lock()
                         .unwrap()
                         .iter()
                         .filter(|(id, _)| **id != self.id)
-                        .map(|(_, tx)| tx.clone())
+                        .map(|(_, s)| s.clone())
                         .collect();
-                    for tx in others {
-                        let msg = ServerMessage::QuestionClosed { session: session.clone(), question: question.clone() };
-                        // Never let a slow peer stall this connection.
-                        if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(msg) {
-                            tokio::spawn(async move {
-                                let _ = tx.send(msg).await;
-                            });
-                        }
+                    for s in others {
+                        close_question(&s, &session, &question);
                     }
                 }
                 ack
             }
         };
         self.reply(ServerMessage::Ack { key, accepted: ack.0, error: ack.1 }).await;
+    }
+}
+
+/// Send `QuestionClosed` to another connection unless it already got it;
+/// never stalls the caller.
+fn close_question(s: &Subscriber, session: &SessionId, question: &QuestionId) {
+    if !s.closed.lock().unwrap().insert(question) {
+        return;
+    }
+    let msg = ServerMessage::QuestionClosed { session: session.clone(), question: question.clone() };
+    if let Err(TrySendError::Full(msg)) = s.out.tx.try_send(msg) {
+        let out = s.out.clone();
+        tokio::spawn(async move {
+            let _ = out.reliable(msg, || slow_consumer("reconnect and resubscribe")).await;
+        });
     }
 }
 
@@ -417,32 +664,79 @@ fn to_ack<T>(r: Result<T, DriverError>) -> Ack {
     }
 }
 
-/// Forward one session's events (reliable) and pulses (lossy) to a connection.
+/// Which questions an event closes, tracking open ones per gate subject.
+///
+/// Closes on `QuestionAnswered` (any responder: a client, in-process code, an
+/// auto rule), on a final verdict recorded for the subject a question was
+/// asked about, and on a hard interrupt (which drops every question).
+#[derive(Default)]
+struct QuestionTracker {
+    open: BTreeMap<GateRef, Vec<QuestionId>>,
+}
+
+impl QuestionTracker {
+    fn closes(&mut self, ev: &Event) -> Vec<QuestionId> {
+        match ev {
+            Event::QuestionAsked { question, subject } => {
+                self.open.entry(subject.clone()).or_default().push(question.id.clone());
+                vec![]
+            }
+            Event::QuestionAnswered { question, .. } => {
+                for qs in self.open.values_mut() {
+                    qs.retain(|q| q != question);
+                }
+                self.open.retain(|_, qs| !qs.is_empty());
+                vec![question.clone()]
+            }
+            Event::VerdictRecorded { subject, verdict, .. } if !matches!(verdict, Verdict::Ask(_)) => {
+                self.open.remove(subject).unwrap_or_default()
+            }
+            Event::Interrupted { hard: true, .. } => std::mem::take(&mut self.open).into_values().flatten().collect(),
+            _ => vec![],
+        }
+    }
+}
+
+/// Forward one session's events (reliable) and pulses (lossy) to a
+/// connection, closing questions as the stream answers them.
 async fn pump(
     session: SessionId,
     mut events: BoxStream<'static, Envelope<Event>>,
     mut pulses: Option<broadcast::Receiver<Pulse>>,
-    out: mpsc::Sender<ServerMessage>,
+    out: Outgoing,
+    closed: Closed,
 ) {
+    let mut tracker = QuestionTracker::default();
     loop {
         tokio::select! {
             ev = events.next() => match ev {
                 Some(e) => {
+                    let seq = e.seq;
+                    let closes = tracker.closes(&e.body);
                     let msg = ServerMessage::Event { session: session.clone(), event: Box::new(e) };
-                    if out.send(msg).await.is_err() {
+                    let sid = &session;
+                    let resume = move |from: Seq| move || slow_consumer(format!("resubscribe to {sid} with from_seq {from}"));
+                    if out.reliable(msg, resume(seq)).await.is_err() {
                         return;
+                    }
+                    for q in closes {
+                        if !closed.lock().unwrap().insert(&q) {
+                            continue;
+                        }
+                        let msg = ServerMessage::QuestionClosed { session: session.clone(), question: q };
+                        if out.reliable(msg, resume(seq + 1)).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 None => {
-                    let _ = out.send(ServerMessage::Error { message: format!("session {session} closed") }).await;
+                    let msg = ServerMessage::Error { message: format!("session {session} closed") };
+                    let _ = out.reliable(msg, || slow_consumer("reconnect")).await;
                     return;
                 }
             },
             p = next_pulse(&mut pulses) => match p {
-                Some(pulse) => {
-                    // Lossy: drop when the connection is backed up.
-                    let _ = out.try_send(ServerMessage::Pulse { session: session.clone(), pulse });
-                }
+                Some(pulse) => out.lossy(ServerMessage::Pulse { session: session.clone(), pulse }),
                 None => pulses = None,
             },
         }
@@ -459,5 +753,60 @@ async fn next_pulse(rx: &mut Option<broadcast::Receiver<Pulse>>) -> Option<Pulse
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q(id: &str) -> Question {
+        serde_json::from_value(serde_json::json!({"id": id, "prompt": "?"})).unwrap()
+    }
+
+    #[test]
+    fn tracker_closes_on_answer_verdict_and_hard_interrupt() {
+        let mut t = QuestionTracker::default();
+        let call = GateRef::Call(CallId::new("c1"));
+        assert!(t.closes(&Event::QuestionAsked { question: q("a"), subject: call.clone() }).is_empty());
+        assert!(t.closes(&Event::QuestionAsked { question: q("b"), subject: GateRef::Session }).is_empty());
+        assert!(t.closes(&Event::QuestionAsked { question: q("c"), subject: GateRef::Turn(1) }).is_empty());
+        // An `Ask` verdict does not close anything.
+        let ask = Event::VerdictRecorded {
+            subject: call.clone(),
+            point: HookPoint::Permission,
+            ring: Ring::Hook,
+            verdict: Verdict::ask("x"),
+            responder: Responder::Hook("h".into()),
+        };
+        assert!(t.closes(&ask).is_empty());
+        let allow = Event::VerdictRecorded {
+            subject: call,
+            point: HookPoint::Permission,
+            ring: Ring::Human,
+            verdict: Verdict::Allow,
+            responder: Responder::AutoRule("r".into()),
+        };
+        assert_eq!(t.closes(&allow), vec![QuestionId::new("a")]);
+        let answered = Event::QuestionAnswered {
+            question: QuestionId::new("b"),
+            answer: Answer::Allow { remember: false },
+            responder: Responder::Code,
+        };
+        assert_eq!(t.closes(&answered), vec![QuestionId::new("b")]);
+        assert_eq!(t.closes(&Event::Interrupted { hard: false, epoch: 1 }), vec![]);
+        assert_eq!(t.closes(&Event::Interrupted { hard: true, epoch: 1 }), vec![QuestionId::new("c")]);
+    }
+
+    #[test]
+    fn closed_set_is_bounded_and_dedupes() {
+        let mut c = ClosedSet::default();
+        assert!(c.insert(&QuestionId::new("x")));
+        assert!(!c.insert(&QuestionId::new("x")));
+        for i in 0..CLOSED_DEDUPE + 10 {
+            c.insert(&QuestionId::new(format!("q{i}")));
+        }
+        assert_eq!(c.set.len(), CLOSED_DEDUPE);
+        assert!(c.insert(&QuestionId::new("x")), "evicted ids can close again");
     }
 }

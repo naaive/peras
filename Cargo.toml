@@ -12,6 +12,7 @@ members = [
     "crates/sdk",
     "crates/sim",
     "crates/cli",
+    "crates/tui",
 ]
 
 [workspace.package]

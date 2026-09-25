@@ -306,6 +306,12 @@ impl Agent {
         self.built.get_or_init(|| build(self.cfg.clone())).await.clone()
     }
 
+    /// Open a session handle: created with this agent's compiled configuration
+    /// if missing, resumed otherwise. For servers and custom clients.
+    pub async fn open_session(&self, id: impl Into<String>) -> Result<SessionHandle<Kernel>, Error> {
+        self.open(&SessionId::new(id.into())).await
+    }
+
     /// Open (create or resume) a session handle.
     pub(crate) async fn open(&self, id: &SessionId) -> Result<SessionHandle<Kernel>, Error> {
         let b = self.built().await?;

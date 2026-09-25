@@ -27,6 +27,29 @@ impl Decider for Toy {
                 }],
                 effects: vec![],
             }),
+            // Question lifecycle driven from inside the session (no server).
+            Input::Signal(Signal::Notify { source, key, .. }) => {
+                let body = match source.as_str() {
+                    "ask" => Event::QuestionAsked {
+                        question: serde_json::from_value(serde_json::json!({"id": key, "prompt": "ok?"})).unwrap(),
+                        subject: GateRef::Session,
+                    },
+                    "answer" => Event::QuestionAnswered {
+                        question: QuestionId::new(key),
+                        answer: Answer::Allow { remember: false },
+                        responder: Responder::Code,
+                    },
+                    "verdict" => Event::VerdictRecorded {
+                        subject: GateRef::Session,
+                        point: HookPoint::SessionStart,
+                        ring: Ring::Human,
+                        verdict: Verdict::Allow,
+                        responder: Responder::AutoRule(key),
+                    },
+                    other => return Err(Rejection::new(format!("toy rejects notify {other}"))),
+                };
+                Ok(Decision { events: vec![Draft::internal(body)], effects: vec![] })
+            }
             other => Err(Rejection::new(format!("toy rejects {other:?}"))),
         }
     }
@@ -286,9 +309,7 @@ async fn simultaneous_answers_first_wins_others_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn json_lines_round_trip_over_duplex() {
     let srv = server();
-    // The server loop is half-duplex per connection (it does not read while a
-    // write is blocked), so the buffer must hold what the client writes
-    // without reading; the long line below still exceeds BufReader's 8 KiB.
+    // The long line below exceeds BufReader's 8 KiB.
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sr, sw) = tokio::io::split(server_io);
     let serving = {
@@ -399,4 +420,176 @@ async fn websocket_transport() {
     assert!(got.contains(&ack("k")));
     let n = got.iter().filter(|m| matches!(m, ServerMessage::Event { .. })).count();
     assert_eq!(n, 2);
+}
+
+fn notify(source: &str, key: &str) -> Input {
+    Input::Signal(Signal::Notify { source: source.into(), key: key.into(), text: String::new(), untrusted: false })
+}
+
+fn closed(q: &str) -> ServerMessage {
+    ServerMessage::QuestionClosed { session: sid(), question: QuestionId::new(q) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn question_closed_for_answers_that_bypass_the_server() {
+    let srv = server();
+    let mut a = srv.connect();
+    let mut b = srv.connect();
+    hello(&mut a, "a").await;
+    hello(&mut b, "b").await;
+    for c in [&mut a, &mut b] {
+        c.send(subscribe(0)).await.unwrap();
+        events(c, 1).await;
+    }
+    let h = srv.session(&sid()).await.unwrap();
+
+    // Answered in-process (e.g. `ask.allow()` in code, an auto rule): the
+    // journaled `QuestionAnswered` closes the dialog on every connection,
+    // right after the event.
+    h.send(notify("ask", "q1")).await.unwrap();
+    h.send(notify("answer", "q1")).await.unwrap();
+    for c in [&mut a, &mut b] {
+        let (evs, other) = events(c, 2).await;
+        assert!(matches!(evs[1].body, Event::QuestionAnswered { .. }));
+        let rest = [other, fence(c).await].concat();
+        assert_eq!(rest, vec![closed("q1")]);
+    }
+
+    // A final verdict on the asked subject closes it too (no QuestionAnswered).
+    h.send(notify("ask", "q2")).await.unwrap();
+    h.send(notify("verdict", "rule")).await.unwrap();
+    for c in [&mut a, &mut b] {
+        let (_, other) = events(c, 2).await;
+        assert_eq!([other, fence(c).await].concat(), vec![closed("q2")]);
+    }
+
+    // Answered through the server: the loser side is closed immediately; the
+    // later journaled answer does not close it again, nor the winner's.
+    h.send(notify("ask", "q3")).await.unwrap();
+    for c in [&mut a, &mut b] {
+        events(c, 1).await;
+    }
+    let q: Question = serde_json::from_value(serde_json::json!({"id": "q3", "prompt": "ok?"})).unwrap();
+    h.asks().open(&q);
+    a.send(ClientMessage::Answer { session: sid(), key: "k3".into(), question: q.id.clone(), answer: Answer::Allow { remember: false } })
+        .await
+        .unwrap();
+    assert_eq!(fence(&mut a).await, vec![ack("k3")]);
+    assert_eq!(fence(&mut b).await, vec![closed("q3")]);
+    h.send(notify("answer", "q3")).await.unwrap();
+    for c in [&mut a, &mut b] {
+        let (_, other) = events(c, 1).await;
+        assert_eq!([other, fence(c).await].concat(), vec![], "no duplicate close");
+    }
+
+    // A late subscriber replaying history sees each question closed once.
+    let mut late = srv.connect();
+    hello(&mut late, "late").await;
+    late.send(subscribe(0)).await.unwrap();
+    let (evs, other) = events(&mut late, h.next_seq() as usize).await;
+    assert_eq!(evs.len() as u64, h.next_seq());
+    let rest = [other, fence(&mut late).await].concat();
+    assert_eq!(rest, vec![closed("q1"), closed("q2"), closed("q3")]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_that_writes_without_reading_does_not_deadlock() {
+    let srv = server();
+    // A tiny pipe: the server's replies fill it long before the client is
+    // done writing. The server must keep reading while its writes block.
+    let (client_io, server_io) = tokio::io::duplex(256);
+    let (sr, sw) = tokio::io::split(server_io);
+    let serving = {
+        let srv = srv.clone();
+        tokio::spawn(async move { srv.serve(JsonLines::new(sr, sw)).await })
+    };
+    let (cr, cw) = tokio::io::split(client_io);
+    let mut c = JsonLines::new(cr, cw);
+    const N: usize = 500;
+    let write_all = async {
+        c.write(&ClientMessage::Hello { versions: vec![PROTOCOL_VERSION], client: "burst".into() }).await.unwrap();
+        for _ in 0..N {
+            c.write(&ClientMessage::Ping).await.unwrap();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), write_all).await.expect("client writes stalled: deadlock");
+    let read = async {
+        assert_eq!(c.read::<ServerMessage>().await.unwrap().unwrap(), ServerMessage::Welcome { version: PROTOCOL_VERSION });
+        for _ in 0..N {
+            assert_eq!(c.read::<ServerMessage>().await.unwrap().unwrap(), ServerMessage::Pong);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), read).await.expect("replies lost");
+    drop(c);
+    let r = tokio::time::timeout(Duration::from_secs(5), serving).await.unwrap().unwrap();
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_consumer_is_disconnected_and_resumes_from_seq() {
+    let rt: Runtime<Toy> = Runtime::builder().build();
+    let options = ServerOptions { outgoing_capacity: 8, pulse_headroom: 2, stall_timeout: Duration::from_millis(200) };
+    let srv = Server::with_options(Arc::new(rt), OpenWith(|_: &SessionId| start()), options);
+
+    // The slow client: tiny transport buffer, never reads while events flow.
+    let (t, mut slow) = channel_with_capacity(4);
+    let serving = {
+        let srv = srv.clone();
+        tokio::spawn(async move { srv.serve(t).await })
+    };
+    slow.send(ClientMessage::Hello { versions: vec![PROTOCOL_VERSION], client: "slow".into() }).await.unwrap();
+    slow.send(subscribe(0)).await.unwrap();
+
+    let mut fast = srv.connect();
+    hello(&mut fast, "fast").await;
+    const N: usize = 60;
+    for i in 0..N {
+        fast.send(submit(&format!("k{i}"), "x")).await.unwrap();
+    }
+    fence(&mut fast).await;
+
+    // The server gives up on the slow client instead of stalling.
+    let r = tokio::time::timeout(Duration::from_secs(5), serving).await.expect("never disconnected").unwrap();
+    assert!(matches!(&r, Err(ConnError::SlowConsumer(m)) if m.contains("from_seq")), "{r:?}");
+
+    // What it did get is a gap-free prefix; the rest is replayed on reconnect.
+    let mut got = vec![];
+    while let Some(m) = slow.recv().await {
+        match m {
+            ServerMessage::Event { event, .. } => got.push(event.seq),
+            ServerMessage::Welcome { .. } => {}
+            ServerMessage::Error { message } => assert!(message.starts_with(SLOW_CONSUMER), "{message}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(got.len() < N + 1, "disconnected before the end");
+    assert_eq!(got, (0..got.len() as u64).collect::<Vec<_>>());
+    let mut again = srv.connect();
+    hello(&mut again, "slow").await;
+    again.send(subscribe(got.len() as u64)).await.unwrap();
+    let (rest, _) = events(&mut again, N + 1 - got.len()).await;
+    assert_eq!(seqs(&rest), (got.len() as u64..=N as u64).collect::<Vec<_>>());
+
+    // The fast client was never affected.
+    fast.send(subscribe(0)).await.unwrap();
+    let (all, _) = events(&mut fast, N + 1).await;
+    assert_eq!(all.len(), N + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_client_bridge() {
+    let srv = server();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let srv = srv.clone();
+        tokio::spawn(async move { srv.serve_ws_listener(listener).await });
+    }
+    let mut c = connect_ws(&format!("ws://{addr}")).await.unwrap();
+    hello(&mut c, "ws-bridge").await;
+    c.send(subscribe(0)).await.unwrap();
+    c.send(submit("k", "hi")).await.unwrap();
+    let (evs, other) = events(&mut c, 2).await;
+    assert_eq!(seqs(&evs), vec![0, 1]);
+    assert_eq!([other, fence(&mut c).await].concat(), vec![ack("k")]);
 }
