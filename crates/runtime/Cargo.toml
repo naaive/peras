@@ -1,0 +1,41 @@
+[package]
+name = "agent-runtime"
+description = "Driver loop, port traits, task registry, snapshots, observer dispatch."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-proto.workspace = true
+agent-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ulid.workspace = true
+globset.workspace = true
+ignore = "0.4"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+
+# `otel` feature: OpenTelemetry export of the session / turn / effect spans.
+opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", optional = true, default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "0.34", optional = true, default-features = false }
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["registry", "std"] }
+
+[features]
+default = []
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tracing-subscriber"]
+
+[dev-dependencies]
+tempfile.workspace = true
+serde.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

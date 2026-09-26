@@ -1,0 +1,28 @@
+[package]
+name = "agent-cli"
+description = "Headless client (JSON Lines), terminal UI, WebSocket server and developer commands (schema, replay, context explain, doctor, config explain)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+agent.workspace = true
+agent-server.workspace = true
+agent-tui = { path = "../tui" }
+async-trait.workspace = true
+ulid.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

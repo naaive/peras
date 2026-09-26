@@ -1,0 +1,29 @@
+[package]
+name = "agent-adapters"
+description = "Adapters: model ports + encoders, journal/blob stores, OS sandbox, memory store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-proto.workspace = true
+agent-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+reqwest.workspace = true
+bytes = "1"
+libc = "0.2"
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"

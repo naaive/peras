@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/kernel",
+    "crates/runtime",
+    "crates/profile",
+    "crates/adapters",
+    "crates/tools",
+    "crates/macros",
+    "crates/server",
+    "crates/sdk",
+    "crates/sim",
+    "crates/cli",
+    "crates/tui",
+    "crates/bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# internal
+agent-proto = { path = "crates/proto" }
+agent-kernel = { path = "crates/kernel" }
+agent-runtime = { path = "crates/runtime" }
+agent-profile = { path = "crates/profile" }
+agent-adapters = { path = "crates/adapters" }
+agent-tools = { path = "crates/tools" }
+agent-macros = { path = "crates/macros" }
+agent-server = { path = "crates/server" }
+agent = { path = "crates/sdk" }
+agent-sim = { path = "crates/sim" }
+
+# external
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = { version = "0.8", features = ["preserve_order"] }
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+ulid = "1"
+globset = "0.4"
+toml = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+proptest = "1"
+tempfile = "3"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+proc-macro-crate = "3"
