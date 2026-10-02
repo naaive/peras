@@ -669,3 +669,56 @@ async fn questions_forwarded_from_subagents_reach_clients() {
     assert_eq!(recv(&mut c).await, ack("ans"));
     assert!(h.asks().is_answered(&late.id));
 }
+
+#[tokio::test]
+async fn forwarded_questions_answered_elsewhere_close_for_every_client() {
+    let srv = server();
+    let h = srv.session(&sid()).await.unwrap();
+    let fwd = |n: &str| Question {
+        id: QuestionId::new(format!("{}s/c1:{n}", agent_runtime::FORWARDED_QUESTION_PREFIX)),
+        prompt: "[sub-agent x] ok?".into(),
+        level: ApprovalLevel::Policy,
+        ring: Ring::Human,
+        rules: vec![],
+        remember_destination: None,
+    };
+    let (a, b) = (fwd("q0"), fwd("q1"));
+    let mut c1 = srv.connect();
+    let mut c2 = srv.connect();
+    for (c, name) in [(&mut c1, "one"), (&mut c2, "two")] {
+        hello(c, name).await;
+        c.send(subscribe(0)).await.unwrap();
+        events(c, 1).await;
+    }
+    h.asks().open(&a);
+    h.asks().open(&b);
+    // Answered from SDK code (no server involved): the session handle's
+    // answer path, as `Ask::allow` uses it.
+    h.answer(a.id.clone(), Answer::Allow { remember: false }, "code").await.unwrap();
+    // Dropped (the sub-agent's own client answered it, or its turn ended).
+    h.asks().close(&b.id);
+    for c in [&mut c1, &mut c2] {
+        let msgs = fence(c).await;
+        let closed: Vec<&ServerMessage> = msgs.iter().filter(|m| matches!(m, ServerMessage::QuestionClosed { .. })).collect();
+        assert_eq!(
+            closed,
+            vec![
+                &ServerMessage::QuestionClosed { session: sid(), question: a.id.clone() },
+                &ServerMessage::QuestionClosed { session: sid(), question: b.id.clone() },
+            ],
+            "{msgs:?}"
+        );
+    }
+    // Answered through the server: the other client gets exactly one close.
+    let c3q = fwd("q2");
+    h.asks().open(&c3q);
+    c1.send(ClientMessage::Answer { session: sid(), key: "k".into(), question: c3q.id.clone(), answer: Answer::Allow { remember: false } })
+        .await
+        .unwrap();
+    let msgs = fence(&mut c1).await;
+    assert!(msgs.contains(&ack("k")), "{msgs:?}");
+    assert!(!msgs.iter().any(|m| matches!(m, ServerMessage::QuestionClosed { question, .. } if *question == c3q.id)), "the winner knows");
+    let msgs = fence(&mut c2).await;
+    let n = msgs.iter().filter(|m| matches!(m, ServerMessage::QuestionClosed { question, .. } if *question == c3q.id)).count();
+    assert_eq!(n, 1, "{msgs:?}");
+}

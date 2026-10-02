@@ -34,17 +34,34 @@ struct Slot {
     tx: watch::Sender<Option<(Answer, Responder)>>,
 }
 
+/// What happened on an [`AskBoard`], in order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoardEvent {
+    /// A question was opened.
+    Opened(Question),
+    /// A question is no longer open: answered (by anyone, through any path)
+    /// or closed because its gate was cancelled.
+    Closed(QuestionId),
+}
+
 /// Per-session pending questions with compare-and-swap answering.
 pub struct AskBoard {
     slots: Mutex<BTreeMap<QuestionId, Slot>>,
     /// Every newly opened question (clients that do not follow the journal,
     /// e.g. questions forwarded from a sub-agent, learn about them here).
     opened: tokio::sync::broadcast::Sender<Question>,
+    /// Opened and closed questions, in order (clients close their dialogs
+    /// for questions the journal does not record, e.g. forwarded ones).
+    events: tokio::sync::broadcast::Sender<BoardEvent>,
 }
 
 impl Default for AskBoard {
     fn default() -> Self {
-        AskBoard { slots: Mutex::default(), opened: tokio::sync::broadcast::channel(64).0 }
+        AskBoard {
+            slots: Mutex::default(),
+            opened: tokio::sync::broadcast::channel(64).0,
+            events: tokio::sync::broadcast::channel(256).0,
+        }
     }
 }
 
@@ -66,6 +83,7 @@ impl AskBoard {
             let (tx, _) = watch::channel(None);
             slots.insert(q.id.clone(), Slot { question: q.clone(), tx });
             let _ = self.opened.send(q.clone());
+            let _ = self.events.send(BoardEvent::Opened(q.clone()));
         }
         if slots.len() > MAX_ANSWERED_KEPT {
             let answered: Vec<QuestionId> =
@@ -84,6 +102,7 @@ impl AskBoard {
             return Err(AnswerError::AlreadyAnswered(id.clone()));
         }
         slot.tx.send_replace(Some((answer, responder)));
+        let _ = self.events.send(BoardEvent::Closed(id.clone()));
         Ok(())
     }
 
@@ -103,6 +122,11 @@ impl AskBoard {
         self.opened.subscribe()
     }
 
+    /// Questions opened and closed from now on, in order.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<BoardEvent> {
+        self.events.subscribe()
+    }
+
     /// Unanswered questions (for clients that connect late).
     pub fn pending(&self) -> Vec<Question> {
         self.slots
@@ -120,7 +144,11 @@ impl AskBoard {
 
     /// Remove a question (its gate was cancelled). Waiters get `None`.
     pub fn close(&self, id: &QuestionId) {
-        self.slots.lock().unwrap().remove(id);
+        let removed = self.slots.lock().unwrap().remove(id);
+        // An answered question was already reported closed.
+        if removed.is_some_and(|s| s.tx.borrow().is_none()) {
+            let _ = self.events.send(BoardEvent::Closed(id.clone()));
+        }
     }
 }
 

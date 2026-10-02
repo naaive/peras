@@ -27,8 +27,10 @@
 //! - **QuestionClosed** is also derived from the event stream, so answers that
 //!   never went through this server (in-process code, auto rules, another
 //!   server) close dialogs too: `QuestionAnswered`, a final verdict for the
-//!   asked subject, or a hard interrupt. Each connection gets at most one
-//!   `QuestionClosed` per question.
+//!   asked subject, or a hard interrupt. Questions forwarded from a
+//!   sub-agent are not in the session's journal: they close when the session's
+//!   ask board reports them answered (through any path, e.g. SDK code) or
+//!   dropped. Each connection gets at most one `QuestionClosed` per question.
 //! - **Ping** -> `Pong`.
 //!
 //! Unknown sessions are obtained through a [`SessionOpener`] ([`ResumeOnly`],

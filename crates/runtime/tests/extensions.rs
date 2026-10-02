@@ -1,5 +1,5 @@
 //! Configuration watcher, task completion notices, subdirectory instruction
-//! scanning and the question board's open notifications.
+//! scanning and the question board's open and close notifications.
 
 use agent_kernel::Kernel;
 use agent_proto::*;
@@ -124,4 +124,39 @@ async fn ask_board_announces_opened_questions() {
     board.open(&q);
     assert_eq!(rx.recv().await.unwrap(), q);
     assert!(rx.try_recv().is_err(), "re-opening is not announced again");
+}
+
+#[tokio::test]
+async fn ask_board_reports_every_close_once() {
+    let board = Arc::new(AskBoard::new());
+    let mut rx = board.subscribe_events();
+    let q = |n: &str| Question {
+        id: QuestionId(format!("subagent:s1/c1:{n}")),
+        prompt: "allow?".into(),
+        level: ApprovalLevel::Policy,
+        ring: Ring::Human,
+        rules: vec![],
+        remember_destination: None,
+    };
+    let (a, b) = (q("a"), q("b"));
+    board.open(&a);
+    board.open(&b);
+    board.answer(&a.id, Answer::Allow { remember: false }, Responder::Code).unwrap();
+    assert!(board.answer(&a.id, Answer::Allow { remember: false }, Responder::Code).is_err());
+    board.close(&a.id); // already reported closed by its answer
+    board.close(&b.id);
+    board.close(&b.id); // gone already
+    let mut got = vec![];
+    while let Ok(e) = rx.try_recv() {
+        got.push(e);
+    }
+    assert_eq!(
+        got,
+        vec![
+            BoardEvent::Opened(a.clone()),
+            BoardEvent::Opened(b.clone()),
+            BoardEvent::Closed(a.id.clone()),
+            BoardEvent::Closed(b.id.clone()),
+        ]
+    );
 }

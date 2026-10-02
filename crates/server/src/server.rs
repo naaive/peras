@@ -19,7 +19,7 @@
 use crate::transport::{channel, ChannelClient, JsonLines, Transport, TransportError, TransportRead, TransportWrite, WsTransport};
 use agent_kernel::{Decider, Decision};
 use agent_proto::*;
-use agent_runtime::{AnswerError, DriverError, Runtime, SessionHandle, FORWARDED_QUESTION_PREFIX};
+use agent_runtime::{AnswerError, BoardEvent, DriverError, Runtime, SessionHandle, FORWARDED_QUESTION_PREFIX};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -249,6 +249,13 @@ impl ClosedSet {
             }
         }
         true
+    }
+
+    /// Forget `q` (it was marked closed in advance and stayed open).
+    fn remove(&mut self, q: &QuestionId) {
+        if self.set.remove(q) {
+            self.order.retain(|x| x != q);
+        }
     }
 }
 
@@ -626,7 +633,7 @@ where
             .insert(self.id, Subscriber { out: self.out.clone(), closed: self.closed.clone() });
         let events = handle.subscribe(from_seq);
         let pulses = pulses.then(|| handle.pulses());
-        let asks = Forwarded { rx: handle.asks().subscribe(), pending: handle.asks().pending() };
+        let asks = Forwarded { rx: handle.asks().subscribe_events(), pending: handle.asks().pending() };
         let task = tokio::spawn(pump(session.clone(), events, pulses, asks, self.out.clone(), self.closed.clone()));
         self.subs.insert(session, Task(task));
     }
@@ -638,6 +645,10 @@ where
             if let Some((_, ack)) = seen.iter().find(|(k, _)| *k == key) {
                 ack.clone()
             } else {
+                // The winner never gets `QuestionClosed`: mark it before the
+                // board reports the answer (forwarded questions close from
+                // the board, possibly before the answer call returns).
+                let fresh = self.closed.lock().unwrap().insert(&question);
                 let ack = match self.server.session(&session).await {
                     Ok(h) => match h.answer(question.clone(), answer, &responder).await {
                         Err(DriverError::Answer(AnswerError::AlreadyAnswered(_))) => {
@@ -651,11 +662,13 @@ where
                 while seen.len() > ANSWER_DEDUPE {
                     seen.pop_front();
                 }
+                if !ack.0 && fresh {
+                    self.closed.lock().unwrap().remove(&question);
+                }
                 if ack.0 {
                     // Close the dialog everywhere now (the journaled
                     // `QuestionAnswered` follows later and is deduplicated);
                     // the winner already knows.
-                    self.closed.lock().unwrap().insert(&question);
                     let others: Vec<Subscriber> = hub
                         .subscribers
                         .lock()
@@ -752,8 +765,17 @@ async fn pump(
     loop {
         tokio::select! {
             q = forwarded.recv(), if forwarded_open => match q {
-                Ok(q) if q.id.0.starts_with(FORWARDED_QUESTION_PREFIX) => {
+                Ok(BoardEvent::Opened(q)) if q.id.0.starts_with(FORWARDED_QUESTION_PREFIX) => {
                     if out.reliable(forwarded_msg(q), || slow_consumer("reconnect and resubscribe")).await.is_err() {
+                        return;
+                    }
+                }
+                // However it was answered (a client of this server, in-process
+                // code, the child's own clients) or dropped, close the dialog.
+                Ok(BoardEvent::Closed(q)) if q.0.starts_with(FORWARDED_QUESTION_PREFIX) => {
+                    let first = closed.lock().unwrap().insert(&q);
+                    let msg = ServerMessage::QuestionClosed { session: session.clone(), question: q };
+                    if first && out.reliable(msg, || slow_consumer("reconnect and resubscribe")).await.is_err() {
                         return;
                     }
                 }
@@ -795,9 +817,10 @@ async fn pump(
 }
 
 /// Questions forwarded to a session's board from its sub-agents: those open
-/// at subscription time, then newly opened ones.
+/// at subscription time, then newly opened and closed ones (the journal does
+/// not record them, so the board is the only source of their closing).
 struct Forwarded {
-    rx: broadcast::Receiver<Question>,
+    rx: broadcast::Receiver<BoardEvent>,
     pending: Vec<Question>,
 }
 
