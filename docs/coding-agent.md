@@ -61,7 +61,7 @@ Supporting framework changes:
 | Prompt-injection defenses | ➕ | Taint tracking from trust annotations. Egress and persistence invariants, secret redaction. |
 | Steering while the agent works | ✅ | Lines typed during a turn reach the agent at its next step. |
 | `@file` mentions with completion, images, vim mode, status line, output styles, IDE integration | ❌ | |
-| Other model vendors | ⚠️ | Anthropic models through `[model] id` or `--model`. The framework has an OpenAI-compatible adapter, but `peras` does not expose it. |
+| Other model vendors | ✅ | `--provider anthropic` (default; `[model] id` or `--model`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`) or `--provider openai` (`--model` required, `OPENAI_API_KEY`, `--base-url` / `OPENAI_BASE_URL`, `/v1` added when the URL has no version) for any OpenAI-compatible chat-completions endpoint. `--context-window` sets the window (openai default 128000). `PERAS_PROVIDER` selects the provider. |
 
 ✅ supported · ⚠️ partial or different · ➕ beyond Claude Code · ❌ missing
 

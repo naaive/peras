@@ -359,3 +359,101 @@ async fn repl_shell_escape_and_notes() {
     assert!(first.contains("<bash-input>echo from-shell</bash-input>") && first.ends_with("what did I run?"), "{first}");
     let _ = std::io::stdout().flush();
 }
+
+// ------------------------------------------------------------------ OpenAI-compatible provider
+
+/// A local OpenAI-compatible endpoint: the first request gets an `ls` tool
+/// call, later ones an answer quoting the tool result. Records each request.
+async fn mock_openai() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(vec![]));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![];
+                let mut chunk = [0u8; 8192];
+                let (head_end, len) = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                            .unwrap_or(0);
+                        break (i + 4, len);
+                    }
+                };
+                while buf.len() < head_end + len {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let body: serde_json::Value = serde_json::from_slice(&buf[head_end..head_end + len]).unwrap();
+                let tool_result = body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").map(|m| m["content"].to_string());
+                log.lock().unwrap().push(json!({"head": head, "body": body}));
+                let model = body["model"].clone();
+                let frame = |delta: serde_json::Value, finish: Option<&str>| {
+                    format!("data: {}\n\n", json!({"id": "c", "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}))
+                };
+                let mut sse = String::new();
+                match tool_result {
+                    None => {
+                        sse += &frame(json!({"role": "assistant", "content": "Looking. "}), None);
+                        sse += &frame(json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "ls", "arguments": "{\"dir\""}}]}), None);
+                        sse += &frame(json!({"tool_calls": [{"index": 0, "function": {"arguments": ": \".\"}"}}]}), None);
+                        sse += &frame(json!({}), Some("tool_calls"));
+                    }
+                    Some(r) => {
+                        sse += &frame(json!({"content": format!("Files: {}", r.contains("a.txt"))}), None);
+                        sse += &frame(json!({}), Some("stop"));
+                    }
+                }
+                sse += &format!("data: {}\n\ndata: [DONE]\n\n", json!({"id": "c", "choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 7}}));
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}", sse.len());
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test]
+async fn openai_compatible_provider_end_to_end() {
+    let ws = workspace();
+    let (url, seen) = mock_openai().await;
+    let endpoint = agent_code::ModelEndpoint {
+        provider: agent_code::Provider::OpenAi,
+        model: Some("gw-model".into()),
+        base_url: Some(url),
+        api_key: Some("sk-test".into()),
+        context_window: None,
+    };
+    let mut o = Options::new(ws.path());
+    o.home = Some(None);
+    o.port = endpoint.port().unwrap();
+    let c = o.build();
+    assert_eq!(c.model_name().await.unwrap(), "gw-model");
+    let mut out = Vec::new();
+    let r = agent_code::print::run(&c, None, "what is here?".into(), OutputFormat::Json, &mut out).await;
+    assert_eq!(r.text(), "Files: true", "{}", String::from_utf8_lossy(&out));
+    assert_eq!((r.tool_calls, r.totals.replies, r.totals.output), (1, 2, 14));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let head = seen[0]["head"].as_str().unwrap();
+    assert!(head.starts_with("POST /v1/chat/completions"), "{head}");
+    assert!(head.to_ascii_lowercase().contains("authorization: bearer sk-test"), "{head}");
+    let body = &seen[0]["body"];
+    assert_eq!(body["model"], "gw-model");
+    assert_eq!(body["stream"], true);
+    assert!(body["messages"][0]["content"].to_string().contains("You are Peras"));
+    assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "multi_edit"));
+}

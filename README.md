@@ -97,6 +97,11 @@ git diff | peras -p "review this"      # piped stdin is appended to the prompt
 peras -c                               # continue the last conversation;  peras -r <id> resumes one
 peras --permission-mode plan           # default | acceptEdits | plan | bypassPermissions
 peras -p "run the tests" --allowed-tools "bash(cargo test:*)" edit
+
+# OpenAI-compatible APIs (OpenAI, new-api / one-api gateways, vLLM, Ollama...)
+export OPENAI_API_KEY=sk-...
+peras --provider openai --base-url https://gateway.example.com --model gpt-5   # `/v1` is added when missing
+# or: PERAS_PROVIDER=openai OPENAI_BASE_URL=... peras --model ...
 ```
 
 In the REPL: `/help`, `/clear`, `/compact`, `/resume`, `/rewind`, `/mode`, `/plan`, `/model`, `/permissions`,

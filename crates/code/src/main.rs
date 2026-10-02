@@ -34,9 +34,21 @@ struct Cli {
     /// Resume a conversation by id (or unique prefix); without an id, list them.
     #[arg(short, long, num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
-    /// Model id (e.g. claude-opus-5-5).
+    /// Model id (e.g. claude-opus-5-5, or the gateway's model name).
     #[arg(long)]
     model: Option<String>,
+    /// Model API: anthropic | openai (OpenAI-compatible chat completions).
+    /// Default: `$PERAS_PROVIDER`, else anthropic. Keys come from
+    /// `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`.
+    #[arg(long)]
+    provider: Option<String>,
+    /// API base URL (default `$ANTHROPIC_BASE_URL` / `$OPENAI_BASE_URL`); for
+    /// openai a URL without a version gets `/v1`.
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Context window of the model in tokens (openai default 128000).
+    #[arg(long)]
+    context_window: Option<u32>,
     /// default | acceptEdits | plan | bypassPermissions
     #[arg(long, default_value = "default")]
     permission_mode: String,
@@ -101,7 +113,16 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
         PermissionMode::parse(&cli.permission_mode)
             .ok_or_else(|| anyhow::anyhow!("--permission-mode must be default, acceptEdits, plan or bypassPermissions"))?
     };
+    let provider = cli.provider.clone().or_else(|| std::env::var("PERAS_PROVIDER").ok()).unwrap_or_else(|| "anthropic".into());
+    let endpoint = agent_code::ModelEndpoint {
+        provider: agent_code::Provider::parse(&provider).ok_or_else(|| anthropic_or_openai(&provider))?,
+        model: cli.model.clone(),
+        base_url: cli.base_url.clone(),
+        api_key: None,
+        context_window: cli.context_window,
+    };
     let mut opts = Options::new(cli.dir.clone());
+    opts.port = endpoint.port().map_err(|e| anyhow::anyhow!(e))?;
     opts.db = cli.db.clone();
     opts.model = cli.model.clone();
     opts.mode = mode;
@@ -145,7 +166,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
             agent_code::repl::interrupts(),
             Box::new(std::io::stdout()),
         )
-        .verbose(cli.verbose);
+        .verbose(cli.verbose)
+        .steer_while_busy(std::io::stdin().is_terminal());
         repl.run(cli.prompt.clone()).await?;
         return Ok(exit_code::OK);
     }
@@ -211,6 +233,10 @@ fn piped_stdin(wait: bool) -> anyhow::Result<Option<String>> {
         bytes.extend(rx.recv().unwrap_or(Ok(vec![]))?);
     }
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn anthropic_or_openai(got: &str) -> anyhow::Error {
+    anyhow::anyhow!("--provider must be anthropic or openai, got `{got}`")
 }
 
 /// `--allowed-tools "edit bash(git diff:*)"`: split on spaces outside parentheses.

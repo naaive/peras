@@ -113,6 +113,9 @@ pub struct Repl {
     model: Option<String>,
     /// Told whenever the REPL waits for the user (prompt, approval).
     ready: Option<mpsc::UnboundedSender<()>>,
+    /// Lines arriving during a turn steer it (a person typing); otherwise
+    /// they wait for the next prompt (piped input).
+    steer_while_busy: bool,
 }
 
 enum Flow {
@@ -141,7 +144,15 @@ impl Repl {
             pending: vec![],
             model: None,
             ready: None,
+            steer_while_busy: true,
         }
+    }
+
+    /// Whether lines typed during a turn steer it (default) or wait for the
+    /// next prompt (input from a pipe or a script).
+    pub fn steer_while_busy(mut self, yes: bool) -> Repl {
+        self.steer_while_busy = yes;
+        self
     }
 
     /// Be told whenever the REPL waits for the user (scripted frontends and
@@ -439,7 +450,7 @@ impl Repl {
                         _ => {}
                     }
                 }
-                l = self.input.recv() => match l {
+                l = self.input.recv(), if self.steer_while_busy => match l {
                     Some(Input::Line(l)) if !l.trim().is_empty() => {
                         ctl.steer(l.trim().to_string());
                         self.say(&render::dim("  (sent: the agent sees it at its next step)"));

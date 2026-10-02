@@ -43,6 +43,93 @@ use tools::{ExitPlanMode, TodoStore, TodoWrite};
 
 pub use mode::PermissionMode as Mode;
 
+/// Model API family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    /// Anthropic Messages API (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`).
+    Anthropic,
+    /// OpenAI-compatible chat completions (`OPENAI_API_KEY`, `OPENAI_BASE_URL`):
+    /// OpenAI, gateways such as new-api / one-api, vLLM, Ollama.
+    OpenAi,
+}
+
+impl Provider {
+    pub fn parse(s: &str) -> Option<Provider> {
+        match s.to_ascii_lowercase().as_str() {
+            "anthropic" | "claude" => Some(Provider::Anthropic),
+            "openai" | "openai-compat" | "openai_compatible" => Some(Provider::OpenAi),
+            _ => None,
+        }
+    }
+}
+
+/// Where and how to reach the model, from flags and the environment.
+#[derive(Debug, Clone)]
+pub struct ModelEndpoint {
+    pub provider: Provider,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    /// Context window in tokens (OpenAI-compatible models: default 128000).
+    pub context_window: Option<u32>,
+}
+
+impl ModelEndpoint {
+    /// The model port, or `None` for the configuration's Anthropic model
+    /// (`[model] id`, `ANTHROPIC_*` variables) when nothing overrides it.
+    pub fn port(&self) -> Result<Option<Arc<dyn ModelPort>>, String> {
+        use agent::adapters::{Claude, ModelPortExt, OpenAiCompat};
+        match self.provider {
+            Provider::Anthropic => {
+                if self.base_url.is_none() && self.api_key.is_none() && self.context_window.is_none() {
+                    return Ok(None);
+                }
+                let model = self.model.clone().unwrap_or_else(|| agent::adapters::model::anthropic::DEFAULT_MODEL.to_string());
+                let mut c = Claude::new(model);
+                if let Some(u) = &self.base_url {
+                    c = c.base_url(u.trim_end_matches('/'));
+                }
+                if let Some(k) = &self.api_key {
+                    c = c.api_key(k);
+                }
+                if let Some(w) = self.context_window {
+                    c.caps_mut().window = w;
+                }
+                Ok(Some(Arc::new(c.retry(3).meter())))
+            }
+            Provider::OpenAi => {
+                let model = self.model.clone().ok_or("the OpenAI-compatible provider needs a model (--model)")?;
+                let base = self
+                    .base_url
+                    .clone()
+                    .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+                let mut o = OpenAiCompat::new(model, openai_base_url(&base));
+                if let Some(k) = &self.api_key {
+                    o = o.api_key(k);
+                }
+                if let Some(w) = self.context_window {
+                    o.caps_mut().window = w;
+                }
+                Ok(Some(Arc::new(o.retry(3).meter())))
+            }
+        }
+    }
+}
+
+/// `https://host` → `https://host/v1`; a URL with a version segment
+/// (`/v1`, `/api/v3`, `.../openai/v1beta`) is kept.
+pub fn openai_base_url(url: &str) -> String {
+    let u = url.trim_end_matches('/');
+    let u = u.strip_suffix("/chat/completions").unwrap_or(u);
+    let last = u.rsplit('/').next().unwrap_or("");
+    let versioned = u.matches('/').count() > 2
+        && last.len() >= 2
+        && last.starts_with('v')
+        && last[1..].chars().next().is_some_and(|c| c.is_ascii_digit());
+    if versioned { u.to_string() } else { format!("{u}/v1") }
+}
+
 /// How to assemble the coding agent.
 #[derive(Clone)]
 pub struct Options {
@@ -177,7 +264,8 @@ impl Options {
         if self.hot_reload {
             agent = agent.hot_reload();
         }
-        Coding { agent, permissions, todos, dir: self.dir.clone(), db, custom_model: self.port.is_some() }
+        let port_model = self.port.as_ref().map(|p| p.caps().model.to_string());
+        Coding { agent, permissions, todos, dir: self.dir.clone(), db, port_model }
     }
 }
 
@@ -216,15 +304,18 @@ pub struct Coding {
     pub todos: TodoStore,
     pub dir: PathBuf,
     pub db: PathBuf,
-    /// Driven by a model port given in [`Options::port`].
-    pub custom_model: bool,
+    /// The model of the port given in [`Options::port`].
+    pub port_model: Option<String>,
 }
 
 impl Coding {
     /// The model id sessions start with.
     pub async fn model_name(&self) -> Result<String, agent::Error> {
+        if let Some(m) = &self.port_model {
+            return Ok(m.clone());
+        }
         let id = self.agent.profile().await?.kernel.caps.model.to_string();
-        Ok(if !self.custom_model && (id.is_empty() || id == "scripted") {
+        Ok(if id.is_empty() || id == "scripted" {
             agent::adapters::model::anthropic::DEFAULT_MODEL.to_string()
         } else {
             id
@@ -262,6 +353,30 @@ mod tests {
         assert!(agent::profile::Settings::default() == agent::profile::Settings::default());
         let parsed: agent::profile::Settings = toml::from_str(&o.settings_toml()).expect("valid settings");
         assert_eq!(parsed.permissions.len(), 2);
+    }
+
+    #[test]
+    fn openai_base_urls() {
+        assert_eq!(openai_base_url("https://token.example.com"), "https://token.example.com/v1");
+        assert_eq!(openai_base_url("https://token.example.com/"), "https://token.example.com/v1");
+        assert_eq!(openai_base_url("https://api.openai.com/v1"), "https://api.openai.com/v1");
+        assert_eq!(openai_base_url("https://x.dev/api/v3/chat/completions"), "https://x.dev/api/v3");
+        assert_eq!(openai_base_url("http://localhost:11434/v1"), "http://localhost:11434/v1");
+        assert_eq!(openai_base_url("https://vendor.dev/v1beta/openai"), "https://vendor.dev/v1beta/openai/v1");
+    }
+
+    #[test]
+    fn endpoints() {
+        let mut e = ModelEndpoint { provider: Provider::Anthropic, model: None, base_url: None, api_key: None, context_window: None };
+        assert!(e.port().unwrap().is_none(), "the configured model");
+        e.provider = Provider::OpenAi;
+        assert!(e.port().is_err(), "a model is required");
+        e.model = Some("gpt-x".into());
+        e.base_url = Some("https://gw.example.com".into());
+        e.context_window = Some(64_000);
+        let p = e.port().unwrap().unwrap();
+        assert_eq!((p.caps().model.as_str(), p.caps().window), ("gpt-x", 64_000));
+        assert_eq!(Provider::parse("OpenAI"), Some(Provider::OpenAi));
     }
 
     #[test]
