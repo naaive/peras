@@ -35,7 +35,27 @@ pub enum ClientMessage {
     Command { session: SessionId, key: String, command: Command },
     /// Approvals are compare-and-swap: first answer wins.
     Answer { session: SessionId, key: String, question: QuestionId, answer: Answer },
+    /// List the slash commands the server expands (`/name args`).
+    ListCommands,
     Ping,
+}
+
+/// A slash command offered by the server (from the profile's command table).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// Split `/name args` into `("name", "args")`. Text that does not start with
+/// `/` followed by a command name (letters, digits, `-`, `_`, `:`, `.`) is
+/// not a slash command.
+pub fn parse_slash(text: &str) -> Option<(&str, &str)> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'));
+    ok.then(|| (name, rest[end..].trim()))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -48,8 +68,28 @@ pub enum ServerMessage {
     Ack { key: String, accepted: bool, #[serde(default)] error: Option<String> },
     /// A question was answered by someone else: close the dialog.
     QuestionClosed { session: SessionId, question: QuestionId },
+    /// Reply to `ListCommands`.
+    Commands { commands: Vec<CommandInfo> },
+    /// A question that is not in this session's event stream: one a sub-agent
+    /// asked, forwarded to its parent's clients (answer it with `Answer` on
+    /// this session, compare-and-swap like any other).
+    Question { session: SessionId, question: crate::verdict::Question },
     Pong,
     Error { message: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_slash;
+
+    #[test]
+    fn slash_parsing() {
+        assert_eq!(parse_slash("/review src/lib.rs  "), Some(("review", "src/lib.rs")));
+        assert_eq!(parse_slash("  /help"), Some(("help", "")));
+        assert_eq!(parse_slash("/"), None);
+        assert_eq!(parse_slash("/usr/bin is broken"), None);
+        assert_eq!(parse_slash("hello /x"), None);
+    }
 }
 
 /// Exit codes of the headless client.

@@ -593,3 +593,79 @@ async fn websocket_client_bridge() {
     assert_eq!(seqs(&evs), vec![0, 1]);
     assert_eq!([other, fence(&mut c).await].concat(), vec![ack("k")]);
 }
+
+/// Expands `/greet <who>`; knows one command.
+struct Slash;
+
+#[async_trait::async_trait]
+impl SessionOpener<Toy> for Slash {
+    async fn open(&self, rt: &Runtime<Toy>, id: &SessionId) -> Result<agent_runtime::SessionHandle<Toy>, agent_runtime::DriverError> {
+        rt.open_session(id.clone(), start).await
+    }
+    fn expand(&self, text: &str) -> Option<String> {
+        match parse_slash(text)? {
+            ("greet", who) => Some(format!("Say hello to {who}.")),
+            _ => None,
+        }
+    }
+    fn commands(&self) -> Vec<CommandInfo> {
+        vec![CommandInfo { name: "greet".into(), description: "Greet someone".into() }]
+    }
+}
+
+#[tokio::test]
+async fn slash_commands_are_listed_and_expanded() {
+    let rt: Runtime<Toy> = Runtime::builder().build();
+    let srv = Server::new(Arc::new(rt), Slash);
+    let mut c = srv.connect();
+    hello(&mut c, "slash").await;
+    c.send(ClientMessage::ListCommands).await.unwrap();
+    assert_eq!(
+        recv(&mut c).await,
+        ServerMessage::Commands { commands: vec![CommandInfo { name: "greet".into(), description: "Greet someone".into() }] }
+    );
+    c.send(subscribe(0)).await.unwrap();
+    c.send(submit("a", "/greet Ada")).await.unwrap();
+    c.send(submit("b", "/other stays")).await.unwrap();
+    let (evs, _) = events(&mut c, 3).await;
+    let texts: Vec<&str> = evs
+        .iter()
+        .filter_map(|e| match &e.body {
+            Event::UserMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["Say hello to Ada.", "/other stays"]);
+}
+
+#[tokio::test]
+async fn questions_forwarded_from_subagents_reach_clients() {
+    let srv = server();
+    let h = srv.session(&sid()).await.unwrap();
+    let early = Question {
+        id: QuestionId::new(format!("{}s/c1:q0", agent_runtime::FORWARDED_QUESTION_PREFIX)),
+        prompt: "[sub-agent x] early?".into(),
+        level: ApprovalLevel::Policy,
+        ring: Ring::Human,
+        rules: vec![],
+        remember_destination: None,
+    };
+    h.asks().open(&early);
+    let mut c = srv.connect();
+    hello(&mut c, "parent-client").await;
+    c.send(subscribe(0)).await.unwrap();
+    let (_, other) = events(&mut c, 1).await;
+    assert!(other.contains(&ServerMessage::Question { session: sid(), question: early.clone() }), "{other:?}");
+    let late = Question { id: QuestionId::new(format!("{}s/c1:q1", agent_runtime::FORWARDED_QUESTION_PREFIX)), ..early.clone() };
+    h.asks().open(&late);
+    // Questions of the session's own kernel go through the event stream only.
+    h.asks().open(&Question { id: QuestionId::new("q:own"), ..early.clone() });
+    let msgs = fence(&mut c).await;
+    assert_eq!(msgs, vec![ServerMessage::Question { session: sid(), question: late.clone() }]);
+    // Answered like any question: compare-and-swap on the session's board.
+    c.send(ClientMessage::Answer { session: sid(), key: "ans".into(), question: late.id.clone(), answer: Answer::Allow { remember: false } })
+        .await
+        .unwrap();
+    assert_eq!(recv(&mut c).await, ack("ans"));
+    assert!(h.asks().is_answered(&late.id));
+}

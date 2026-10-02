@@ -86,7 +86,32 @@ cargo run -p agent-cli -- context explain <session>                   # where ev
 cargo run -p agent-cli -- doctor                                      # sandbox probe, credentials, config warnings
 cargo run -p agent-cli -- config explain model.id                     # final value + source layer
 cargo run -p agent-cli -- schema                                      # protocol JSON Schema
+cargo run -p agent-cli -- commands                                    # slash commands (`/name args`)
 ```
+
+## Configuration and extensions
+
+`Agent::discover(dir)` compiles the five configuration layers plus everything they point to:
+
+- **Instruction files** (`AGENTS.md`, `CLAUDE.md`) from the project root to the working directory enter the Static
+  layer; those in subdirectories are injected (within a byte budget) when a tool first accesses that directory, again
+  when they change, and again after compaction removed them.
+- **Skills** (`skills/<name>/SKILL.md`, user and project), loaded with `load_skill`.
+- **Slash commands** (`commands/<name>.md`): `/name args` typed in `agent run`, the TUI or any server client expands
+  into the template (`$ARGUMENTS`); the TUI also has local actions (`/help`, `/model`, `/pause`, ...).
+- **Sub-agents** (`agents/<name>.md`, frontmatter `description`, `tools`, `model`, `mode: fork`) are registered as
+  tools. A child session links its parent, inherits its taint, gets the intersection of the tools, a budget carved
+  out of the parent's and its approval mode; its questions are forwarded to the parent's clients; it can run in the
+  background (`task_list`, `task_output`, `task_kill`).
+- **Hooks** (`[[hooks]]`: command, HTTP, MCP tool, model call or sub-agent executors) and **observers**
+  (`[[observers]]`: command, HTTP or MCP executors; feedback only as a notify / wake / silent signal).
+- **MCP servers** (`[mcp.<name>]`): `command` (stdio) or `url` (Streamable HTTP, falling back to HTTP+SSE).
+- **Plugins** (`~/.agent/plugins/<p>/`, `.agent/plugins/<p>/` with a versioned `plugin.toml`): bundles of hooks, MCP
+  servers, observers, skills, commands, sub-agents and instruction files, merged like the layer they are installed in;
+  `[plugins] disabled = [..]` turns one off.
+- **Long-term memory** (`.memory(store)`) is loaded into the Durable layer when a session starts.
+- **Hot reload** (`.hot_reload()`, on in `tui` / `serve`): changed configuration is recompiled and applied to live
+  sessions at their next idle point.
 
 ## Development
 
