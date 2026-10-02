@@ -88,6 +88,8 @@ pub(crate) struct Built {
     pub config: KernelConfig,
     pub profile_hash: String,
     pub profile: Profile,
+    /// Held while the agent can write the workspace (released with the last clone).
+    _lock: Option<WorkspaceLock>,
 }
 
 /// An agent: a model, tools, policy, storage. Cheap to clone; clones share the
@@ -417,6 +419,18 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     registry.adapt(&ToolEnv { sandbox: report.clone(), shell_rules: profile.shell.clone() });
     let profile = profile.with_tools(registry.specs());
 
+    // ---- one writing session per workspace (shared by the agents of this
+    // process, e.g. sub-agents); read-only agents take no lock.
+    let writes = registry.specs().iter().any(|t| t.class != EffectClass::Pure || t.subagent);
+    let lock = if writes {
+        Some(WorkspaceLock::acquire(&workspace, &data_dir().join("locks")).map_err(|e| match e {
+            LockError::Held { .. } => Error::WorkspaceLocked(e.to_string()),
+            LockError::Io { .. } => Error::Config(e.to_string()),
+        })?)
+    } else {
+        None
+    };
+
     // ---- gates
     let mut chain = GateChain::new();
     for (i, g) in cfg.gates.iter().enumerate() {
@@ -527,7 +541,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
         builder = builder.observer(o.clone());
     }
     let rt = builder.build();
-    Ok(Arc::new(Built { rt, config: kc, profile_hash, profile }))
+    Ok(Arc::new(Built { rt, config: kc, profile_hash, profile, _lock: lock }))
 }
 
 /// Framework data directory (`$AGENT_DATA_DIR`, else `~/.agent`).

@@ -149,6 +149,7 @@ dependencies = [
  "globset",
  "hex",
  "ignore",
+ "libc",
  "notify",
  "opentelemetry",
  "opentelemetry-otlp",

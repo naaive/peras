@@ -6,6 +6,10 @@ pub enum Error {
     /// Configuration problem (reported at first run, or by `Agent::check`).
     #[error("config: {0}")]
     Config(String),
+    /// Another process has a writing session on this workspace (one writer
+    /// per workspace; use a separate git worktree).
+    #[error("{0}")]
+    WorkspaceLocked(String),
     #[error(transparent)]
     Driver(#[from] DriverError),
     /// The turn failed (model/infrastructure error).

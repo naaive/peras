@@ -13,6 +13,7 @@
 //! - [`metrics`] — [`Metrics`] (counters and histograms, `snapshot()`).
 //! - [`snapshot`] — [`JsonCodec`], a [`StateCodec`] for serde states.
 //! - [`cursors`] — [`MemCursors`] / [`FileCursors`] observer cursor stores.
+//! - [`lock`] — [`WorkspaceLock`]: one writing session per workspace.
 //! - [`redact`] — [`Redactor`]: secret values are redacted from inputs (hence the
 //!   journal and context) and blobs.
 //! - `otel` (feature `otel`) — OpenTelemetry OTLP export of the spans.
@@ -22,6 +23,7 @@ pub mod cursors;
 pub mod dispatch;
 pub mod driver;
 pub mod gate;
+pub mod lock;
 pub mod mem;
 pub mod metrics;
 #[cfg(feature = "otel")]
@@ -39,6 +41,7 @@ pub use dispatch::{Env, ObserverResume, RuntimeOptions};
 pub use driver::{Applied, DriverError, Runtime, RuntimeBuilder, SessionHandle};
 pub use gate::{AnswerError, AskBoard, AutoRule, FnHook, FnRule, GateChain, Hook};
 pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, RuleStats};
+pub use lock::{LockError, WorkspaceLock};
 pub use mem::*;
 pub use ports::*;
 pub use redact::{RedactingBlobs, RedactingSecrets, Redactor};
