@@ -173,7 +173,7 @@ impl Decider for Toy {
                     }
                     EffectResult::Executed(rs) => {
                         for r in rs {
-                            let call = ToolCall {
+                            let call = ToolCall { isolated: false,
                                 id: r.call_id.clone(),
                                 name: String::new(),
                                 input: json!({}),

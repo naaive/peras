@@ -74,7 +74,7 @@ fn reply(text: &str, calls: Vec<ToolCall>, usage: (u32, u32)) -> AssistantMessag
 }
 
 fn call(id: &str, name: &str) -> ToolCall {
-    ToolCall {
+    ToolCall { isolated: false,
         id: CallId::new(id),
         name: name.into(),
         input: serde_json::json!({"path": "src/lib.rs"}),

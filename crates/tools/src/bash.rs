@@ -12,7 +12,7 @@
 use crate::caps::{check_granted, compile_spec};
 use crate::shell::{self, Rule, SemanticTable, ShellAnalysis};
 use agent_proto::{Access, EffectClass, ToolContent, ToolSpec};
-use agent_runtime::{AccessCtx, Tool, ToolCtx, ToolEnv, ToolError, ToolOutput};
+use agent_runtime::{staged_key, AccessCtx, Tool, ToolCtx, ToolEnv, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -41,6 +41,8 @@ impl Bash {
 #[derive(Debug, Clone)]
 pub struct BashTool {
     sandbox_available: bool,
+    /// Opaque commands run isolated (staged for review) instead of asking first.
+    isolation: bool,
     table: Arc<SemanticTable>,
 }
 
@@ -68,6 +70,7 @@ impl BashTool {
     pub fn new(sandbox_available: bool) -> Self {
         BashTool {
             sandbox_available,
+            isolation: false,
             table: Arc::new(SemanticTable::defaults()),
         }
     }
@@ -81,6 +84,15 @@ impl BashTool {
     pub fn sandbox_available(&self) -> bool {
         self.sandbox_available
     }
+    /// Run Opaque commands isolated: on a copy of the workspace, offline, with
+    /// their changes staged for review (needs a sandbox with isolation).
+    pub fn with_isolation(mut self, isolation: bool) -> Self {
+        self.isolation = isolation;
+        self
+    }
+    pub fn isolation(&self) -> bool {
+        self.isolation
+    }
 
     /// This tool adapted to `env`: the semantic table applies only if the
     /// sandbox is really available (never more than this tool already
@@ -90,6 +102,7 @@ impl BashTool {
         table.extend(env.shell_rules.iter().map(Rule::from_def));
         BashTool {
             sandbox_available: self.sandbox_available && env.sandbox.available,
+            isolation: env.sandbox.available && env.sandbox.isolation,
             table: Arc::new(table),
         }
     }
@@ -144,15 +157,30 @@ impl BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(1, MAX_TIMEOUT_MS);
         let read_only = analysis.class == EffectClass::Pure;
+        // Approved to run isolated: on a copy of the workspace, offline, the
+        // changes staged until the kernel has them reviewed.
+        let isolated = ctx.isolated;
         let mut spec = compile_spec(&ctx, timeout_ms, !read_only);
         if read_only {
             // Read-only commands: read-only, offline sandbox.
             spec.writable.clear();
+        }
+        if read_only || isolated {
             spec.network.clear();
         }
+        spec.isolated = isolated;
         let argv = vec!["bash".to_string(), "-c".to_string(), inp.command.clone()];
         let cancel = ctx.cancel.child_token();
-        let run = ctx.sandbox.run(&argv, &spec, cancel.clone());
+        let key = staged_key(&ctx.session, &ctx.call_id);
+        let run = async {
+            if isolated {
+                ctx.sandbox
+                    .run_staged(&key, &argv, &spec, cancel.clone())
+                    .await
+            } else {
+                ctx.sandbox.run(&argv, &spec, cancel.clone()).await
+            }
+        };
         let grace = std::time::Duration::from_millis(timeout_ms + 5_000);
         let out = tokio::select! {
             biased;
@@ -185,14 +213,40 @@ impl BashTool {
             Some(code) => text.push_str(&format!("[exit code {code}]")),
             None => text.push_str("[terminated by signal]"),
         }
-        if !out.overlay_changes.is_empty() {
+        let staged = if isolated {
+            out.overlay_changes.clone()
+        } else {
+            vec![]
+        };
+        if !staged.is_empty() {
             text.push_str(&format!(
-                "\n[changed files: {}]",
-                out.overlay_changes.join(", ")
+                "\n[ran isolated; changed files staged for review: {}]",
+                list(&staged)
+            ));
+        } else if !out.overlay_changes.is_empty() {
+            text.push_str(&format!(
+                "\n[changes outside the declared writes, not written back: {}]",
+                list(&out.overlay_changes)
             ));
         }
-        spill(text, &ctx).await
+        let mut output = spill(text, &ctx).await?;
+        output.staged = staged;
+        Ok(output)
     }
+}
+
+/// At most 20 paths, then "and N more".
+fn list(paths: &[String]) -> String {
+    let mut s = paths
+        .iter()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > 20 {
+        s.push_str(&format!(" and {} more", paths.len() - 20));
+    }
+    s
 }
 
 /// Long outputs go to a blob; the model sees head and tail.
@@ -249,6 +303,11 @@ impl Tool for BashTool {
             }
             Err(_) => EffectClass::Opaque,
         }
+    }
+    /// Opaque commands run isolated when the sandbox supports it ("execute
+    /// isolated, then approve the diff" instead of asking first).
+    fn isolated(&self, input: &Value) -> bool {
+        self.isolation && self.class(input) == EffectClass::Opaque
     }
     async fn call(&self, input: Value, ctx: ToolCtx) -> Result<ToolOutput, ToolError> {
         self.run(input, ctx).await

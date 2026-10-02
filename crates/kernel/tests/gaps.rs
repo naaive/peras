@@ -263,7 +263,7 @@ fn remembered_destination_is_allowlisted_for_the_session() {
 // ------------------------------------------------------------------ 3. rewind report
 
 fn call_of(id: &str, name: &str, class: EffectClass, input: serde_json::Value) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), input, access: vec![], class }
+    ToolCall { isolated: false, id: id.into(), name: name.into(), input, access: vec![], class }
 }
 
 /// Runs one approved call in its own turn; returns the id of the turn's last event.

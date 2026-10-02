@@ -106,7 +106,7 @@ pub fn kernel_config() -> KernelConfig {
 }
 
 fn read_call(id: String, path: String) -> ToolCall {
-    ToolCall {
+    ToolCall { isolated: false,
         id: CallId(id),
         name: "read".into(),
         input: json!({ "file": path }),
@@ -116,7 +116,7 @@ fn read_call(id: String, path: String) -> ToolCall {
 }
 
 fn edit_call(id: String, path: String) -> ToolCall {
-    ToolCall {
+    ToolCall { isolated: false,
         id: CallId(id),
         name: "edit".into(),
         input: json!({ "file": path, "old": "a", "new": "b" }),
@@ -289,6 +289,7 @@ impl SessionDriver {
                 trust: Trust::Internal,
             },
             Effect::Restore(_) => EffectResult::Restored(RestoreReport::default()),
+            Effect::Merge(_) => EffectResult::Merged(MergeReport::default()),
             Effect::Finish(_) => return None,
             Effect::SampleRef(_) | Effect::CompactRef(_) => panic!("journal reference dispatched: {effect:?}"),
         })

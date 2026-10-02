@@ -786,7 +786,11 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             on_verdict(s, subject, *point, *ring, verdict, responder)
         }
         Event::QuestionAsked { question, subject } => {
+            // A staged change list is reviewed after the call ran: its
+            // verdict concerns the result, not the call's gate.
+            let changes = gate::is_changes_question(&question.id);
             let point = match subject {
+                GateRef::Call(_) if changes => HookPoint::PostTool,
                 GateRef::Call(_) => HookPoint::Permission,
                 _ => HookPoint::PreSample,
             };
@@ -794,7 +798,7 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
                 question.id.clone(),
                 PendingQuestion { question: question.clone(), subject: subject.clone(), point, gate: None },
             );
-            if let (GateRef::Call(cid), Some(t)) = (subject, s.turn.as_mut()) {
+            if let (GateRef::Call(cid), Some(t), false) = (subject, s.turn.as_mut(), changes) {
                 if let Some(sl) = t.slot_mut(cid) {
                     sl.gate = CallGate::AwaitHuman(question.id.clone(), None);
                 }
@@ -1215,6 +1219,15 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect, seq: Seq) {
                     sl.exec = Exec::Done;
                 }
             }
+            (GateSubject::Changes { call, .. }, _) => {
+                if let Some(sl) = t.slot_mut(&call.id) {
+                    sl.post = Some(id);
+                    sl.exec = Exec::Done;
+                }
+                if let Some(pq) = req.question.as_ref().and_then(|q| s.questions.get_mut(&q.id)) {
+                    pq.gate = Some(id);
+                }
+            }
             (GateSubject::UserSubmit { .. }, _) => t.submit = TGate::Waiting(id),
             (GateSubject::PreSample, _) => {
                 t.presample = TGate::Waiting(id);
@@ -1240,6 +1253,13 @@ fn on_issued(s: &mut State, id: EffectId, effect: &Effect, seq: Seq) {
                 t.sp_ckpt = true;
             } else {
                 t.pre_ckpt = PreCkpt::Pending(id);
+            }
+        }
+        // The result is written once the staged changes are merged.
+        Effect::Merge(plan) => {
+            if let Some(sl) = t.slot_mut(&plan.call.id) {
+                sl.post = Some(id);
+                sl.exec = Exec::Done;
             }
         }
         _ => {}

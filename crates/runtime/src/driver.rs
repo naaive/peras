@@ -1204,6 +1204,15 @@ where
                     let _ = tx.send(Msg::Completed(id, r));
                 });
             }
+            Effect::Merge(plan) => {
+                // Like a restore: once started, the merge runs to completion
+                // so the workspace matches the journaled plan.
+                flight.uncancellable = true;
+                spawn_in(span, async move {
+                    let r = dispatch::merge(&env, &session, &plan).await;
+                    let _ = tx.send(Msg::Completed(id, r));
+                });
+            }
             Effect::SampleRef(_) | Effect::CompactRef(_) => {
                 // A decider must hand out the rebuilt request: a reference only
                 // exists in the journal (`EffectIssued`).

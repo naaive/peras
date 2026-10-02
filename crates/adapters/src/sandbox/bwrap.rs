@@ -1,11 +1,12 @@
 //! bubblewrap sandbox (Linux, unprivileged user namespaces).
 
 use super::egress::{find_netbridge, proxy_env, EgressProxy, BRIDGE_LISTEN, NETBRIDGE_BIN};
-use super::isolate::{IsolatedCopy, IsolatedRun};
+use super::isolate::{IsolatedCopy, IsolatedRun, Staging};
 use super::{env_with_path, exec, trial, which};
 use agent_runtime::{ExecOutput, SandboxPort, SandboxReport, SandboxSpec};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,7 @@ pub struct BwrapSandbox {
     overlay: bool,
     bridge: Option<PathBuf>,
     notes: Vec<String>,
+    staging: Arc<Staging>,
 }
 
 /// Overlay directories for an isolated run.
@@ -51,7 +53,7 @@ const EGRESS_SOCK: &str = "egress.sock";
 impl BwrapSandbox {
     /// Use a specific binary without probing (capabilities assumed).
     pub fn new(bwrap: impl Into<PathBuf>, overlay: bool) -> Self {
-        BwrapSandbox { bwrap: bwrap.into(), overlay, bridge: None, notes: vec![] }
+        BwrapSandbox { bwrap: bwrap.into(), overlay, bridge: None, notes: vec![], staging: Arc::default() }
     }
 
     /// Route allowlisted network through the egress proxy using this
@@ -94,7 +96,7 @@ impl BwrapSandbox {
             )),
             None => notes.push(format!("{NETBRIDGE_BIN} helper not found: sandbox is always offline")),
         }
-        Ok(BwrapSandbox { bwrap, overlay, bridge, notes })
+        Ok(BwrapSandbox { bwrap, overlay, bridge, notes, staging: Arc::default() })
     }
 
     /// Compile a spec into the bwrap command line (without the binary).
@@ -275,6 +277,24 @@ impl SandboxPort for BwrapSandbox {
         let mut cmd = tokio::process::Command::new(&self.bwrap);
         cmd.args(self.args(argv, spec, WorkspaceMount::Direct, egress)).env_clear();
         exec(cmd, spec.timeout_ms, cancel, || {}).await
+    }
+
+    /// Copy-based isolation (its change list can be merged exactly); offline.
+    async fn run_staged(
+        &self,
+        key: &str,
+        argv: &[String],
+        spec: &SandboxSpec,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, String> {
+        let run = self.run_isolated(argv, spec, cancel).await?;
+        Ok(self.staging.stage(key, run))
+    }
+
+    async fn merge(&self, key: &str, apply: bool) -> Result<Vec<String>, String> {
+        let staging = self.staging.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || staging.merge(&key, apply)).await.map_err(|e| e.to_string())?
     }
 }
 

@@ -294,6 +294,15 @@ pub async fn run_call(
     let Some(tool) = env.tools.get(&call.name).cloned() else {
         return Ok(ToolResult::text(call.id.clone(), format!("Unknown tool `{}`.", call.name), true));
     };
+    // The kernel waived the unknown-effect invariant because the call was
+    // declared isolated (possibly by a rewrite): the tool must run it so.
+    if call.isolated && !tool.isolated(&call.input) {
+        return Ok(ToolResult::text(
+            call.id.clone(),
+            format!("Refused: `{}` was approved to run isolated, but this tool cannot run this input isolated.", call.name),
+            true,
+        ));
+    }
     let pulses_tx = pulses.clone();
     let call_name = call.id.0.clone();
     let progress: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |m: String| {
@@ -311,6 +320,7 @@ pub async fn run_call(
         secrets: env.secrets.clone(),
         progress,
         subagents: env.subagents.clone(),
+        isolated: call.isolated,
     };
     let started = Instant::now();
     let r = tool.call(call.input.clone(), ctx).await;
@@ -324,6 +334,8 @@ pub async fn run_call(
                 is_error: false,
                 trust: derive_trust(&call.name, out.trust, &grants),
                 observed: out.observed,
+                // Only an isolated run can stage changes.
+                staged: if call.isolated { out.staged } else { vec![] },
             })
         }
         Err(ToolError::Infra(e)) => Err(e),
@@ -437,6 +449,30 @@ async fn checkpoint_inner(env: &Env, scope: &CheckpointScope) -> EffectResult {
     match env.checkpointer.checkpoint(scope).await {
         Ok(info) => EffectResult::Checkpointed(info),
         Err(e) => EffectResult::Failed { error: format!("checkpoint: {e}") },
+    }
+}
+
+/// Merge or discard the changes an isolated call staged. Before applying, the
+/// originals of the exact changed paths are saved (exact rewind and change
+/// attribution). Never an infrastructure error: a merge that cannot happen
+/// (conflicting workspace changes, staged copy lost in a restart) is reported
+/// to the model through the result.
+pub async fn merge(env: &Env, session: &SessionId, plan: &MergePlan) -> EffectResult {
+    let key = staged_key(session, &plan.call.id);
+    if plan.apply {
+        let root = env.options.workspace.display().to_string();
+        let root = root.trim_end_matches('/');
+        let writes: Vec<Access> =
+            plan.result.staged.iter().map(|p| Access::write(ResourceUri::fs(&format!("{root}/{p}")))).collect();
+        if let Err(e) = env.checkpointer.save_originals(&writes).await {
+            let _ = env.sandbox.merge(&key, false).await;
+            return EffectResult::Merged(MergeReport { applied: vec![], error: Some(format!("save originals: {e}")) });
+        }
+    }
+    match env.sandbox.merge(&key, plan.apply).await {
+        Ok(applied) => EffectResult::Merged(MergeReport { applied, error: None }),
+        Err(_) if !plan.apply => EffectResult::Merged(MergeReport::default()),
+        Err(e) => EffectResult::Merged(MergeReport { applied: vec![], error: Some(e) }),
     }
 }
 

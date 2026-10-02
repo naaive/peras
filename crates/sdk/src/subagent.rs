@@ -69,7 +69,7 @@ impl Tool for Agent {
             Err(_) => false,
         };
         let text = outcome_to_result(&child, outcome).map_err(|e| ToolError::Failed(e.to_string()))?;
-        Ok(ToolOutput {
+        Ok(ToolOutput { staged: vec![],
             content: vec![ToolContent::Text { text }],
             trust: tainted.then(|| Trust::Untrusted { source: format!("subagent:{}", self.cfg.name) }),
             observed: vec![],

@@ -58,7 +58,7 @@ mod roundtrip {
         rt(EffectResult::SampleFailed(ModelError::Overflow));
         rt(Input::Streamed(
             EffectId { epoch: 0, n: 1 },
-            ToolCall {
+            ToolCall { isolated: false,
                 id: "c".into(),
                 name: "read".into(),
                 input: serde_json::json!({"file":"a"}),

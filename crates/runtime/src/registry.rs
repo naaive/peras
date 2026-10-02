@@ -71,8 +71,8 @@ impl ToolRegistry {
     /// `Opaque` and no access; tools whose `access()` fails get no access (the
     /// call then fails at execution time, with nothing granted).
     pub fn enrich(&self, id: CallId, name: &str, input: serde_json::Value) -> ToolCall {
-        let (access, class) = match self.tools.get(name) {
-            None => (vec![], EffectClass::Opaque),
+        let (access, class, isolated) = match self.tools.get(name) {
+            None => (vec![], EffectClass::Opaque, false),
             Some(t) => {
                 let access = match t.access(&input, &self.ctx) {
                     Ok(a) => a,
@@ -81,9 +81,9 @@ impl ToolRegistry {
                         vec![]
                     }
                 };
-                (access, t.class(&input))
+                (access, t.class(&input), t.isolated(&input))
             }
         };
-        ToolCall { id, name: name.to_string(), input, access, class }
+        ToolCall { id, name: name.to_string(), input, access, class, isolated }
     }
 }

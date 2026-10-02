@@ -160,14 +160,14 @@ async fn stream_assembly_and_streamed_tool_calls() {
     assert_eq!(m.usage.input_tokens, 10);
     assert_eq!(m.usage.output_tokens, 5);
     assert_eq!(m.stop, StopReason::ToolUse);
-    let c1 = ToolCall {
+    let c1 = ToolCall { isolated: false,
         id: CallId::new("c1"),
         name: "echo".into(),
         input: json!({"file":"a.txt","text":"x"}),
         access: vec![Access::read(ResourceUri::fs("/ws/a.txt"))],
         class: EffectClass::Pure,
     };
-    let c2 = ToolCall { id: CallId::new("c2"), name: "nope".into(), input: json!({}), access: vec![], class: EffectClass::Opaque };
+    let c2 = ToolCall { isolated: false, id: CallId::new("c2"), name: "nope".into(), input: json!({}), access: vec![], class: EffectClass::Opaque };
     assert_eq!(
         m.content,
         vec![

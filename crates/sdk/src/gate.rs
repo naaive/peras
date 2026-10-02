@@ -121,7 +121,7 @@ mod tests {
 
     fn p(access: Vec<Access>) -> Proposal {
         Proposal::new(
-            ToolCall { id: "c".into(), name: "edit".into(), input: serde_json::json!({}), access, class: EffectClass::LocalWrite },
+            ToolCall { isolated: false, id: "c".into(), name: "edit".into(), input: serde_json::json!({}), access, class: EffectClass::LocalWrite },
             false,
             PathBuf::from("/repo"),
         )

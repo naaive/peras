@@ -453,7 +453,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     }
     kc.security.workspace_root = workspace.display().to_string();
     kc.security.sandbox_available = report.available;
-    kc.security.isolation_available = report.isolation;
+    kc.security.isolation_available = report.available && report.isolation;
     kc.security.disposable_env = kc.security.disposable_env || disposable;
     kc.unattended = unattended;
     kc.encoder_version = model.encoder().version();

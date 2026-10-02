@@ -244,7 +244,7 @@ impl World for EchoWorld {
                     AssistantMessage {
                         content: (0..n)
                             .map(|i| {
-                                ContentBlock::ToolUse(ToolCall {
+                                ContentBlock::ToolUse(ToolCall { isolated: false,
                                     id: CallId(format!("c{i}")),
                                     name: "echo".into(),
                                     input: json!({ "text": format!("r{i}") }),

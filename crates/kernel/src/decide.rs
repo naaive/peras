@@ -421,6 +421,13 @@ impl Cx {
             self.user(Event::TurnStarted { cause: TurnCause::Continuation });
         }
         self.user(Event::QuestionAnswered { question: question.clone(), answer: answer.clone(), responder: responder.clone() });
+        // A staged change list under review: merged or discarded per the answer.
+        let changes = pq.gate.and_then(|g| match &self.s.issued.get(&g)?.effect {
+            Effect::Gate(GateRequest { subject: GateSubject::Changes { call, result }, .. }) => {
+                Some((call.clone(), result.clone()))
+            }
+            _ => None,
+        });
         if let Some(g) = pq.gate {
             if self.s.issued.contains_key(&g) {
                 self.settle(g);
@@ -436,7 +443,9 @@ impl Cx {
             verdict: verdict.clone(),
             responder,
         });
-        if !matches!(pq.subject, GateRef::Call(_)) {
+        if let Some((call, result)) = changes {
+            self.merge_by_verdict(&call, result, &verdict);
+        } else if !matches!(pq.subject, GateRef::Call(_)) {
             self.after_turn_verdict(pq.point, Ring::Human, &verdict);
         }
         Ok(())
@@ -588,6 +597,10 @@ impl Cx {
                     self.fail_turn(format!("context overflow: compaction failed: {err}"));
                 }
             }
+            (Effect::Merge(plan), EffectResult::Merged(report)) => {
+                self.settle(id);
+                self.merged(plan, report);
+            }
             (Effect::Checkpoint(_), EffectResult::Checkpointed(info)) => {
                 self.settle(id);
                 self.user(Event::CheckpointTaken { info });
@@ -641,6 +654,7 @@ impl Cx {
                 };
                 self.gated(req, v, Responder::Kernel, false);
             }
+            Effect::Merge(plan) => self.merged(plan, MergeReport { applied: vec![], error: Some(error) }),
             Effect::Sample(_) | Effect::SampleRef(_) => self.fail_turn(error),
             Effect::Compact(CompactJob { overflow, .. }) | Effect::CompactRef(CompactRef { overflow, .. }) => {
                 if overflow {
@@ -682,31 +696,121 @@ impl Cx {
     }
 
     fn executed(&mut self, batch: Batch, results: Vec<ToolResult>) {
-        let post = self.s.hooked(HookPoint::PostTool);
         for call in &batch.calls {
             let Some(t) = &self.s.turn else { return };
             let open = t.slot(&call.id).map(|sl| !sl.result).unwrap_or(false);
             if !open {
                 continue;
             }
-            let soft = t.soft;
             let r = results
                 .iter()
                 .find(|r| r.call_id == call.id)
                 .cloned()
                 .unwrap_or_else(|| ToolResult::text(call.id.clone(), "tool produced no result", true));
-            if post && !soft {
-                let req = self.gate_req(
-                    HookPoint::PostTool,
-                    Ring::Hook,
-                    GateSubject::PostTool { call: call.clone(), result: r },
-                    None,
-                );
-                self.issue(Effect::Gate(req));
+            if !r.staged.is_empty() {
+                self.review_changes(call, r);
             } else {
-                self.tool_resulted(call, r, true);
+                self.deliver(call, r);
             }
         }
+    }
+
+    /// An executed call's result: through the PostTool hook if any, else
+    /// written.
+    fn deliver(&mut self, call: &ToolCall, r: ToolResult) {
+        let soft = self.s.turn.as_ref().map(|t| t.soft).unwrap_or(false);
+        if self.s.hooked(HookPoint::PostTool) && !soft {
+            let req =
+                self.gate_req(HookPoint::PostTool, Ring::Hook, GateSubject::PostTool { call: call.clone(), result: r }, None);
+            self.issue(Effect::Gate(req));
+        } else {
+            self.tool_resulted(call, r, true);
+        }
+    }
+
+    /// "Execute isolated, then approve the diff": the changes an isolated
+    /// call staged are merged automatically when rings 1–2 allow those writes,
+    /// discarded when they deny them, otherwise handed to a human. Verdicts are
+    /// recorded at `PostTool` (they concern the result, not whether the call
+    /// may run). A staged copy cannot outlive the process, so a review nobody
+    /// can answer discards the changes (the model is told and may re-run).
+    fn review_changes(&mut self, call: &ToolCall, result: ToolResult) {
+        let subject = GateRef::Call(call.id.clone());
+        if self.s.turn.as_ref().map(|t| t.soft).unwrap_or(true) {
+            self.merge(call, result, false, Some("interrupted before the changes were reviewed".into()));
+            return;
+        }
+        let kv = gate::changes_verdict(&self.s, call, &result.staged);
+        match kv.verdict {
+            Verdict::Ask(q) if self.cfg().unattended.is_some() && q.level == ApprovalLevel::Invariant => {
+                let why = format!("approval required ({}) and nobody can answer", q.rules.join(", "));
+                self.internal(Event::VerdictRecorded {
+                    subject,
+                    point: HookPoint::PostTool,
+                    ring: Ring::Invariant,
+                    verdict: Verdict::deny(why.clone()),
+                    responder: Responder::Unattended,
+                });
+                self.merge(call, result, false, Some(why));
+            }
+            Verdict::Ask(q) => {
+                self.user(Event::QuestionAsked { question: q.clone(), subject });
+                let req = self.gate_req(
+                    HookPoint::Permission,
+                    Ring::Human,
+                    GateSubject::Changes { call: call.clone(), result },
+                    Some(q),
+                );
+                self.issue(Effect::Gate(req));
+            }
+            verdict => {
+                self.internal(Event::VerdictRecorded {
+                    subject,
+                    point: HookPoint::PostTool,
+                    ring: kv.ring,
+                    verdict: verdict.clone(),
+                    responder: kv.responder,
+                });
+                self.merge_by_verdict(call, result, &verdict);
+            }
+        }
+    }
+
+    fn merge_by_verdict(&mut self, call: &ToolCall, result: ToolResult, verdict: &Verdict) {
+        match verdict {
+            Verdict::Allow | Verdict::Annotate(_) | Verdict::Continue(_) => self.merge(call, result, true, None),
+            Verdict::Deny(r) => self.merge(call, result, false, Some(r.0.clone())),
+            Verdict::Defer => self.merge(call, result, false, Some("approval deferred; nobody answered".into())),
+            Verdict::Rewrite(_) | Verdict::Ask(_) => {
+                self.merge(call, result, false, Some("a change list can only be approved or denied".into()))
+            }
+        }
+    }
+
+    fn merge(&mut self, call: &ToolCall, result: ToolResult, apply: bool, reason: Option<String>) {
+        self.issue(Effect::Merge(MergePlan { call: call.clone(), result, apply, reason }));
+    }
+
+    /// The staged changes were merged or discarded: deliver the result with
+    /// a note saying which.
+    fn merged(&mut self, plan: MergePlan, report: MergeReport) {
+        let open = self.s.turn.as_ref().and_then(|t| t.slot(&plan.call.id)).map(|sl| !sl.result).unwrap_or(false);
+        if !open {
+            return;
+        }
+        let MergePlan { call, mut result, apply, reason } = plan;
+        let staged = std::mem::take(&mut result.staged);
+        let note = match (apply, &report.error) {
+            (true, None) => format!("[changes applied: {}]", gate::list_paths(&report.applied)),
+            (true, Some(e)) => format!("[changes NOT applied ({e}): {}]", gate::list_paths(&staged)),
+            (false, _) => format!(
+                "[changes discarded ({}): {}]",
+                reason.as_deref().unwrap_or("not approved"),
+                gate::list_paths(&staged)
+            ),
+        };
+        result.content.push(ToolContent::Text { text: note });
+        self.deliver(&call, result);
     }
 
     fn check_human(&self, req: &GateRequest, verdict: Verdict, responder: &Responder) -> Verdict {
@@ -714,7 +818,15 @@ impl Cx {
             return verdict;
         }
         let ok = match responder {
-            Responder::Human(_) | Responder::DisposableEnv => true,
+            Responder::Human(_) => true,
+            // A disposable environment only vouches for what runs inside it:
+            // not for host-side tools, nor for changes merged back into the
+            // real workspace.
+            Responder::DisposableEnv => match &req.subject {
+                GateSubject::Tool { call } => gate::runs_in_sandbox(call),
+                GateSubject::Changes { .. } => false,
+                _ => true,
+            },
             Responder::Code => self.cfg().unattended.is_none(),
             _ => false,
         };
@@ -793,6 +905,16 @@ impl Cx {
                     responder,
                 });
                 self.after_turn_verdict(req.point, req.ring, &verdict);
+            }
+            GateSubject::Changes { call, result } => {
+                self.internal(Event::VerdictRecorded {
+                    subject: GateRef::Call(call.id.clone()),
+                    point: HookPoint::PostTool,
+                    ring: req.ring,
+                    verdict: verdict.clone(),
+                    responder,
+                });
+                self.merge_by_verdict(call, result.clone(), &verdict);
             }
             GateSubject::SessionStart | GateSubject::PreCompact => {
                 self.internal(Event::VerdictRecorded {
@@ -1064,7 +1186,7 @@ impl Cx {
         let cfg = self.cfg().clone();
         let subject = GateRef::Call(call.id.clone());
         if cfg.unattended.is_some() && q.level == ApprovalLevel::Invariant {
-            if cfg.security.disposable_env {
+            if cfg.security.disposable_env && gate::runs_in_sandbox(call) {
                 self.internal(Event::VerdictRecorded {
                     subject,
                     point: HookPoint::Permission,

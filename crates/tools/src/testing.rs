@@ -196,6 +196,7 @@ impl SandboxPort for LocalSandbox {
 /// given secrets and a [`LocalSandbox`].
 pub fn ctx(workspace: impl AsRef<Path>, grants: Vec<Access>) -> ToolCtx {
     ToolCtx {
+        isolated: false,
         call_id: CallId::new("test-call"),
         session: SessionId::new("test-session"),
         workspace: workspace.as_ref().to_path_buf(),

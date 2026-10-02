@@ -214,7 +214,9 @@ pub(crate) fn invariants(s: &State, call: &ToolCall) -> (Vec<String>, Option<Str
             && !m.egress.is_match(a.resource.as_str())
             && !s.destinations.contains(a.resource.as_str())
     });
-    let opaque_net = call.class == EffectClass::Opaque && !sec.sandbox_available;
+    // Isolated runs are offline and their writes only staged.
+    let isolated = runs_isolated(s, call);
+    let opaque_net = call.class == EffectClass::Opaque && !sec.sandbox_available && !isolated;
     if tainted && private && (net_exit.is_some() || opaque_net) {
         hits.push("invariant:exfiltration".to_string());
         remember = net_exit.map(|a| a.resource.as_str().to_string());
@@ -225,10 +227,95 @@ pub(crate) fn invariants(s: &State, call: &ToolCall) -> (Vec<String>, Option<Str
     if call.access.iter().any(|a| is_write(a) && m.self_config.is_match(a.resource.as_str())) {
         hits.push("invariant:self_modification".to_string());
     }
-    if call.class == EffectClass::Opaque && !sec.isolation_available {
+    // Only a call that will actually execute isolated escapes it: the
+    // availability of isolation alone says nothing about this call.
+    if call.class == EffectClass::Opaque && !isolated {
         hits.push("invariant:unknown_effect".to_string());
     }
     (hits, remember)
+}
+
+/// The call runs isolated (offline, on a copy; changes staged for review):
+/// it says so and the profile confirms isolated execution exists.
+pub(crate) fn runs_isolated(s: &State, call: &ToolCall) -> bool {
+    call.isolated && s.config.as_ref().map(|c| c.security.isolation_available).unwrap_or(false)
+}
+
+/// The call executes in the sandbox (it runs commands, declared as `cmd:`
+/// resources); other tools act on the host directly. Only such calls can be
+/// vouched for by a framework-launched disposable environment.
+pub(crate) fn runs_in_sandbox(call: &ToolCall) -> bool {
+    call.access.iter().any(|a| a.resource.scheme() == Some(Scheme::Cmd))
+}
+
+/// Id of the question reviewing the changes a call staged.
+pub(crate) fn changes_question_id(call: &CallId) -> QuestionId {
+    QuestionId(format!("q:{call}:changes"))
+}
+
+pub(crate) fn is_changes_question(id: &QuestionId) -> bool {
+    id.0.starts_with("q:") && id.0.ends_with(":changes")
+}
+
+/// Paths listed in a change question / merge note before "and N more".
+const LISTED_CHANGES: usize = 20;
+
+pub(crate) fn list_paths(paths: &[String]) -> String {
+    let mut s = paths.iter().take(LISTED_CHANGES).cloned().collect::<Vec<_>>().join(", ");
+    if paths.len() > LISTED_CHANGES {
+        s.push_str(&format!(" and {} more", paths.len() - LISTED_CHANGES));
+    }
+    s
+}
+
+/// Review of the changes an isolated call staged ("execute isolated, then
+/// approve the diff"): they are judged exactly like a call declaring those
+/// writes (rings 1 and 2). Allow = merge automatically, Deny = discard,
+/// Ask = hand the change list to a human (invariant level when ring 1 hit).
+pub(crate) fn changes_verdict(s: &State, call: &ToolCall, staged: &[String]) -> KernelVerdict {
+    let root = s.config.as_ref().map(|c| c.security.workspace_root.trim_end_matches('/').to_string()).unwrap_or_default();
+    let writes = ToolCall {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        input: call.input.clone(),
+        access: staged.iter().map(|p| Access::write(ResourceUri::fs(&format!("{root}/{p}")))).collect(),
+        class: EffectClass::LocalWrite,
+        isolated: false,
+    };
+    let qid = changes_question_id(&call.id);
+    let prompt = |why: &str| {
+        format!("Apply the changes `{}` made in isolation? {}: {}", call.name, why, list_paths(staged))
+    };
+    let (hits, _) = invariants(s, &writes);
+    if !hits.is_empty() {
+        return KernelVerdict {
+            verdict: Verdict::Ask(Question {
+                id: qid,
+                prompt: prompt(&format!("Triggered {}", hits.join(", "))),
+                level: ApprovalLevel::Invariant,
+                ring: Ring::Invariant,
+                rules: hits,
+                remember_destination: None,
+            }),
+            ring: Ring::Invariant,
+            responder: Responder::Kernel,
+        };
+    }
+    let (action, rules) = policy(s, &writes);
+    let rule_name = rules.first().cloned().unwrap_or_else(|| "default".into());
+    let verdict = match action {
+        PolicyAction::Allow => Verdict::Allow,
+        PolicyAction::Deny => Verdict::deny(format!("denied by policy ({})", rules.join(", "))),
+        PolicyAction::Ask => Verdict::Ask(Question {
+            id: qid,
+            prompt: prompt(&format!("Policy {}", rules.join(", "))),
+            level: ApprovalLevel::Policy,
+            ring: Ring::Policy,
+            rules,
+            remember_destination: None,
+        }),
+    };
+    KernelVerdict { verdict, ring: Ring::Policy, responder: Responder::Policy(rule_name) }
 }
 
 /// Ring 2: policy rules. Deny wins, then Ask, then Allow; unmatched accesses fall
@@ -311,7 +398,8 @@ pub(crate) fn policy(s: &State, call: &ToolCall) -> (PolicyAction, Vec<String>) 
     if covered_all {
         return (PolicyAction::Allow, allow);
     }
-    if side_effecting(call) {
+    // An isolated call writes nothing before its staged changes are reviewed.
+    if side_effecting(call) && !runs_isolated(s, call) {
         (PolicyAction::Ask, vec!["default".into()])
     } else {
         (PolicyAction::Allow, vec!["default".into()])

@@ -314,7 +314,7 @@ mod tests {
         let mut prof = p();
         prof.inline_limit_bytes = 100;
         prof.preview_bytes = 10;
-        let call = ToolCall {
+        let call = ToolCall { isolated: false,
             id: "c".into(),
             name: "read".into(),
             input: serde_json::json!({}),
@@ -329,7 +329,7 @@ mod tests {
         assert!(text.contains("bytes omitted"));
         assert!(text.len() < 100);
         let blob = BlobRef { sha256: "ab".into(), size: 9000, media_type: None };
-        let result = ToolResult {
+        let result = ToolResult { staged: vec![],
             call_id: "c".into(),
             content: vec![ToolContent::Blob { blob, preview: "head..tail".into() }],
             is_error: false,

@@ -260,6 +260,7 @@ impl Driver {
                 })
             }
             Effect::Restore(_) => EffectResult::Restored(RestoreReport::default()),
+            Effect::Merge(_) => EffectResult::Merged(MergeReport::default()),
         };
         self.try_input(Input::Completed(id, r));
     }

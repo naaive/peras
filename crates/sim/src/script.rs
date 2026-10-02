@@ -94,7 +94,7 @@ impl Script {
     }
 
     fn tool_call(&self, tool: &impl ToolName, input: serde_json::Value) -> ToolCall {
-        ToolCall { id: self.next_call_id(), name: tool.tool_name(), input, access: vec![], class: EffectClass::Pure }
+        ToolCall { isolated: false, id: self.next_call_id(), name: tool.tool_name(), input, access: vec![], class: EffectClass::Pure }
     }
 
     /// A response with one tool call (stop reason `tool_use`).
@@ -306,7 +306,7 @@ pub async fn collect_message(
                         serde_json::from_str(&buf)
                             .map_err(|e| ModelError::Invalid { message: format!("tool input: {e}") })?
                     };
-                    content.push(ContentBlock::ToolUse(ToolCall {
+                    content.push(ContentBlock::ToolUse(ToolCall { isolated: false,
                         id,
                         name,
                         input,

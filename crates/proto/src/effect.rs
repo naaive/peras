@@ -86,6 +86,9 @@ pub enum GateSubject {
     PreSample,
     Tool { call: ToolCall },
     PostTool { call: ToolCall, result: ToolResult },
+    /// Approval of the changes an isolated call staged (`result.staged`):
+    /// "execute isolated, then approve the diff".
+    Changes { call: ToolCall, result: ToolResult },
     PreCompact,
     Stop { final_text: String },
 }
@@ -132,6 +135,30 @@ pub struct RestorePlan {
     pub checkpoint: Option<CheckpointId>,
 }
 
+/// What to do with the changes an isolated call staged. Carries the call's
+/// result, which is written (with a note on the outcome) once merged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MergePlan {
+    pub call: ToolCall,
+    pub result: ToolResult,
+    /// Apply the staged changes to the workspace (else discard them).
+    pub apply: bool,
+    /// Why they are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Outcome of a [`MergePlan`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct MergeReport {
+    /// Workspace-relative paths written or deleted.
+    pub applied: Vec<String>,
+    /// Nothing was applied: why (conflicting workspace changes, staged copy
+    /// gone after a restart...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// The final outcome of a turn / run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -156,6 +183,8 @@ pub enum Effect {
     Checkpoint(CheckpointScope),
     Restore(RestorePlan),
     Finish(TurnOutcome),
+    /// Merge (or discard) the changes an isolated call staged.
+    Merge(MergePlan),
     /// Journal-only form of `Sample` (see [`SampleRef`]). Never dispatched: the
     /// kernel hands out the rebuilt `Sample`.
     SampleRef(SampleRef),
@@ -174,6 +203,7 @@ impl Effect {
             Effect::Checkpoint(_) => "checkpoint",
             Effect::Restore(_) => "restore",
             Effect::Finish(_) => "finish",
+            Effect::Merge(_) => "merge",
         }
     }
 
@@ -257,6 +287,7 @@ pub enum EffectResult {
     CompactFailed(ModelError),
     Checkpointed(CheckpointInfo),
     Restored(RestoreReport),
+    Merged(MergeReport),
     /// Infrastructure error (not a tool failure: those are results).
     Failed { error: String },
 }

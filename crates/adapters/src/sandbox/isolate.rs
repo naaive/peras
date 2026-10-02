@@ -210,6 +210,91 @@ impl IsolatedCopy {
     pub fn keep(self) -> PathBuf {
         self.scratch.keep()
     }
+
+    /// Paths among `changes` that changed in the original workspace since the
+    /// copy was made (merging them would overwrite someone else's change).
+    pub fn conflicts<S: AsRef<str>>(&self, changes: &[S]) -> io::Result<Vec<String>> {
+        let mut out = vec![];
+        for c in changes {
+            let rel = c.as_ref();
+            let now = match Meta::of(&self.workspace.join(safe_rel(rel)?)) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            let same = match (self.originals.get(rel), &now) {
+                (None, None) => true,
+                // A directory's own metadata changes with its entries; the
+                // entries are compared one by one.
+                (Some(a), Some(b)) if a.kind == Kind::Dir && b.kind == Kind::Dir => true,
+                (Some(a), Some(b)) => a.untouched(b),
+                _ => false,
+            };
+            if !same {
+                out.push(rel.to_string());
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Isolated runs whose changes await review, by key (bounded: the oldest
+/// are discarded first, e.g. runs abandoned by a hard interrupt).
+#[derive(Debug, Default)]
+pub struct Staging {
+    runs: std::sync::Mutex<std::collections::VecDeque<(String, IsolatedRun)>>,
+}
+
+/// Staged runs kept at most.
+pub const MAX_STAGED: usize = 16;
+
+impl Staging {
+    /// Keep `run` under `key` when it changed anything; returns its output.
+    pub fn stage(&self, key: &str, run: IsolatedRun) -> ExecOutput {
+        let out = run.output.clone();
+        if run.changes.is_empty() {
+            return out;
+        }
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        runs.retain(|(k, _)| k != key);
+        while runs.len() >= MAX_STAGED {
+            runs.pop_front();
+        }
+        runs.push_back((key.to_string(), run));
+        out
+    }
+
+    /// Apply (after checking for conflicting workspace changes) or discard
+    /// the run staged under `key`. Either way it is gone afterwards.
+    pub fn merge(&self, key: &str, apply: bool) -> Result<Vec<String>, String> {
+        let run = {
+            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            let i = runs.iter().position(|(k, _)| k == key);
+            i.and_then(|i| runs.remove(i)).map(|(_, r)| r)
+        };
+        let Some(run) = run else {
+            return Err("the staged changes are no longer available (discarded, or the process restarted)".into());
+        };
+        if !apply {
+            return Ok(vec![]);
+        }
+        let conflicts = run.copy.conflicts(&run.changes).map_err(|e| e.to_string())?;
+        if !conflicts.is_empty() {
+            return Err(format!(
+                "the workspace changed since the command ran, nothing applied; conflicting: {}",
+                conflicts.join(", ")
+            ));
+        }
+        apply_isolated_changes(run.copy.path(), run.copy.workspace(), &run.changes).map_err(|e| e.to_string())
+    }
+
+    pub fn len(&self) -> usize {
+        self.runs.lock().map(|r| r.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Result of an isolated run: the output, the typed change list and the copy
@@ -519,6 +604,52 @@ mod tests {
         assert!(!root.join("gone").exists());
         assert!(apply_isolated_changes(&cp, root, &["../x".to_string()]).is_err());
         assert!(apply_isolated_changes(&cp, root, &["/etc/passwd".to_string()]).is_err());
+    }
+
+    fn run_in_copy(root: &Path, f: impl FnOnce(&Path)) -> IsolatedRun {
+        let copy = IsolatedCopy::create(root, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        f(copy.path());
+        IsolatedRun::finish(ExecOutput { status: Some(0), ..Default::default() }, copy).unwrap()
+    }
+
+    #[test]
+    fn staging_merges_discards_and_detects_conflicts() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path();
+        w(&root.join("a"), "1");
+        let staging = Staging::default();
+        // Nothing changed: nothing staged.
+        staging.stage("s/none", run_in_copy(root, |_| {}));
+        assert!(staging.is_empty());
+        // Staged, then merged.
+        let out = staging.stage("s/c1", run_in_copy(root, |c| w(&c.join("a"), "2")));
+        assert_eq!(out.overlay_changes, vec!["a"]);
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "1", "staged only");
+        assert_eq!(staging.merge("s/c1", true).unwrap(), vec!["a"]);
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "2");
+        assert!(staging.merge("s/c1", true).unwrap_err().contains("no longer available"));
+        // Discarded.
+        staging.stage("s/c2", run_in_copy(root, |c| w(&c.join("b"), "new")));
+        assert_eq!(staging.merge("s/c2", false).unwrap(), Vec::<String>::new());
+        assert!(!root.join("b").exists());
+        // The original changed meanwhile: nothing applied.
+        staging.stage("s/c3", run_in_copy(root, |c| {
+            w(&c.join("a"), "3");
+            w(&c.join("c"), "x");
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        w(&root.join("a"), "user");
+        let e = staging.merge("s/c3", true).unwrap_err();
+        assert!(e.contains("conflicting: a"), "{e}");
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "user");
+        assert!(!root.join("c").exists());
+        // Bounded: the oldest are dropped.
+        for i in 0..MAX_STAGED + 2 {
+            staging.stage(&format!("s/{i}"), run_in_copy(root, |c| w(&c.join("d"), "d")));
+        }
+        assert_eq!(staging.len(), MAX_STAGED);
+        assert!(staging.merge("s/0", false).is_err());
     }
 
     #[cfg(unix)]

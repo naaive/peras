@@ -2,11 +2,18 @@
 //!
 //! Each run copies the workspace (`spec.cwd`) into a scratch directory
 //! ([`IsolatedCopy`]), mounts that copy at `/workspace` in a fresh `--rm`
-//! container and discards it afterwards. Nothing is written back: the files
-//! the command changed are reported in `overlay_changes` (merge approved ones
-//! with [`super::apply_isolated_changes`] after [`Container::run_isolated`]).
-//! [`Container::is_disposable`] is always true, which lets the SDK treat
-//! everything inside as reversible.
+//! container and discards it afterwards. What reaches the workspace:
+//!
+//! - plain runs ([`SandboxPort::run`]): changes inside the declared writable
+//!   paths are written back (they were authorized before the run); anything
+//!   else is discarded and listed in `overlay_changes`;
+//! - staged runs ([`SandboxPort::run_staged`], Opaque commands): nothing until
+//!   the change list is reviewed and [`SandboxPort::merge`]d, like any other
+//!   isolated run.
+//!
+//! [`Container::is_disposable`] is always true: the environment may vouch for
+//! commands executed inside it (invariant-level asks when unattended), never
+//! for host-side tools or for merging changes back into the workspace.
 //!
 //! The container always runs with `--network none`. When `spec.network` is
 //! non-empty and the `agent-netbridge` helper is available, a per-run egress
@@ -17,12 +24,13 @@
 
 use super::egress::{find_netbridge, proxy_env, EgressProxy, BRIDGE_LISTEN};
 use super::exec;
-use super::isolate::{IsolatedCopy, IsolatedRun};
+use super::isolate::{apply_isolated_changes, IsolatedCopy, IsolatedRun, Staging};
 use super::which;
 use agent_runtime::{ExecOutput, SandboxPort, SandboxReport, SandboxSpec};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_IMAGE: &str = "docker.io/library/debian:stable-slim";
@@ -38,6 +46,7 @@ pub struct Container {
     runtime: Option<PathBuf>,
     image: String,
     bridge: Option<PathBuf>,
+    staging: Arc<Staging>,
 }
 
 /// Extra mounts for one container run.
@@ -58,6 +67,7 @@ impl Container {
             runtime: which("docker").or_else(|| which("podman")),
             image: DEFAULT_IMAGE.into(),
             bridge: find_netbridge(),
+            staging: Arc::default(),
         }
     }
     pub fn image(mut self, image: impl Into<String>) -> Self {
@@ -213,14 +223,85 @@ impl SandboxPort for Container {
         }
     }
 
+    /// Plain runs write back what the command changed inside the declared
+    /// writable paths (those writes were authorized before the run); other
+    /// changes are discarded and listed in `overlay_changes`. Isolated runs
+    /// write nothing back (see [`SandboxPort::run_staged`]).
     async fn run(&self, argv: &[String], spec: &SandboxSpec, cancel: CancellationToken) -> Result<ExecOutput, String> {
-        Ok(self.run_isolated(argv, spec, cancel).await?.output)
+        let run = self.run_isolated(argv, spec, cancel).await?;
+        if spec.isolated {
+            return Ok(run.output);
+        }
+        tokio::task::spawn_blocking({
+            let writable = spec.writable.clone();
+            move || write_back(run, &writable)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
+
+    async fn run_staged(
+        &self,
+        key: &str,
+        argv: &[String],
+        spec: &SandboxSpec,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, String> {
+        let spec = SandboxSpec { isolated: true, ..spec.clone() };
+        let run = self.run_isolated(argv, &spec, cancel).await?;
+        Ok(self.staging.stage(key, run))
+    }
+
+    async fn merge(&self, key: &str, apply: bool) -> Result<Vec<String>, String> {
+        let staging = self.staging.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || staging.merge(&key, apply)).await.map_err(|e| e.to_string())?
+    }
+}
+
+/// Apply the changes of a container run that fall inside `writable`; the
+/// rest stay in `overlay_changes` (discarded with the copy).
+fn write_back(run: IsolatedRun, writable: &[PathBuf]) -> Result<ExecOutput, String> {
+    let IsolatedRun { mut output, changes, copy } = run;
+    let ws = copy.workspace().to_path_buf();
+    let inside = |rel: &str| {
+        let p = ws.join(rel);
+        writable.iter().any(|w| {
+            let w = std::fs::canonicalize(w).unwrap_or_else(|_| w.clone());
+            p.starts_with(&w)
+        })
+    };
+    let (keep, drop): (Vec<_>, Vec<_>) = changes.into_iter().partition(|c| inside(&c.path));
+    if !keep.is_empty() {
+        apply_isolated_changes(copy.path(), &ws, &keep).map_err(|e| format!("writing back: {e}"))?;
+    }
+    output.overlay_changes = drop.into_iter().map(|c| c.path).collect();
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_runs_write_back_declared_writes_only() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a"), "1").unwrap();
+        std::fs::write(root.join("b"), "1").unwrap();
+        let copy = IsolatedCopy::create(&root, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(copy.path().join("src/a"), "2").unwrap();
+        std::fs::write(copy.path().join("src/new"), "n").unwrap();
+        std::fs::write(copy.path().join("b"), "2").unwrap();
+        let run = IsolatedRun::finish(ExecOutput { status: Some(0), ..Default::default() }, copy).unwrap();
+        let out = write_back(run, &[root.join("src")]).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("src/a")).unwrap(), "2");
+        assert_eq!(std::fs::read_to_string(root.join("src/new")).unwrap(), "n");
+        assert_eq!(std::fs::read_to_string(root.join("b")).unwrap(), "1", "undeclared write discarded");
+        assert_eq!(out.overlay_changes, vec!["b"]);
+    }
 
     #[test]
     fn args_and_disposable() {

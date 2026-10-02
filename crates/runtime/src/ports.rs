@@ -163,6 +163,30 @@ pub trait SandboxPort: Send + Sync {
         spec: &SandboxSpec,
         cancel: CancellationToken,
     ) -> Result<ExecOutput, String>;
+    /// Run isolated (on a copy of `spec.cwd`, offline) and keep the changes
+    /// staged under `key` (see [`staged_key`]) until [`SandboxPort::merge`];
+    /// `overlay_changes` lists them (empty: nothing staged). Default:
+    /// unsupported (sandboxes reporting `isolation: false`). (ADDITIVE)
+    async fn run_staged(
+        &self,
+        _key: &str,
+        _argv: &[String],
+        _spec: &SandboxSpec,
+        _cancel: CancellationToken,
+    ) -> Result<ExecOutput, String> {
+        Err("isolated execution is not supported by this sandbox".into())
+    }
+    /// Apply the changes staged under `key` to the workspace (`apply`), or
+    /// discard them; returns the paths applied. `Err` = nothing applied.
+    /// (ADDITIVE)
+    async fn merge(&self, _key: &str, _apply: bool) -> Result<Vec<String>, String> {
+        Err("no staged changes".into())
+    }
+}
+
+/// Key under which a call's isolated run is staged.
+pub fn staged_key(session: &SessionId, call: &CallId) -> String {
+    format!("{session}/{call}")
 }
 
 // ---------------------------------------------------------------- tools
@@ -196,6 +220,9 @@ pub struct ToolOutput {
     pub trust: Option<Trust>,
     /// Content hashes observed while reading.
     pub observed: Vec<Access>,
+    /// Isolated runs: workspace-relative paths changed and staged (merged
+    /// only after review). (ADDITIVE)
+    pub staged: Vec<String>,
 }
 
 impl ToolOutput {
@@ -228,6 +255,9 @@ pub struct ToolCtx {
     pub progress: Arc<dyn Fn(String) + Send + Sync>,
     /// For sub-agent tools: spawns a child session.
     pub subagents: Option<Arc<dyn SubagentSpawner>>,
+    /// The call was approved to run isolated ([`Tool::isolated`]): run it with
+    /// [`SandboxPort::run_staged`] under [`staged_key`]. (ADDITIVE)
+    pub isolated: bool,
 }
 
 pub trait SecretSource: Send + Sync {
@@ -245,6 +275,12 @@ pub trait Tool: Send + Sync {
     /// Side-effect class for this input (defaults to the spec's class).
     fn class(&self, _input: &serde_json::Value) -> EffectClass {
         self.spec().class
+    }
+    /// This call runs isolated: on a copy of the workspace, offline, with its
+    /// changes staged and merged only after review ([`ToolCtx::isolated`]).
+    /// The kernel then waives the unknown-effect invariant. (ADDITIVE)
+    fn isolated(&self, _input: &serde_json::Value) -> bool {
+        false
     }
     async fn call(&self, input: serde_json::Value, ctx: ToolCtx) -> Result<ToolOutput, ToolError>;
     /// Adapt to the execution environment before registration (the probed

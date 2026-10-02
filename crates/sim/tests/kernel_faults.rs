@@ -17,7 +17,7 @@ struct Scripted {
 }
 
 fn call(id: &str, name: &str, class: EffectClass, access: Vec<Access>) -> ToolCall {
-    ToolCall { id: CallId::new(id), name: name.into(), input: json!({ "file": "a.txt" }), access, class }
+    ToolCall { isolated: false, id: CallId::new(id), name: name.into(), input: json!({ "file": "a.txt" }), access, class }
 }
 
 impl World for Scripted {
@@ -40,6 +40,7 @@ impl World for Scripted {
             Effect::Checkpoint(_) => EffectResult::Checkpointed(CheckpointInfo { id: CheckpointId::new("cp"), agent_changes: vec![], external_changes: vec![] }),
             Effect::Compact(_) => EffectResult::Compacted { summary: "summary".into(), trust: Trust::Internal },
             Effect::Restore(_) => EffectResult::Restored(RestoreReport::default()),
+            Effect::Merge(_) => EffectResult::Merged(MergeReport::default()),
             Effect::Finish(_) => return None,
             Effect::SampleRef(_) | Effect::CompactRef(_) => panic!("journal reference dispatched: {effect:?}"),
         })

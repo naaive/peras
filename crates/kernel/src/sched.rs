@@ -94,7 +94,7 @@ mod tests {
     use super::*;
 
     fn call(id: &str, class: EffectClass, access: Vec<Access>) -> ToolCall {
-        ToolCall { id: id.into(), name: "t".into(), input: serde_json::json!({}), access, class }
+        ToolCall { isolated: false, id: id.into(), name: "t".into(), input: serde_json::json!({}), access, class }
     }
 
     #[test]

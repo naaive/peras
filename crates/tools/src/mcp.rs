@@ -463,6 +463,7 @@ impl Tool for McpTool {
             })
         };
         Ok(ToolOutput {
+            staged: vec![],
             content,
             trust,
             observed: vec![],

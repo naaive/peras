@@ -55,7 +55,7 @@ pub fn cfg() -> KernelConfig {
 }
 
 pub fn read_call(id: &str, path: &str) -> ToolCall {
-    ToolCall {
+    ToolCall { isolated: false,
         id: id.into(),
         name: "read".into(),
         input: serde_json::json!({ "file": path }),
@@ -65,7 +65,7 @@ pub fn read_call(id: &str, path: &str) -> ToolCall {
 }
 
 pub fn write_call(id: &str, path: &str) -> ToolCall {
-    ToolCall {
+    ToolCall { isolated: false,
         id: id.into(),
         name: "edit".into(),
         input: serde_json::json!({ "file": path }),
@@ -75,7 +75,7 @@ pub fn write_call(id: &str, path: &str) -> ToolCall {
 }
 
 pub fn net_call(id: &str, host: &str) -> ToolCall {
-    ToolCall {
+    ToolCall { isolated: false,
         id: id.into(),
         name: "fetch".into(),
         input: serde_json::json!({ "url": host }),
@@ -85,13 +85,23 @@ pub fn net_call(id: &str, host: &str) -> ToolCall {
 }
 
 pub fn bash_call(id: &str, cmd: &str) -> ToolCall {
-    ToolCall {
+    ToolCall { isolated: false,
         id: id.into(),
         name: "bash".into(),
         input: serde_json::json!({ "cmd": cmd }),
-        access: vec![Access::write(ResourceUri("fs:///ws/**".into()))],
+        access: vec![Access::write(ResourceUri::cmd(cmd)), Access::write(ResourceUri("fs:///ws/**".into()))],
         class: EffectClass::Opaque,
     }
+}
+
+/// A bash call the tool runs isolated (staged changes, reviewed afterwards).
+pub fn isolated_bash_call(id: &str, cmd: &str) -> ToolCall {
+    ToolCall { isolated: true, ..bash_call(id, cmd) }
+}
+
+/// The result of an isolated run that changed `staged`.
+pub fn staged(call: &ToolCall, text: &str, staged: &[&str]) -> ToolResult {
+    ToolResult { staged: staged.iter().map(|s| s.to_string()).collect(), ..ok(call, text) }
 }
 
 pub fn reply(text: &str, calls: Vec<ToolCall>) -> AssistantMessage {

@@ -19,7 +19,7 @@ pub use bwrap::BwrapSandbox;
 pub use container::Container;
 pub use direct::DirectExec;
 pub use egress::{Allowlist, EgressEvent, EgressProxy};
-pub use isolate::{apply_isolated_changes, Change, ChangeKind, IsolatedCopy, IsolatedRun};
+pub use isolate::{apply_isolated_changes, Change, ChangeKind, IsolatedCopy, IsolatedRun, Staging};
 pub use landlock_seccomp::LandlockSandbox;
 pub use seatbelt::{seatbelt_profile, SeatbeltSandbox};
 

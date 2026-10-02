@@ -98,3 +98,105 @@ async fn require_refuses_to_run_without_a_sandbox() {
     let agent = Agent::new(Script::new().say("hi")).workspace(d.path()).policy(&policy).sandbox(FakeSandbox::default());
     assert_eq!(agent.run("hi").await.unwrap(), "hi");
 }
+
+/// The platform sandbox when it supports isolated execution (landlock or
+/// bubblewrap); `None` skips the test.
+fn isolating_sandbox() -> Option<Arc<dyn SandboxPort>> {
+    let s = agent::adapters::detect();
+    let r = s.report();
+    if r.available && r.isolation {
+        Some(s)
+    } else {
+        eprintln!("no sandbox with isolated execution ({}); skipping", r.implementation);
+        None
+    }
+}
+
+/// Wraps a shared sandbox port (`Agent::sandbox` takes it by value).
+struct Shared(Arc<dyn SandboxPort>);
+
+#[async_trait]
+impl SandboxPort for Shared {
+    fn report(&self) -> SandboxReport {
+        self.0.report()
+    }
+    async fn run(&self, argv: &[String], spec: &SandboxSpec, cancel: CancellationToken) -> Result<ExecOutput, String> {
+        self.0.run(argv, spec, cancel).await
+    }
+    async fn run_staged(
+        &self,
+        key: &str,
+        argv: &[String],
+        spec: &SandboxSpec,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, String> {
+        self.0.run_staged(key, argv, spec, cancel).await
+    }
+    async fn merge(&self, key: &str, apply: bool) -> Result<Vec<String>, String> {
+        self.0.merge(key, apply).await
+    }
+}
+
+/// Runs an Opaque command (variable expansion) in `dir` and answers the
+/// review of its changes with `answer`, after `before_answer` ran. `None`:
+/// skipped (no isolating sandbox).
+async fn opaque_run(
+    dir: &std::path::Path,
+    answer: impl Fn(&Ask),
+    before_answer: impl Fn(&std::path::Path),
+) -> Option<(Vec<agent::proto::Question>, String)> {
+    let s = isolating_sandbox()?;
+    let cmd = "X=new; echo $X > out.txt; rm README.md";
+    let model = Script::new().call(Bash, json!({ "command": cmd })).say("ran");
+    let agent = Agent::new(model).workspace(dir).tools((Bash,)).sandbox(Shared(s)).without_checkpoints();
+    let mut run = agent.run("run it");
+    let (mut asks, mut result) = (vec![], String::new());
+    while let Some(u) = run.next().await {
+        match u {
+            Update::Ask(a) => {
+                // Asked after the command ran: nothing reached the workspace yet.
+                assert!(!dir.join("out.txt").exists());
+                assert!(dir.join("README.md").exists());
+                before_answer(dir);
+                asks.push(a.question.clone());
+                answer(&a);
+            }
+            Update::Tool { result: r, .. } => result = format!("{:?}", r.content),
+            _ => {}
+        }
+    }
+    Some((asks, result))
+}
+
+#[tokio::test]
+async fn opaque_command_runs_isolated_then_its_diff_is_approved() {
+    let d = ws();
+    let Some((asks, result)) = opaque_run(d.path(), |a| a.allow(), |_| {}).await else { return };
+    // One ask, about the change list; none before running.
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert!(!asks[0].rules.contains(&"invariant:unknown_effect".to_string()), "{asks:?}");
+    assert!(asks[0].prompt.contains("README.md, out.txt"), "{}", asks[0].prompt);
+    assert_eq!(std::fs::read_to_string(d.path().join("out.txt")).unwrap(), "new\n");
+    assert!(!d.path().join("README.md").exists());
+    assert!(result.contains("changes applied: README.md, out.txt"), "{result}");
+}
+
+#[tokio::test]
+async fn denied_diff_never_reaches_the_workspace() {
+    let d = ws();
+    let Some((asks, result)) = opaque_run(d.path(), |a| a.deny("no"), |_| {}).await else { return };
+    assert_eq!(asks.len(), 1);
+    assert!(!d.path().join("out.txt").exists());
+    assert_eq!(std::fs::read_to_string(d.path().join("README.md")).unwrap(), "hello foo\n");
+    assert!(result.contains("changes discarded (no)"), "{result}");
+}
+
+#[tokio::test]
+async fn approved_diff_over_a_concurrent_edit_is_not_applied() {
+    let d = ws();
+    let user_edit = |dir: &std::path::Path| std::fs::write(dir.join("README.md"), "edited by the user\n").unwrap();
+    let Some((_, result)) = opaque_run(d.path(), |a| a.allow(), user_edit).await else { return };
+    assert_eq!(std::fs::read_to_string(d.path().join("README.md")).unwrap(), "edited by the user\n");
+    assert!(!d.path().join("out.txt").exists(), "nothing applied");
+    assert!(result.contains("changes NOT applied") && result.contains("README.md"), "{result}");
+}

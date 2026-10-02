@@ -31,6 +31,14 @@ pub struct ToolCall {
     #[serde(default)]
     pub access: Vec<Access>,
     pub class: EffectClass,
+    /// The call runs isolated (on a copy of the workspace, offline): its
+    /// changes are staged and only merged once their change list is approved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub isolated: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -54,6 +62,10 @@ pub struct ToolResult {
     /// Content hashes observed by reads (used for stale-write detection).
     #[serde(default)]
     pub observed: Vec<Access>,
+    /// Workspace-relative paths an isolated call changed: staged, not yet
+    /// in the workspace. The kernel reviews them before the result is written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staged: Vec<String>,
 }
 
 impl ToolResult {
@@ -64,6 +76,7 @@ impl ToolResult {
             is_error,
             trust: Trust::Internal,
             observed: vec![],
+            staged: vec![],
         }
     }
     /// The result synthesised for a denied call: the reason is returned to the model.

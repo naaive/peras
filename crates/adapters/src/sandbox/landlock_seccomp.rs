@@ -12,16 +12,18 @@
 //! `egress_proxy = false`; callers must ask before running networked
 //! commands here). Isolated runs use the copy-based [`IsolatedCopy`].
 
-use super::isolate::{IsolatedCopy, IsolatedRun};
+use super::isolate::{IsolatedCopy, IsolatedRun, Staging};
 use agent_runtime::{ExecOutput, SandboxPort, SandboxReport, SandboxSpec};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct LandlockSandbox {
     abi: i32,
     notes: Vec<String>,
+    staging: Arc<Staging>,
 }
 
 impl LandlockSandbox {
@@ -108,6 +110,23 @@ impl SandboxPort for LandlockSandbox {
         let mut writable = spec.writable.clone();
         writable.push(tmp.path().to_path_buf());
         self.run_confined(argv, spec, &spec.cwd, &writable, tmp.path(), cancel).await
+    }
+
+    async fn run_staged(
+        &self,
+        key: &str,
+        argv: &[String],
+        spec: &SandboxSpec,
+        cancel: CancellationToken,
+    ) -> Result<ExecOutput, String> {
+        let run = self.run_isolated(argv, spec, cancel).await?;
+        Ok(self.staging.stage(key, run))
+    }
+
+    async fn merge(&self, key: &str, apply: bool) -> Result<Vec<String>, String> {
+        let staging = self.staging.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || staging.merge(&key, apply)).await.map_err(|e| e.to_string())?
     }
 }
 
@@ -255,7 +274,7 @@ mod imp {
         );
         notes.push("pathname unix sockets on the host remain connectable; /tmp is not private (TMPDIR is)".into());
         notes.push("isolated execution is copy-based (workspace copied to a scratch dir)".into());
-        Ok(LandlockSandbox { abi, notes })
+        Ok(LandlockSandbox { abi, notes, staging: Default::default() })
     }
 
     pub(super) async fn run(

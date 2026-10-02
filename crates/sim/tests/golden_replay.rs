@@ -160,6 +160,7 @@ impl World for Recorded {
                 trust: Trust::Internal,
             },
             Effect::Restore(_) => EffectResult::Restored(RestoreReport::default()),
+            Effect::Merge(_) => EffectResult::Merged(MergeReport::default()),
             Effect::Finish(_) => return None,
             Effect::SampleRef(_) | Effect::CompactRef(_) => panic!("journal reference dispatched: {effect:?}"),
         })
