@@ -207,6 +207,7 @@ pub fn ctx(workspace: impl AsRef<Path>, grants: Vec<Access>) -> ToolCtx {
         secrets: Arc::new(MapSecrets::default()),
         progress: Arc::new(|_| {}),
         subagents: None,
+        tasks: None,
     }
 }
 
