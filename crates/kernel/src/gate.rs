@@ -216,7 +216,11 @@ pub(crate) fn invariants(s: &State, call: &ToolCall) -> (Vec<String>, Option<Str
     });
     // Isolated runs are offline and their writes only staged.
     let isolated = runs_isolated(s, call);
-    let opaque_net = call.class == EffectClass::Opaque && !sec.sandbox_available && !isolated;
+    // A sub-agent is Opaque for scheduling only: each of its own calls is
+    // gated in the child session, whose permissions are within this one's.
+    let subagent = cfg.tools.iter().any(|t| t.subagent && t.name == call.name);
+    let opaque = call.class == EffectClass::Opaque && !subagent;
+    let opaque_net = opaque && !sec.sandbox_available && !isolated;
     if tainted && private && (net_exit.is_some() || opaque_net) {
         hits.push("invariant:exfiltration".to_string());
         remember = net_exit.map(|a| a.resource.as_str().to_string());
@@ -229,7 +233,7 @@ pub(crate) fn invariants(s: &State, call: &ToolCall) -> (Vec<String>, Option<Str
     }
     // Only a call that will actually execute isolated escapes it: the
     // availability of isolation alone says nothing about this call.
-    if call.class == EffectClass::Opaque && !isolated {
+    if opaque && !isolated {
         hits.push("invariant:unknown_effect".to_string());
     }
     (hits, remember)

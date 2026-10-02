@@ -44,6 +44,7 @@ fn helper_call(id: &str) -> ToolCall {
         input: serde_json::json!({ "task": "review" }),
         access: vec![Access::write(ResourceUri("fs:///ws/**".into()))],
         class: EffectClass::Opaque,
+        isolated: false,
     }
 }
 
