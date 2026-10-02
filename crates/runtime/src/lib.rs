@@ -13,6 +13,8 @@
 //! - [`metrics`] — [`Metrics`] (counters and histograms, `snapshot()`).
 //! - [`snapshot`] — [`JsonCodec`], a [`StateCodec`] for serde states.
 //! - [`cursors`] — [`MemCursors`] / [`FileCursors`] observer cursor stores.
+//! - [`redact`] — [`Redactor`]: secret values are redacted from inputs (hence the
+//!   journal and context) and blobs.
 //! - `otel` (feature `otel`) — OpenTelemetry OTLP export of the spans.
 
 pub mod assemble;
@@ -25,6 +27,7 @@ pub mod metrics;
 #[cfg(feature = "otel")]
 pub mod otel;
 pub mod ports;
+pub mod redact;
 pub mod registry;
 pub mod shadow;
 pub mod snapshot;
@@ -38,6 +41,7 @@ pub use gate::{AnswerError, AskBoard, AutoRule, FnHook, FnRule, GateChain, Hook}
 pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, RuleStats};
 pub use mem::*;
 pub use ports::*;
+pub use redact::{RedactingBlobs, RedactingSecrets, Redactor};
 pub use registry::ToolRegistry;
 pub use shadow::ShadowCheckpointer;
 pub use snapshot::JsonCodec;

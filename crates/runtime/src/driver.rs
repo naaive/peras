@@ -25,6 +25,7 @@ use crate::gate::{human_responder, AnswerError, AskBoard, GateChain};
 use crate::mem::*;
 use crate::metrics::Metrics;
 use crate::ports::*;
+use crate::redact::{RedactingBlobs, RedactingSecrets, Redactor};
 use crate::registry::ToolRegistry;
 use agent_kernel::{Decider, Decision};
 use agent_proto::*;
@@ -170,6 +171,7 @@ pub struct RuntimeBuilder<D: Decider> {
     metrics: Option<Arc<Metrics>>,
     rebuilder: Option<Arc<dyn PromptRebuilder>>,
     cursors: Option<Arc<dyn ObserverCursors>>,
+    redactor: Option<Arc<Redactor>>,
     _d: PhantomData<fn() -> D>,
 }
 
@@ -194,6 +196,7 @@ impl<D: Decider> Default for RuntimeBuilder<D> {
             metrics: None,
             rebuilder: None,
             cursors: None,
+            redactor: None,
             _d: PhantomData,
         }
     }
@@ -281,21 +284,31 @@ where
         self.cursors = Some(c);
         self
     }
+    /// Where secret values handed to tools are registered for redaction
+    /// (default: the process-wide [`Redactor::global`]).
+    pub fn redactor(mut self, r: Arc<Redactor>) -> Self {
+        self.redactor = Some(r);
+        self
+    }
 
     /// Never fails: missing ports get in-memory / null defaults
     /// (`MemJournal`, `MemBlobStore`, `NoModel`, empty tools, `GateChain`,
     /// `NullCheckpointer`, `NullSandbox`, `EnvSecrets`, `SystemClock`, `UlidGen`).
     pub fn build(self) -> Runtime<D> {
         let options = self.options;
+        // Secrets are registered as they are handed out; blobs are redacted.
+        let redactor = self.redactor.unwrap_or_else(Redactor::global);
+        let blobs = self.blobs.unwrap_or_else(|| Arc::new(MemBlobStore::new()));
+        let secrets = self.secrets.unwrap_or_else(|| Arc::new(EnvSecrets::new()));
         let env = Env {
             journal: self.journal.unwrap_or_else(|| Arc::new(MemJournal::new())),
-            blobs: self.blobs.unwrap_or_else(|| Arc::new(MemBlobStore::new())),
+            blobs: Arc::new(RedactingBlobs::new(blobs, redactor.clone())),
             model: self.model.unwrap_or_else(|| Arc::new(NoModel::default())),
             tools: Arc::new(self.tools.unwrap_or_else(|| ToolRegistry::new(options.workspace.clone()))),
             gates: self.gates.unwrap_or_else(|| Arc::new(GateChain::default())),
             checkpointer: self.checkpointer.unwrap_or_else(|| Arc::new(NullCheckpointer::default())),
             sandbox: self.sandbox.unwrap_or_else(|| Arc::new(NullSandbox)),
-            secrets: self.secrets.unwrap_or_else(|| Arc::new(EnvSecrets::new())),
+            secrets: Arc::new(RedactingSecrets::new(secrets, redactor.clone())),
             memory: self.memory,
             subagents: self.subagents,
             clock: self.clock.unwrap_or_else(|| Arc::new(SystemClock)),
@@ -305,6 +318,7 @@ where
             metrics: self.metrics.unwrap_or_default(),
             rebuilder: self.rebuilder,
             cursors: self.cursors,
+            redactor,
         };
         Runtime { env: Arc::new(env), sessions: Arc::default(), codec: self.codec, _d: PhantomData }
     }
@@ -965,6 +979,9 @@ where
         if let Some(f) = &self.fenced {
             return Err(DriverError::Fenced(f.clone()));
         }
+        // Secret values never reach the kernel, hence neither the journal nor
+        // the model context.
+        let input = self.env.redactor.redact(input);
         let at = self.env.clock.now();
         let decision = {
             let s = self.shared.state.read().unwrap();

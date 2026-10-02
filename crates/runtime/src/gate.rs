@@ -288,6 +288,7 @@ impl GateChain {
             let v = match r {
                 Ok(v) => v,
                 Err(e) => {
+                    let e = crate::redact::Redactor::global().redact_str(&e).into_owned();
                     tracing::warn!(hook = %name, point = ?req.point, error = %e, "hook failed");
                     match req.point.on_failure() {
                         FailureMode::Allow => continue,

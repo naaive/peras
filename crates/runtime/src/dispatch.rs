@@ -108,6 +108,9 @@ pub struct Env {
     pub rebuilder: Option<Arc<dyn PromptRebuilder>>,
     /// Persisted observer cursors.
     pub cursors: Option<Arc<dyn ObserverCursors>>,
+    /// Secret values to redact (`blobs` and `secrets` are wrapped with it,
+    /// and the driver redacts every input).
+    pub redactor: Arc<crate::redact::Redactor>,
 }
 
 /// Where effect tasks send their outputs.
