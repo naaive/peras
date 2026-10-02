@@ -418,7 +418,9 @@ fn expand_tool(
 /// inside the test through `agent_tools::testing::workspace()`, and is deleted
 /// after the test. Agents built in the test default to it (never the real
 /// current directory), keep their framework data (shadow snapshots, locks)
-/// in a temporary directory too, and stamp events with the virtual clock
+/// in a temporary directory too, read their user configuration layer from an
+/// empty temporary home (never the developer's `~/.agent`, so it cannot
+/// change a test's result), and stamp events with the virtual clock
 /// (`agent_tools::testing::clock()`), which only moves when the test advances
 /// it. Tokio timers stay real (a paused tokio clock would make subprocess
 /// timeouts fire immediately). Awaiting a run inside the test allows

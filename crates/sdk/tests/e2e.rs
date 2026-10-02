@@ -33,7 +33,7 @@ async fn edits_readme() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[agent::test]
 async fn stream_updates_and_ask_answered_from_code() {
     let d = ws();
     let model = Script::new()
@@ -64,7 +64,7 @@ async fn stream_updates_and_ask_answered_from_code() {
     assert_eq!(std::fs::read_to_string(d.path().join("README.md")).unwrap(), "hello baz\n");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn awaited_run_denies_unhandled_asks() {
     let d = ws();
     let model = Script::new()
@@ -75,7 +75,7 @@ async fn awaited_run_denies_unhandled_asks() {
     assert_eq!(std::fs::read_to_string(d.path().join("README.md")).unwrap(), "hello foo\n");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn code_gate_denies_and_observer_sees_failure() {
     let d = ws();
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -104,7 +104,7 @@ async fn code_gate_denies_and_observer_sees_failure() {
     assert!(seen.iter().any(|s| s.contains("hands off README")), "{seen:?}");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn json_output() {
     #[derive(serde::Deserialize, schemars::JsonSchema, Debug, PartialEq)]
     struct Plan {
@@ -116,7 +116,7 @@ async fn json_output() {
     assert_eq!(plan, Plan { tasks: vec!["a".into(), "b".into()] });
 }
 
-#[tokio::test]
+#[agent::test]
 async fn chat_session_persists_across_turns() {
     let d = ws();
     let model = Script::new().say("one").say("two");
@@ -129,7 +129,7 @@ async fn chat_session_persists_across_turns() {
     assert_eq!(users, 2);
 }
 
-#[tokio::test]
+#[agent::test]
 async fn subagent_is_a_tool() {
     let d = ws();
     let child_model = Script::new().say("looks good");
@@ -159,7 +159,7 @@ async fn subagent_is_a_tool() {
 
 /// In debug builds every sample's request is rebuilt from the journal and
 /// compared byte-for-byte; a multi-turn session with tools must never mismatch.
-#[tokio::test]
+#[agent::test]
 async fn requests_rebuild_from_journal() {
     let d = ws();
     let model = Script::new()

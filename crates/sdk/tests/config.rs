@@ -43,7 +43,7 @@ fn user_texts(events: &[Envelope<Event>]) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
+#[agent::test]
 async fn long_term_memory_is_loaded_at_session_start() {
     let d = tempfile::tempdir().unwrap();
     let mem = agent::tools::testing::MemMemory::default();
@@ -61,7 +61,7 @@ async fn long_term_memory_is_loaded_at_session_start() {
     assert_eq!(events.iter().filter(|e| matches!(e.body, Event::MemoryLoaded { .. })).count(), 1);
 }
 
-#[tokio::test]
+#[agent::test]
 async fn subdirectory_instructions_are_injected_on_access() {
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(d.path().join("sub")).unwrap();
@@ -85,7 +85,7 @@ async fn subdirectory_instructions_are_injected_on_access() {
     assert!(last.contains("In sub/, use tabs."));
 }
 
-#[tokio::test]
+#[agent::test]
 async fn slash_commands_expand_into_their_template() {
     let (d, policy) = project("");
     std::fs::create_dir_all(d.path().join(".agent/commands")).unwrap();
@@ -100,7 +100,7 @@ async fn slash_commands_expand_into_their_template() {
     assert_eq!(texts, vec!["Review src/lib.rs carefully.".to_string(), "/nope stays as typed".to_string()]);
 }
 
-#[tokio::test]
+#[agent::test]
 async fn configuration_changes_reconfigure_live_sessions() {
     let (d, policy) = project("");
     let agent = discover(d.path(), &policy, Script::new().say("one").say("two")).hot_reload();
@@ -120,7 +120,7 @@ async fn configuration_changes_reconfigure_live_sessions() {
     assert_eq!(chat.send("again").await.unwrap(), "two");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn configured_observer_sees_events_and_can_only_signal() {
     let out = tempfile::tempdir().unwrap();
     let seen = out.path().join("seen.json");
@@ -162,7 +162,7 @@ fn denied_text(events: &[Envelope<Event>]) -> Option<String> {
     })
 }
 
-#[tokio::test]
+#[agent::test]
 async fn model_call_hook_judges_tool_calls() {
     let extra = "[[hooks]]\npoint = \"pre_tool\"\nmatcher = \"read\"\nexecutor = { prompt = \"Deny reads of README.\" }\n";
     let (d, policy) = project(extra);
@@ -201,7 +201,7 @@ async fn assert_hook_spend_charged(agent: &Agent, chat: &Chat) {
     assert_eq!(h.with_state(agent::kernel::usage).0, own + charged, "charged to the session's budget");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn subagent_hook_judges_tool_calls() {
     let extra = "[[hooks]]\npoint = \"pre_tool\"\nmatcher = \"read\"\nexecutor = { agent = \"judge\" }\n";
     let (d, policy) = project(extra);
@@ -268,7 +268,7 @@ async fn guard_server() -> String {
     format!("http://{addr}/mcp")
 }
 
-#[tokio::test]
+#[agent::test]
 async fn mcp_hook_and_remote_mcp_tools() {
     let url = guard_server().await;
     let extra = format!(
@@ -282,4 +282,23 @@ async fn mcp_hook_and_remote_mcp_tools() {
     let chat = agent.session("mcp-guarded");
     assert_eq!(chat.send("read").await.unwrap(), "ok");
     assert!(denied_text(&chat.events().await.unwrap()).unwrap().contains("mcp guard says no"));
+}
+
+#[agent::test]
+async fn the_user_layer_comes_from_the_tests_own_home() {
+    // Inside `#[agent::test]` the user layer (`~/.agent`) is the test's own
+    // empty home, never the developer's: what is planted there is read...
+    let home = agent::tools::testing::scope().unwrap().home;
+    assert_ne!(Some(home.clone()), std::env::var_os("HOME").map(PathBuf::from));
+    std::fs::create_dir_all(home.join(".agent")).unwrap();
+    std::fs::write(home.join(".agent/settings.toml"), "system = [\"From the user layer.\"]\n").unwrap();
+    let (d, policy) = project("");
+    let p = discover(d.path(), &policy, Script::new()).profile().await.unwrap();
+    assert!(p.kernel.system.iter().any(|s| s == "From the user layer."), "{:?}", p.kernel.system);
+    // ...and an explicit home replaces it (`None`: no user layer at all).
+    let other = tempfile::tempdir().unwrap();
+    let p = discover(d.path(), &policy, Script::new()).home(Some(other.path())).profile().await.unwrap();
+    assert!(!p.kernel.system.iter().any(|s| s == "From the user layer."));
+    let p = discover(d.path(), &policy, Script::new()).home(None::<&Path>).profile().await.unwrap();
+    assert!(!p.kernel.system.iter().any(|s| s == "From the user layer."));
 }

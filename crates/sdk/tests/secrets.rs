@@ -14,7 +14,7 @@ async fn leak(token: Secret<Name>, big: bool) -> Result<String> {
     Ok(format!("token is {v}\n{filler}"))
 }
 
-#[tokio::test]
+#[agent::test]
 async fn secrets_are_redacted_from_journal_context_and_blobs() {
     std::env::set_var(NAME, VALUE);
     let d = tempfile::tempdir().unwrap();

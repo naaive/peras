@@ -98,6 +98,12 @@ pub(crate) struct Config {
     /// Look for instruction files in the subdirectories tools access (`None`
     /// = only in discover mode).
     instructions_on_access: Option<bool>,
+    /// The user's home: `~/.agent` holds the user configuration layer, user
+    /// skills and plugins, and (without `AGENT_DATA_DIR`) the data directory.
+    /// Taken when the agent is created: `$HOME`, or inside `#[agent::test]`
+    /// the test's own empty home, so a developer's configuration never
+    /// changes a test.
+    pub(crate) home: Option<PathBuf>,
 }
 
 /// What a configuration compiles to (replaced on hot reload).
@@ -193,6 +199,7 @@ impl Agent {
                 preset: None,
                 hot_reload: false,
                 instructions_on_access: None,
+                home: default_home(),
             },
             built: Arc::new(OnceCell::new()),
         }
@@ -206,6 +213,14 @@ impl Agent {
         f(&mut self.cfg);
         self.built = Arc::new(OnceCell::new());
         self
+    }
+
+    /// The user's home directory (`~/.agent`: user configuration layer, user
+    /// skills and plugins, data directory); `None` = no user layer. Defaults
+    /// to `$HOME` (inside `#[agent::test]`, the test's own empty home).
+    pub fn home(self, dir: Option<impl AsRef<Path>>) -> Agent {
+        let home = dir.map(|d| d.as_ref().to_path_buf());
+        self.edit(|c| c.home = home)
     }
 
     /// Use this model port instead of the profile's `[model] id` (e.g. a
@@ -493,9 +508,11 @@ async fn load_memory(m: &dyn MemoryStore) -> Option<String> {
     Some(text)
 }
 
-fn default_tools(memory: bool, profile: &Profile) -> Vec<Arc<dyn Tool>> {
+fn default_tools(cfg: &Config, profile: &Profile) -> Vec<Arc<dyn Tool>> {
     use agent_tools::builtin::*;
+    let memory = cfg.memory.is_some();
     let catalog = profile.skills.iter().map(|s| (s.name.clone(), PathBuf::from(&s.path)));
+    let user_skills = cfg.home.as_ref().map(|h| h.join(".agent").join("skills"));
     let mut v: Vec<Arc<dyn Tool>> = vec![
         Arc::new(read),
         Arc::new(write),
@@ -504,7 +521,7 @@ fn default_tools(memory: bool, profile: &Profile) -> Vec<Arc<dyn Tool>> {
         Arc::new(grep),
         Arc::new(web_fetch),
         Arc::new(agent_tools::Bash),
-        Arc::new(SkillLoader::new().with_catalog(catalog)),
+        Arc::new(SkillLoader::new().with_user_dir(user_skills).with_catalog(catalog)),
         Arc::new(TaskList),
         Arc::new(TaskOutput),
         Arc::new(TaskKill),
@@ -525,6 +542,7 @@ pub(crate) fn discover_options(cfg: &Config) -> Result<Option<DiscoverOptions>, 
     let cli = cfg.policy.as_deref().map(read_file).transpose()?;
     Ok(cfg.discover.as_ref().map(|dir| {
         let mut opts = DiscoverOptions::from_env(dir);
+        opts.home = cfg.home.clone();
         opts.cli = cli;
         opts
     }))
@@ -583,8 +601,8 @@ pub(crate) fn kernel_config(cfg: &Config, profile: &Profile, a: &Assembly) -> Ke
     kc.security.disposable_env = kc.security.disposable_env || a.disposable;
     // User-level skills and plugins are trusted configuration: loading them
     // is not untrusted content.
-    if let Some(home) = std::env::var_os("HOME") {
-        let user = PathBuf::from(home).join(".agent");
+    if let Some(home) = &cfg.home {
+        let user = home.join(".agent");
         for sub in ["skills", "plugins"] {
             let glob = format!("fs://{}/**", user.join(sub).display());
             if !kc.security.trusted_sources.contains(&glob) {
@@ -693,14 +711,14 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     agent_adapters::check_required(choice.require, &report).map_err(Error::Config)?;
     // Isolated runs awaiting review are kept in the data directory, keyed by
     // call: a crash between the run and its merge loses nothing.
-    sandbox.stage_in(&data_dir().join("staged"));
+    sandbox.stage_in(&data_dir(&cfg).join("staged"));
 
     // ---- tools
     let link = Arc::new(Link::default());
     let mut registry = ToolRegistry::new(&workspace);
     let tools = cfg.tools.clone().unwrap_or_else(|| {
         if cfg.discover.is_some() {
-            default_tools(cfg.memory.is_some(), &profile)
+            default_tools(&cfg, &profile)
         } else {
             vec![]
         }
@@ -730,7 +748,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     // ---- one writing session per workspace: taken when the first session
     // opens (see `Built::lock`); read-only agents take none.
     let writes = specs.iter().any(|t| t.class != EffectClass::Pure || t.subagent);
-    let lock = writes.then(|| (workspace.clone(), data_dir().join("locks")));
+    let lock = writes.then(|| (workspace.clone(), data_dir(&cfg).join("locks")));
 
     // ---- gates
     let unattended = cfg.unattended.or(profile.kernel.unattended);
@@ -745,7 +763,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     let profile_hash = format!("{}:{}", profile.hash, agent_kernel::config_hash(&kc));
 
     let checkpointer: Arc<dyn Checkpointer> = if cfg.shadow {
-        let store = shadow_dir(&workspace);
+        let store = shadow_dir(&cfg, &workspace);
         match ShadowCheckpointer::new(&workspace, &store) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -757,7 +775,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
         Arc::new(NullCheckpointer::default())
     };
 
-    let data = data_dir();
+    let data = data_dir(&cfg);
     let cursors: Arc<dyn ObserverCursors> = match std::fs::create_dir_all(&data)
         .map_err(|e| e.to_string())
         .and_then(|_| FileCursors::open(data.join("observer-cursors.json")).map_err(|e| e.to_string()))
@@ -821,21 +839,30 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     Ok(built)
 }
 
-/// Framework data directory (`$AGENT_DATA_DIR`, else `~/.agent`; inside
+/// The user's home an agent starts with: inside `#[agent::test]` the test's
+/// own (empty) one, else `$HOME`.
+fn default_home() -> Option<PathBuf> {
+    match agent_tools::testing::scope() {
+        Some(t) => Some(t.home),
+        None => std::env::var_os("HOME").map(PathBuf::from),
+    }
+}
+
+/// Framework data directory (`$AGENT_DATA_DIR`, else `<home>/.agent`; inside
 /// `#[agent::test]`, the test's temporary one).
-fn data_dir() -> PathBuf {
+fn data_dir(cfg: &Config) -> PathBuf {
     if let Some(t) = agent_tools::testing::scope() {
         return t.data_dir;
     }
     std::env::var_os("AGENT_DATA_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agent")))
+        .or_else(|| cfg.home.as_ref().map(|h| h.join(".agent")))
         .unwrap_or_else(|| std::env::temp_dir().join("agent"))
 }
 
 /// Shadow snapshot store: outside the workspace, keyed by its path.
-fn shadow_dir(workspace: &Path) -> PathBuf {
-    let base = data_dir().join("shadow");
+fn shadow_dir(cfg: &Config, workspace: &Path) -> PathBuf {
+    let base = data_dir(cfg).join("shadow");
     let key: String = workspace
         .display()
         .to_string()

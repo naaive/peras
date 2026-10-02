@@ -36,7 +36,7 @@ fn ws() -> tempfile::TempDir {
     d
 }
 
-#[tokio::test]
+#[agent::test]
 async fn bash_is_classified_when_the_agent_has_a_sandbox() {
     let d = ws();
     let sandbox = FakeSandbox::default();
@@ -61,7 +61,7 @@ async fn bash_is_classified_when_the_agent_has_a_sandbox() {
     assert!(spec.writable.is_empty() && spec.network.is_empty(), "{spec:?}");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn without_a_sandbox_every_command_asks() {
     let d = ws();
     let model = Script::new().call(Bash, json!({ "command": "grep -c foo README.md" })).say("counted");
@@ -80,7 +80,7 @@ async fn without_a_sandbox_every_command_asks() {
     assert!(rules.contains(&"invariant:unknown_effect".to_string()), "{rules:?}");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn require_refuses_to_run_without_a_sandbox() {
     let d = ws();
     let policy = d.path().join("agent.toml");
@@ -168,7 +168,7 @@ async fn opaque_run(
     Some((asks, result))
 }
 
-#[tokio::test]
+#[agent::test]
 async fn opaque_command_runs_isolated_then_its_diff_is_approved() {
     let d = ws();
     let Some((asks, result)) = opaque_run(d.path(), |a| a.allow(), |_| {}).await else { return };
@@ -181,7 +181,7 @@ async fn opaque_command_runs_isolated_then_its_diff_is_approved() {
     assert!(result.contains("changes applied: README.md, out.txt"), "{result}");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn denied_diff_never_reaches_the_workspace() {
     let d = ws();
     let Some((asks, result)) = opaque_run(d.path(), |a| a.deny("no"), |_| {}).await else { return };
@@ -191,7 +191,7 @@ async fn denied_diff_never_reaches_the_workspace() {
     assert!(result.contains("changes discarded (no)"), "{result}");
 }
 
-#[tokio::test]
+#[agent::test]
 async fn approved_diff_over_a_concurrent_edit_is_not_applied() {
     let d = ws();
     let user_edit = |dir: &std::path::Path| std::fs::write(dir.join("README.md"), "edited by the user\n").unwrap();

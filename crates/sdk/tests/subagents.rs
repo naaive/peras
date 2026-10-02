@@ -54,7 +54,7 @@ fn subagent_events(events: &[agent::proto::Envelope<Event>]) -> (Vec<SessionId>,
     (started, finished)
 }
 
-#[tokio::test]
+#[agent::test]
 async fn lifecycle_parent_link_and_forwarded_questions() {
     let d = ws();
     let child_model = Script::new().call(edit, json!({ "file": "README.md", "old": "foo", "new": "bar" })).say("edited");
@@ -114,7 +114,7 @@ impl Tool for Untrusted {
     }
 }
 
-#[tokio::test]
+#[agent::test]
 async fn child_tools_are_narrowed_and_taint_travels_both_ways() {
     let d = ws();
     let child_model = Script::new().call(edit, json!({ "file": "README.md", "old": "foo", "new": "pwned" })).say("could not edit");
@@ -151,7 +151,7 @@ async fn child_tools_are_narrowed_and_taint_travels_both_ways() {
     assert!(result_trust.unwrap().is_untrusted());
 }
 
-#[tokio::test]
+#[agent::test]
 async fn fork_inherits_the_completed_turns() {
     let d = ws();
     let child_model = Script::new().say("forked answer");
@@ -172,7 +172,7 @@ async fn fork_inherits_the_completed_turns() {
     assert_eq!(req["messages"][1], parent_first[1]);
 }
 
-#[tokio::test]
+#[agent::test]
 async fn background_subagent_runs_as_a_task() {
     let d = ws();
     let child_model = Script::new().say("background answer");
@@ -213,7 +213,7 @@ async fn background_subagent_runs_as_a_task() {
     );
 }
 
-#[tokio::test]
+#[agent::test]
 async fn definition_files_are_registered_as_subagents() {
     let d = ws();
     std::fs::create_dir_all(d.path().join(".git")).unwrap();
@@ -248,7 +248,7 @@ async fn definition_files_are_registered_as_subagents() {
 
 /// A re-dispatched sub-agent call (crash recovery re-runs it) resumes the same
 /// child session: a finished child answers from its journal, nothing runs twice.
-#[tokio::test]
+#[agent::test]
 async fn redispatched_call_resumes_the_same_child() {
     let d = ws();
     let model = Script::new().say("only once");

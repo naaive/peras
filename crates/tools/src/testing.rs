@@ -18,12 +18,16 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// What an `#[agent_test]` provides: a temporary workspace, a framework data
-/// directory next to it (shadow snapshots, locks, cursors), and a virtual
-/// clock. Agents built inside the test default to all three.
+/// directory next to it (shadow snapshots, locks, cursors, staged runs), an
+/// empty home directory (the user configuration layer), and a virtual clock.
+/// Agents built inside the test default to all four.
 #[derive(Debug, Clone)]
 pub struct TestScope {
     pub workspace: PathBuf,
     pub data_dir: PathBuf,
+    /// An empty home directory: agents built in the test read their user
+    /// configuration layer (`~/.agent`) from here, never the developer's.
+    pub home: PathBuf,
     /// The time the runtime stamps on events. It starts at [`TEST_EPOCH_MS`]
     /// and only moves when the test advances it.
     pub clock: VirtualClock,
@@ -76,10 +80,12 @@ where
     let scope = TestScope {
         workspace: root.join("ws"),
         data_dir: root.join("data"),
+        home: root.join("home"),
         clock: VirtualClock::new(TEST_EPOCH_MS),
     };
     std::fs::create_dir_all(&scope.workspace).expect("create temp workspace");
     std::fs::create_dir_all(&scope.data_dir).expect("create temp data dir");
+    std::fs::create_dir_all(&scope.home).expect("create temp home");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
