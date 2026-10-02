@@ -1227,8 +1227,12 @@ where
                 let asks = self.shared.asks.clone();
                 if let Some(q) = &req.question {
                     // Open synchronously so an answer arriving right after the
-                    // `QuestionAsked` event is never "unknown".
-                    asks.open(q);
+                    // `QuestionAsked` event is never "unknown"; one an auto rule
+                    // answers is opened answered (nobody is offered it).
+                    match env.gates.auto_answer(&req) {
+                        Some((a, resp)) => asks.open_answered(q, a, resp),
+                        None => asks.open(q),
+                    }
                     flight.question = Some(q.id.clone());
                 }
                 let ctx = GateCtx { session, asks, cancel };

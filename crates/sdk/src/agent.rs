@@ -69,12 +69,24 @@ pub(crate) enum ModelChoice {
 
 type ConfigEdit = Arc<dyn Fn(&mut KernelConfig) + Send + Sync>;
 type GateFn = Arc<dyn Fn(&Proposal) -> Verdict + Send + Sync>;
+type SourceEdit = Arc<dyn Fn(&mut Sources) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) model: ModelChoice,
     pub(crate) tools: Option<Vec<Arc<dyn Tool>>>,
+    /// Added to the tool set (the defaults in discover mode), replacing
+    /// tools of the same name.
+    pub(crate) extra_tools: Vec<Arc<dyn Tool>>,
     policy: Option<PathBuf>,
+    /// Settings TOML text applied as the command-line layer (with `policy`,
+    /// the file's tables are merged into it).
+    settings: Option<String>,
+    /// Edits applied to the discovered sources before compiling (built-in
+    /// sub-agents and commands of an application).
+    source_edits: Vec<SourceEdit>,
+    /// Replaces the framework's base system prompt.
+    system: Option<String>,
     pub(crate) discover: Option<PathBuf>,
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) journal: Option<JournalChoice>,
@@ -180,7 +192,11 @@ impl Agent {
             cfg: Config {
                 model,
                 tools: None,
+                extra_tools: vec![],
                 policy: None,
+                settings: None,
+                source_edits: vec![],
+                system: None,
                 discover: None,
                 workspace: None,
                 journal: None,
@@ -230,10 +246,22 @@ impl Agent {
         self.edit(|c| c.model = ModelChoice::Port(m))
     }
 
+    /// [`Agent::model`] from a shared port.
+    pub fn model_port(self, model: Arc<dyn ModelPort>) -> Agent {
+        self.edit(|c| c.model = ModelChoice::Port(model))
+    }
+
     /// Tools: `.tools((read, edit, Bash))`. Sub-agents are tools too.
     pub fn tools(self, tools: impl IntoTools) -> Agent {
         let t = tools.into_tools();
         self.edit(|c| c.tools = Some(t))
+    }
+
+    /// Add tools to the tool set (in discover mode, to the default built-ins),
+    /// replacing a tool of the same name: `.extra_tools((my_edit,))`.
+    pub fn extra_tools(self, tools: impl IntoTools) -> Agent {
+        let t = tools.into_tools();
+        self.edit(|c| c.extra_tools.extend(t))
     }
 
     /// A settings TOML file applied as the command-line layer.
@@ -249,6 +277,28 @@ impl Agent {
             None => true,
             Some(w) => std::fs::canonicalize(w).map(|w| w.starts_with(&t.workspace)).unwrap_or(false),
         }
+    }
+
+    /// Settings TOML text as the command-line layer (e.g. built from flags).
+    /// Tables of a `policy` file are merged over it.
+    pub fn settings(self, toml: impl Into<String>) -> Agent {
+        let t = toml.into();
+        self.edit(|c| c.settings = Some(t))
+    }
+
+    /// Edit the discovered sources before they are compiled (also on hot
+    /// reload): an application adds its built-in sub-agent definitions and
+    /// commands here, with the user's and project's files alongside.
+    pub fn sources(self, f: impl Fn(&mut Sources) + Send + Sync + 'static) -> Agent {
+        let f: SourceEdit = Arc::new(f);
+        self.edit(|c| c.source_edits.push(f))
+    }
+
+    /// Replace the framework's base system prompt (instruction files, skills
+    /// and memory still follow it).
+    pub fn system_prompt(self, text: impl Into<String>) -> Agent {
+        let t = text.into();
+        self.edit(|c| c.system = Some(t))
     }
 
     pub fn workspace(self, dir: impl AsRef<Path>) -> Agent {
@@ -537,9 +587,36 @@ fn read_file(p: &Path) -> Result<String, Error> {
     std::fs::read_to_string(p).map_err(|e| Error::Config(format!("{}: {e}", p.display())))
 }
 
+/// The command-line layer: `settings` text, with the `policy` file merged
+/// over it.
+fn cli_layer(cfg: &Config) -> Result<Option<String>, Error> {
+    let file = cfg.policy.as_deref().map(read_file).transpose()?;
+    match (&cfg.settings, file) {
+        (None, f) => Ok(f),
+        (Some(s), None) => Ok(Some(s.clone())),
+        (Some(s), Some(f)) => {
+            let parse = |t: &str| t.parse::<toml::Table>().map_err(|e| Error::Config(format!("settings: {e}")));
+            let mut base = parse(s)?;
+            merge_toml(&mut base, parse(&f)?);
+            Ok(Some(base.to_string()))
+        }
+    }
+}
+
+fn merge_toml(base: &mut toml::Table, over: toml::Table) {
+    for (k, v) in over {
+        match (base.get_mut(&k), v) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_toml(b, o),
+            (_, v) => {
+                base.insert(k, v);
+            }
+        }
+    }
+}
+
 /// Discovery options of a discover-mode agent.
 pub(crate) fn discover_options(cfg: &Config) -> Result<Option<DiscoverOptions>, Error> {
-    let cli = cfg.policy.as_deref().map(read_file).transpose()?;
+    let cli = cli_layer(cfg)?;
     Ok(cfg.discover.as_ref().map(|dir| {
         let mut opts = DiscoverOptions::from_env(dir);
         opts.home = cfg.home.clone();
@@ -553,14 +630,17 @@ pub(crate) fn compile_profile(cfg: &Config, workspace: &Path) -> Result<Profile,
     if let Some(p) = &cfg.preset {
         return Ok(p.clone());
     }
-    let sources = match discover_options(cfg)? {
+    let mut sources = match discover_options(cfg)? {
         Some(opts) => agent_profile::discover(&opts).map_err(|e| Error::Config(e.to_string()))?,
         None => Sources {
-            cli: cfg.policy.as_deref().map(read_file).transpose()?,
+            cli: cli_layer(cfg)?,
             project_root: Some(workspace.display().to_string()),
             ..Default::default()
         },
     };
+    for e in &cfg.source_edits {
+        e(&mut sources);
+    }
     let profile = agent_profile::compile(&sources).map_err(|e| Error::Config(e.to_string()))?;
     for w in &profile.warnings {
         tracing::warn!(?w, "profile warning");
@@ -592,8 +672,9 @@ pub(crate) fn kernel_config(cfg: &Config, profile: &Profile, a: &Assembly) -> Ke
     if let Some(allowed) = &profile.tool_allowlist {
         kc.tools.retain(|t| allowed.contains(&t.name));
     }
-    if kc.system.is_empty() || !kc.system.iter().any(|s| s == BASE_SYSTEM) {
-        kc.system.insert(0, BASE_SYSTEM.into());
+    let base = cfg.system.as_deref().unwrap_or(BASE_SYSTEM);
+    if kc.system.is_empty() || !kc.system.iter().any(|s| s == base) {
+        kc.system.insert(0, base.into());
     }
     kc.security.workspace_root = a.workspace.display().to_string();
     kc.security.sandbox_available = a.report.available;
@@ -702,7 +783,12 @@ impl Toolbox {
     /// The tool registry for `profile`, the connected MCP servers and the
     /// sub-agent definitions. Sub-agent definitions are linked for spawning.
     pub(crate) async fn assemble(&self, cfg: &Config, workspace: &Path, profile: &Profile) -> (ToolRegistry, McpClients, BTreeMap<String, Agent>) {
-        let tools = cfg.tools.clone().unwrap_or_else(|| if cfg.discover.is_some() { default_tools(cfg, profile) } else { vec![] });
+        let mut tools = cfg.tools.clone().unwrap_or_else(|| if cfg.discover.is_some() { default_tools(cfg, profile) } else { vec![] });
+        for t in &cfg.extra_tools {
+            let name = t.spec().name;
+            tools.retain(|x| x.spec().name != name);
+            tools.push(t.clone());
+        }
         // MCP: keep connections whose definition did not change; connect the
         // new or changed ones; drop the others (closed with their last tool).
         let previous = std::mem::take(&mut self.state.lock().unwrap().mcp);

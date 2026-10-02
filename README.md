@@ -20,6 +20,7 @@ pure kernel that performs no IO.
 | `crates/sdk` | `agent` | Application facade (`use agent::prelude::*`) | yes |
 | `crates/sim` | `agent-sim` | Virtual clock, scripted model, controllable scheduler, kernel simulation with crash injection | none |
 | `crates/cli` | `agent-cli` | `agent` binary: headless JSONL runs, `schema`, `replay`, `context explain`, `doctor`, `config explain` | yes |
+| `crates/code` | `agent-code` | `peras` binary: a Claude Code style coding agent (coding prompt, editing / planning tools, permission modes, built-in sub-agents and commands, interactive REPL, print mode) | yes |
 
 Dependencies only point inwards (`proto` ← `kernel` ← `runtime` ← adapters/tools/sdk). CI enforces the
 kernel boundary (`scripts/check-kernel-purity.sh`): no tokio/reqwest in its dependency tree, no filesystem,
@@ -80,6 +81,28 @@ Inside `#[agent::test]` an agent works on the temporary workspace (`agent::tools
 never the real current directory) and stamps events with a virtual clock (`testing::clock()`), and awaiting a
 run allows policy-level asks there (the test is the user); invariant-level asks still need a real human. This
 example is `crates/sdk/tests/readme.rs`.
+
+## Coding agent: `peras`
+
+`crates/code` is a complete coding agent built on the framework, modeled on Claude Code
+([docs/coding-agent.md](docs/coding-agent.md) compares them feature by feature).
+
+```sh
+cargo install --path crates/code      # or: cargo run -p agent-code --
+export ANTHROPIC_API_KEY=...
+peras                                  # interactive session in the current directory
+peras "fix the failing test"           # ... starting with this message
+peras -p "explain src/lib.rs"          # print mode; --output-format text|json|stream-json
+git diff | peras -p "review this"      # piped stdin is appended to the prompt
+peras -c                               # continue the last conversation;  peras -r <id> resumes one
+peras --permission-mode plan           # default | acceptEdits | plan | bypassPermissions
+peras -p "run the tests" --allowed-tools "bash(cargo test:*)" edit
+```
+
+In the REPL: `/help`, `/clear`, `/compact`, `/resume`, `/rewind`, `/mode`, `/plan`, `/model`, `/permissions`,
+`/todos`, `/cost`, `/status`, plus the prompt commands `/init`, `/review`, `/security-review`, `/commit` and those of
+`.agent/commands`; `!cmd` runs a shell command for the next message, `#note` adds a note to `AGENTS.md`; typing while
+the agent works steers it, Ctrl-C interrupts.
 
 ## CLI
 

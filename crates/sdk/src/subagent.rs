@@ -122,6 +122,8 @@ pub(crate) fn from_definitions(
             _ => ModelChoice::Port(model.clone()),
         };
         c.tools = Some(tools);
+        // `base` already holds them; adding them again would bypass the allowlist.
+        c.extra_tools = vec![];
         c.preset = Some(child);
         c.journal = Some(journal.clone());
         c.sandbox = Some(sandbox.clone());

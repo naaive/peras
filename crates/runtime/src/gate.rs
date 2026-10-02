@@ -94,6 +94,25 @@ impl AskBoard {
         }
     }
 
+    /// Register a question that is answered as it opens (an auto-answer
+    /// rule): it is never announced as opened, so clients never offer it to
+    /// a human. An existing question keeps its answer, or takes this one.
+    pub fn open_answered(&self, q: &Question, answer: Answer, responder: Responder) {
+        let mut slots = self.slots.lock().unwrap();
+        match slots.get(&q.id) {
+            Some(slot) => {
+                if slot.tx.borrow().is_none() {
+                    slot.tx.send_replace(Some((answer, responder)));
+                    let _ = self.events.send(BoardEvent::Closed(q.id.clone()));
+                }
+            }
+            None => {
+                let (tx, _) = watch::channel(Some((answer, responder)));
+                slots.insert(q.id.clone(), Slot { question: q.clone(), tx });
+            }
+        }
+    }
+
     /// Compare-and-swap answer: succeeds only for an open, unanswered question.
     pub fn answer(&self, id: &QuestionId, answer: Answer, responder: Responder) -> Result<(), AnswerError> {
         let slots = self.slots.lock().unwrap();
@@ -399,6 +418,14 @@ impl GateChain {
         best.unwrap_or((Verdict::Allow, Responder::Kernel))
     }
 
+    /// Auto-answer rules: never for invariant-level asks.
+    fn auto(&self, req: &GateRequest, question: &Question) -> Option<(Answer, Responder)> {
+        if req.level == ApprovalLevel::Invariant || question.level == ApprovalLevel::Invariant {
+            return None;
+        }
+        self.rules.iter().find_map(|r| r.answer(req, question).map(|a| (a, Responder::AutoRule(r.name().to_string()))))
+    }
+
     async fn ask_human(&self, req: &GateRequest, ctx: Option<&GateCtx>) -> GateOutcome {
         let question = req.question.clone().unwrap_or_else(|| Question {
             id: QuestionId(format!("gate:{:?}", req.point)),
@@ -409,23 +436,14 @@ impl GateChain {
             remember_destination: None,
         });
         let invariant = req.level == ApprovalLevel::Invariant || question.level == ApprovalLevel::Invariant;
-
-        // Auto-answer rules: never for invariant-level asks.
-        let mut auto: Option<(Answer, Responder)> = None;
-        if !invariant {
-            for r in &self.rules {
-                if let Some(a) = r.answer(req, &question) {
-                    auto = Some((a, Responder::AutoRule(r.name().to_string())));
-                    break;
-                }
-            }
-        }
+        let auto = self.auto(req, &question);
 
         if let Some(ctx) = ctx {
-            ctx.asks.open(&question);
-            if let Some((a, resp)) = auto {
-                // CAS like everyone else: a human may have answered first.
-                let _ = ctx.asks.answer(&question.id, a, resp);
+            match auto {
+                // Answered as it opens (a human may have answered a re-opened
+                // question first: that answer is kept).
+                Some((a, resp)) => ctx.asks.open_answered(&question, a, resp),
+                None => ctx.asks.open(&question),
             }
         } else if let Some((a, resp)) = auto {
             return answer_to_outcome(&a, resp);
@@ -503,6 +521,11 @@ impl GateExecutor for GateChain {
     async fn evaluate_in(&self, req: &GateRequest, ctx: &GateCtx) -> (Verdict, Responder) {
         let o = self.evaluate_outcome(req, ctx).await;
         (o.verdict, o.responder)
+    }
+
+    fn auto_answer(&self, req: &GateRequest) -> Option<(Answer, Responder)> {
+        let q = req.question.as_ref()?;
+        (req.ring == Ring::Human).then(|| self.auto(req, q)).flatten()
     }
 
     /// Ring 5 carries the human's `Answer::Allow { remember }` through.

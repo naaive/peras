@@ -358,6 +358,12 @@ pub trait GateExecutor: Send + Sync {
         let (verdict, responder) = self.evaluate_in(req, ctx).await;
         GateOutcome::new(verdict, responder)
     }
+    /// The answer of a ring-5 question that is known without waiting
+    /// (auto-answer rules): the driver opens the question already answered,
+    /// so clients never offer it to a human. (ADDITIVE)
+    fn auto_answer(&self, _req: &GateRequest) -> Option<(Answer, Responder)> {
+        None
+    }
 }
 
 /// An observer: event-stream subscriber with its own cursor. At-least-once

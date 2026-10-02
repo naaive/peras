@@ -31,6 +31,14 @@ impl Chat {
         Run::new(self.agent.clone(), Target::Open(self.id.clone()), text.into())
     }
 
+    /// Send a control to the session (e.g. `Control::SwitchModel` between
+    /// turns, `Control::ClearTaint` after review).
+    pub async fn control(&self, c: Control) -> Result<(), Error> {
+        let h = self.agent.open(&self.id).await?;
+        h.send(Input::Control(c)).await?;
+        Ok(())
+    }
+
     /// Next seq (useful as a rewind point).
     pub async fn next_seq(&self) -> Result<Seq, Error> {
         Ok(self.agent.open(&self.id).await?.next_seq())

@@ -45,6 +45,9 @@ pub(crate) enum Ctrl {
 #[derive(Debug)]
 pub struct Ask {
     pub question: Question,
+    /// What the question is about (a proposed call, a turn); `None` for
+    /// questions forwarded from a sub-agent.
+    pub subject: Option<GateRef>,
     tx: mpsc::UnboundedSender<Ctrl>,
 }
 
@@ -283,7 +286,7 @@ pub(crate) async fn drive(
     let mut forwarded_open = true;
     for question in h.asks().pending() {
         if question.id.0.starts_with(agent_runtime::FORWARDED_QUESTION_PREFIX) {
-            let _ = tx.send(Update::Ask(Ask { question, tx: ask_tx.clone() }));
+            let _ = tx.send(Update::Ask(Ask { question, subject: None, tx: ask_tx.clone() }));
         }
     }
     if let Err(e) = h.send(first).await {
@@ -292,6 +295,8 @@ pub(crate) async fn drive(
     }
     let mut ctrl_open = true;
     let mut pulses_open = true;
+    // Journaled questions not yet opened on the board.
+    let mut asked: std::collections::HashMap<QuestionId, GateRef> = std::collections::HashMap::new();
     loop {
         tokio::select! {
             ev = events.next() => {
@@ -299,13 +304,28 @@ pub(crate) async fn drive(
                     let _ = tx.send(Update::Done(TurnOutcome::Failed { error: "session closed".into() }));
                     return;
                 };
-                let (update, done) = map_event(ev, &ask_tx);
+                // A question reaches the client once it is known to need a
+                // human: open and unanswered on the board (auto-answered
+                // ones are answered as they open and never announced).
+                if let Event::QuestionAsked { question, subject } = &ev.body {
+                    if h.asks().pending().iter().any(|q| q.id == question.id) {
+                        let _ = tx.send(Update::Ask(Ask { question: question.clone(), subject: Some(subject.clone()), tx: ask_tx.clone() }));
+                    } else if !h.asks().is_answered(&question.id) {
+                        asked.insert(question.id.clone(), subject.clone());
+                    }
+                    continue;
+                }
+                let (update, done) = map_event(ev);
                 if let Some(u) = update { let _ = tx.send(u); }
                 if done { return; }
             }
             q = forwarded.recv(), if forwarded_open => match q {
                 Ok(question) if question.id.0.starts_with(agent_runtime::FORWARDED_QUESTION_PREFIX) => {
-                    let _ = tx.send(Update::Ask(Ask { question, tx: ask_tx.clone() }));
+                    let _ = tx.send(Update::Ask(Ask { question, subject: None, tx: ask_tx.clone() }));
+                }
+                Ok(question) if asked.contains_key(&question.id) => {
+                    let subject = asked.remove(&question.id);
+                    let _ = tx.send(Update::Ask(Ask { question, subject, tx: ask_tx.clone() }));
                 }
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => forwarded_open = false,
@@ -331,11 +351,10 @@ pub(crate) async fn drive(
     }
 }
 
-fn map_event(ev: Envelope<Event>, ask_tx: &mpsc::UnboundedSender<Ctrl>) -> (Option<Update>, bool) {
+fn map_event(ev: Envelope<Event>) -> (Option<Update>, bool) {
     match ev.body {
         Event::AssistantReplied { message, .. } => (Some(Update::Reply(message)), false),
         Event::ToolResulted { call, result } => (Some(Update::Tool { call, result }), false),
-        Event::QuestionAsked { question, .. } => (Some(Update::Ask(Ask { question, tx: ask_tx.clone() })), false),
         Event::TurnEnded { outcome } => (Some(Update::Done(outcome)), true),
         _ if ev.audience.user_visible() => (Some(Update::Event(Box::new(ev))), false),
         _ => (None, false),

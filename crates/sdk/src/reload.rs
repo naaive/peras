@@ -67,6 +67,9 @@ impl GateExecutor for ReloadableGates {
     async fn evaluate_outcome(&self, req: &GateRequest, ctx: &GateCtx) -> GateOutcome {
         self.current().evaluate_outcome(req, ctx).await
     }
+    fn auto_answer(&self, req: &GateRequest) -> Option<(Answer, Responder)> {
+        self.current().auto_answer(req)
+    }
 }
 
 /// What a reload needs besides the configuration.
