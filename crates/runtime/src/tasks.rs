@@ -1,10 +1,14 @@
 //! Background task registry: long-running commands, async sub-agents, timers.
 //! List, kill, timeout; output stored as a blob. Tasks may belong to a
 //! session: when one finishes, the registry's notifier is told (the runtime
-//! delivers it to the owning session as a notification).
+//! delivers it to the owning session as a notification). A task that declared
+//! writes ([`TaskRegistry::set_writes`]) changes the workspace while it runs:
+//! the checkpointer counts changes there as the agent's, and a rewind stops
+//! the task first. Killing or timing out a task cancels its token and gives
+//! it a short grace to stop (e.g. kill its process group) before dropping it.
 
 use crate::ports::BlobStore;
-use agent_proto::{BlobRef, SessionId, Trust};
+use agent_proto::{Access, BlobRef, SessionId, Trust};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -13,6 +17,10 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 pub type TaskId = u64;
+
+/// How long a killed or timed-out task may take to stop after its token is
+/// cancelled before it is dropped.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -46,6 +54,9 @@ struct Entry {
     owner: Option<SessionId>,
     /// Trust of the output (e.g. a sub-agent whose context was tainted).
     trust: Option<Trust>,
+    /// Declared writes of the task (its changes are the agent's while it
+    /// runs; a rewind stops it first).
+    writes: Vec<Access>,
     cancel: CancellationToken,
     status: watch::Sender<TaskStatus>,
 }
@@ -120,20 +131,38 @@ impl TaskRegistry {
         let name = name.into();
         self.tasks.lock().unwrap().insert(
             id,
-            Entry { name: name.clone(), owner: owner.clone(), trust: None, cancel: cancel.clone(), status: status.clone() },
+            Entry {
+                name: name.clone(),
+                owner: owner.clone(),
+                trust: None,
+                writes: vec![],
+                cancel: cancel.clone(),
+                status: status.clone(),
+            },
         );
         let blobs = self.blobs.clone();
         let notifier = self.notifier.clone();
         tokio::spawn(async move {
             let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
+            let mut fut = std::pin::pin!(fut);
+            let deadline = tokio::time::sleep(timeout);
             let r = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => TaskStatus::Killed,
-                r = tokio::time::timeout(timeout, fut) => match r {
-                    Err(_) => { cancel.cancel(); TaskStatus::TimedOut }
-                    Ok(Err(e)) => TaskStatus::Failed { error: e },
-                    Ok(Ok(bytes)) if bytes.is_empty() => TaskStatus::Done { output: None },
-                    Ok(Ok(bytes)) => match blobs.put(&bytes, Some("application/octet-stream")).await {
+                _ = cancel.cancelled() => {
+                    // Let the task observe its token (e.g. kill a process
+                    // group) before it is dropped.
+                    let _ = tokio::time::timeout(STOP_GRACE, &mut fut).await;
+                    TaskStatus::Killed
+                }
+                _ = deadline => {
+                    cancel.cancel();
+                    let _ = tokio::time::timeout(STOP_GRACE, &mut fut).await;
+                    TaskStatus::TimedOut
+                }
+                r = &mut fut => match r {
+                    Err(e) => TaskStatus::Failed { error: e },
+                    Ok(bytes) if bytes.is_empty() => TaskStatus::Done { output: None },
+                    Ok(bytes) => match blobs.put(&bytes, Some("application/octet-stream")).await {
                         Ok(b) => TaskStatus::Done { output: Some(b) },
                         Err(e) => TaskStatus::Failed { error: format!("storing output: {e}") },
                     },
@@ -169,6 +198,44 @@ impl TaskRegistry {
         if let Some(e) = self.tasks.lock().unwrap().get_mut(&id) {
             e.trust = Some(trust);
         }
+    }
+
+    /// Record the task's declared writes: while it runs they are the
+    /// agent's changes ([`TaskRegistry::write_scopes`]), and a rewind stops
+    /// it first ([`TaskRegistry::kill_writers`]).
+    pub fn set_writes(&self, id: TaskId, writes: Vec<Access>) {
+        if let Some(e) = self.tasks.lock().unwrap().get_mut(&id) {
+            e.writes = writes;
+        }
+    }
+
+    /// Declared writes of the running tasks (for change attribution: the
+    /// checkpointer counts changes there as the agent's).
+    pub fn write_scopes(&self) -> Vec<Access> {
+        let tasks = self.tasks.lock().unwrap();
+        let mut out: Vec<Access> = vec![];
+        for e in tasks.values().filter(|e| !e.status.borrow().is_finished()) {
+            for w in &e.writes {
+                if !out.contains(w) {
+                    out.push(w.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Stop the running tasks of `owner` that declared writes (before a
+    /// rewind restores the workspace). Returns their ids.
+    pub fn kill_writers(&self, owner: &SessionId) -> Vec<TaskId> {
+        let tasks = self.tasks.lock().unwrap();
+        let mut out = vec![];
+        for (id, e) in tasks.iter() {
+            if e.owner.as_ref() == Some(owner) && !e.writes.is_empty() && !e.status.borrow().is_finished() {
+                e.cancel.cancel();
+                out.push(*id);
+            }
+        }
+        out
     }
 
     /// The label set with [`TaskRegistry::set_trust`].

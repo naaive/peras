@@ -8,6 +8,20 @@
 //! [`SemanticTable`] (extended by `[[shell.commands]]` from the profile)
 //! classifies commands. `Bash::new(true)` returns such a [`BashTool`]
 //! directly; only use it when an OS sandbox enforces the spec.
+//!
+//! With `"background": true` the command runs as a background task of the
+//! session's task registry: the call returns at once with the task id; the
+//! output (stdout and stderr, then the exit code) is stored as a blob and
+//! read with `task_output`, the end is delivered to the session as a
+//! notification, `task_kill` stops it (its whole process group) and its
+//! timeout (default [`DEFAULT_BACKGROUND_TIMEOUT_MS`], at most
+//! [`MAX_BACKGROUND_TIMEOUT_MS`]) ends it as timed out. Gating is unchanged:
+//! the call is judged on its declared accesses before it starts, and while it
+//! runs its declared writes count as the agent's (change attribution) and a
+//! rewind stops it first. A background command is never run isolated
+//! (design: "Commands in isolated execution cannot be turned into background
+//! tasks"): its changes would land after the diff review, so an Opaque
+//! background command is approved before it runs instead of after.
 
 use crate::caps::{check_granted, compile_spec};
 use crate::shell::{self, Rule, SemanticTable, ShellAnalysis};
@@ -21,6 +35,9 @@ use std::sync::Arc;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
+/// Background commands: default and maximum timeout.
+pub const DEFAULT_BACKGROUND_TIMEOUT_MS: u64 = 1_800_000;
+pub const MAX_BACKGROUND_TIMEOUT_MS: u64 = 7_200_000;
 /// Outputs longer than this are spilled to a blob.
 pub const MAX_INLINE_OUTPUT: usize = 30_000;
 
@@ -60,6 +77,8 @@ struct BashInput {
     #[serde(default)]
     #[allow(dead_code)]
     description: Option<String>,
+    #[serde(default)]
+    background: bool,
 }
 
 fn parse_input(v: &Value) -> Result<BashInput, ToolError> {
@@ -134,9 +153,11 @@ impl BashTool {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The command line to run" },
-                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_MS,
-                                    "description": "Timeout in milliseconds (default 120000)" },
-                    "description": { "type": "string", "description": "Short description of what the command does" }
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BACKGROUND_TIMEOUT_MS,
+                                    "description": "Timeout in milliseconds (default 120000, at most 600000; in the background default 1800000, at most 7200000)" },
+                    "description": { "type": "string", "description": "Short description of what the command does" },
+                    "background": { "type": "boolean",
+                                    "description": "Run as a background task (servers, watchers, long builds): returns the task id at once; you are notified when it ends, read its output with task_output and stop it with task_kill" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -151,6 +172,9 @@ impl BashTool {
         let analysis = self.analyze(&inp.command, &ctx.workspace);
         for a in &analysis.accesses {
             check_granted(&ctx, a)?;
+        }
+        if inp.background {
+            return background(inp, analysis, ctx);
         }
         let timeout_ms = inp
             .timeout_ms
@@ -191,28 +215,12 @@ impl BashTool {
                 Err(_) => { cancel.cancel(); return Err(ToolError::Failed(format!("command timed out after {timeout_ms} ms"))) }
             },
         };
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.is_empty() {
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&stderr);
-        }
-        if text.is_empty() {
-            text.push_str("(no output)");
-        }
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
+        let mut text = output_text(&out);
         if out.timed_out {
             text.push_str(&format!("[timed out after {timeout_ms} ms]"));
             return Err(ToolError::Failed(text));
         }
-        match out.status {
-            Some(code) => text.push_str(&format!("[exit code {code}]")),
-            None => text.push_str("[terminated by signal]"),
-        }
+        push_status(&mut text, &out);
         let staged = if isolated {
             out.overlay_changes.clone()
         } else {
@@ -233,6 +241,118 @@ impl BashTool {
         output.staged = staged;
         Ok(output)
     }
+}
+
+/// stdout and stderr combined, ending with a newline.
+fn output_text(out: &agent_runtime::ExecOutput) -> String {
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    if text.is_empty() {
+        text.push_str("(no output)");
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+fn push_status(text: &mut String, out: &agent_runtime::ExecOutput) {
+    match out.status {
+        Some(code) => text.push_str(&format!("[exit code {code}]")),
+        None => text.push_str("[terminated by signal]"),
+    }
+}
+
+/// Start the command as a background task owned by the session (see the
+/// module docs). Never isolated: the task registry has no review step, so the
+/// changes of a background command are not staged.
+fn background(inp: BashInput, analysis: ShellAnalysis, ctx: ToolCtx) -> Result<ToolOutput, ToolError> {
+    if ctx.isolated {
+        // `isolated()` never asks for it; refuse rather than bypass the review.
+        return Err(ToolError::Failed(
+            "commands that run isolated cannot run in the background (their changes need review first)".into(),
+        ));
+    }
+    let Some(tasks) = ctx.tasks.clone() else {
+        return Err(ToolError::Failed("background tasks are not available here".into()));
+    };
+    let timeout_ms = inp
+        .timeout_ms
+        .unwrap_or(DEFAULT_BACKGROUND_TIMEOUT_MS)
+        .clamp(1, MAX_BACKGROUND_TIMEOUT_MS);
+    let read_only = analysis.class == EffectClass::Pure;
+    // The registry enforces the timeout (status "timed out"); the sandbox's
+    // own limit is only a backstop.
+    let mut spec = compile_spec(&ctx, timeout_ms + 10_000, !read_only);
+    if read_only {
+        spec.writable.clear();
+        spec.network.clear();
+    }
+    let trust = background_trust(&ctx, &analysis, &spec);
+    let writes: Vec<Access> = analysis.accesses.iter().filter(|a| a.mode == agent_proto::AccessMode::Write).cloned().collect();
+    let argv = vec!["bash".to_string(), "-c".to_string(), inp.command.clone()];
+    let sandbox = ctx.sandbox.clone();
+    let name = format!("bash: {}", one_line(&inp.command, 80));
+    let id = tasks.spawn_for(Some(ctx.session.clone()), name, Some(std::time::Duration::from_millis(timeout_ms)), move |cancel| async move {
+        // Cancelled (task_kill, timeout, rewind): the sandbox kills the
+        // command's process group.
+        let out = sandbox.run(&argv, &spec, cancel).await.map_err(|e| format!("failed to run command: {e}"))?;
+        let mut text = output_text(&out);
+        if out.timed_out {
+            return Err(format!("{text}[timed out]"));
+        }
+        push_status(&mut text, &out);
+        Ok(text.into_bytes())
+    });
+    if let Some(t) = trust {
+        tasks.set_trust(id, t);
+    }
+    if !writes.is_empty() {
+        tasks.set_writes(id, writes);
+    }
+    Ok(ToolOutput::text(format!(
+        "Started as background task {id} (timeout {timeout_ms} ms). You will be notified when it ends; read its \
+         output with task_output, stop it with task_kill."
+    )))
+}
+
+/// Output of a background command reaches the model later, through
+/// `task_output`, without this call's declared accesses: label it untrusted
+/// when the command could read untrusted content (the network, MCP, files
+/// outside the workspace). Content of an untrusted workspace is not
+/// recognized here (the tool does not know the workspace's trust).
+fn background_trust(ctx: &ToolCtx, analysis: &ShellAnalysis, spec: &agent_runtime::SandboxSpec) -> Option<agent_proto::Trust> {
+    if let Some(net) = spec.network.first() {
+        return Some(agent_proto::Trust::Untrusted { source: format!("net:{net}") });
+    }
+    let ws = ctx.workspace.to_string_lossy();
+    let ws = ws.trim_end_matches('/');
+    analysis.accesses.iter().find_map(|a| {
+        let outside = match a.resource.scheme() {
+            Some(agent_proto::Scheme::Net) | Some(agent_proto::Scheme::Mcp) => true,
+            Some(agent_proto::Scheme::Fs) => {
+                let p = a.resource.rest();
+                !(p == ws || p.starts_with(&format!("{ws}/")))
+            }
+            _ => false,
+        };
+        outside.then(|| agent_proto::Trust::Untrusted { source: a.resource.as_str().to_string() })
+    })
+}
+
+fn one_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("");
+    let mut out: String = line.chars().take(max).collect();
+    if out.len() < s.len() {
+        out.push_str("...");
+    }
+    out
 }
 
 /// At most 20 paths, then "and N more".
@@ -306,8 +426,10 @@ impl Tool for BashTool {
     }
     /// Opaque commands run isolated when the sandbox supports it ("execute
     /// isolated, then approve the diff" instead of asking first).
+    /// Background commands are never isolated (see the module docs).
     fn isolated(&self, input: &Value) -> bool {
-        self.isolation && self.class(input) == EffectClass::Opaque
+        let background = parse_input(input).is_ok_and(|i| i.background);
+        self.isolation && !background && self.class(input) == EffectClass::Opaque
     }
     async fn call(&self, input: Value, ctx: ToolCtx) -> Result<ToolOutput, ToolError> {
         self.run(input, ctx).await

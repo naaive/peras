@@ -381,6 +381,12 @@ pub trait Checkpointer: Send + Sync {
     async fn restore_originals(&self, _writes: &[Access]) -> Result<(), String> {
         Ok(())
     }
+    /// Count changes matching `writes` in the interval opened by the next
+    /// checkpoint as the agent's, without saving originals: the declared
+    /// writes of background tasks still running. Default: no-op. (ADDITIVE)
+    async fn declare_writes(&self, _writes: &[Access]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- clock / ids

@@ -511,6 +511,14 @@ pub async fn checkpoint(env: &Env, scope: &CheckpointScope) -> EffectResult {
 }
 
 async fn checkpoint_inner(env: &Env, scope: &CheckpointScope) -> EffectResult {
+    // Background tasks keep writing between checkpoints: their declared
+    // writes are the agent's changes for as long as they run.
+    let background = env.tasks.write_scopes();
+    if !background.is_empty() {
+        if let Err(e) = env.checkpointer.declare_writes(&background).await {
+            return EffectResult::Failed { error: format!("declare background writes: {e}") };
+        }
+    }
     if !scope.declared_writes.is_empty() {
         if let Err(e) = env.checkpointer.save_originals(&scope.declared_writes).await {
             return EffectResult::Failed { error: format!("save originals: {e}") };

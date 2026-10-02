@@ -892,6 +892,18 @@ impl Inner {
         self.persist(&st)
     }
 
+    fn declare_writes(&self, writes: &[Access]) -> Result<(), String> {
+        let mut st = self.state.lock().unwrap();
+        let before = st.staged_patterns.len();
+        st.staged_patterns.extend(writes.iter().filter(|a| a.mode == AccessMode::Write).filter_map(|a| self.rel(a)));
+        if st.staged_patterns.len() == before {
+            return Ok(());
+        }
+        st.staged_patterns.sort();
+        st.staged_patterns.dedup();
+        self.persist(&st)
+    }
+
     fn write_content(&self, rel: &str, sha: &Option<String>) -> Result<(), String> {
         let path = self.root.join(rel);
         match sha {
@@ -1102,6 +1114,11 @@ impl Checkpointer for ShadowCheckpointer {
     async fn save_originals(&self, writes: &[Access]) -> Result<(), String> {
         let writes = writes.to_vec();
         self.blocking(move |i| i.save_originals(&writes)).await
+    }
+
+    async fn declare_writes(&self, writes: &[Access]) -> Result<(), String> {
+        let writes = writes.to_vec();
+        self.blocking(move |i| i.declare_writes(&writes)).await
     }
 
     async fn restore(&self, plan: &RestorePlan) -> Result<RestoreReport, String> {

@@ -1244,6 +1244,12 @@ where
                 // workspace matches the journaled plan (idempotent on re-run).
                 flight.uncancellable = true;
                 spawn_in(span, async move {
+                    // Background tasks that write to the workspace are stopped
+                    // first (they would write over the restored files).
+                    let stopped = env.tasks.kill_writers(&session);
+                    for t in stopped {
+                        let _ = env.tasks.wait(t).await;
+                    }
                     let r = dispatch::restore(&env, &plan).await;
                     let _ = tx.send(Msg::Completed(id, r));
                 });

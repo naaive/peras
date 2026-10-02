@@ -418,6 +418,9 @@ impl Tool for Agent {
                 outcome_to_result(child.id(), outcome).map(String::into_bytes).map_err(|e| e.to_string())
             });
             let _ = id_cell.set(id);
+            // The child writes to the workspace while it runs: its changes are
+            // the agent's, and a rewind stops it first.
+            tasks.set_writes(id, self.access(&input, &AccessCtx { workspace: ctx.workspace.clone() })?);
             return Ok(ToolOutput::text(format!(
                 "Started sub-agent `{}` as background task {id}. You will be notified when it finishes; read its answer with task_output.",
                 self.cfg.name
