@@ -128,11 +128,12 @@ impl FsWatch {
     /// directory lies inside the workspace. Per-directory watches are added
     /// later through [`FsWatch::watch_dir`].
     pub fn start(root: &Path, store: &Path) -> Result<FsWatch, String> {
-        let name = format!("agent-shadow-fence-{}", ulid::Ulid::new());
+        let name = format!("{FENCE_PREFIX}{}-{}", std::process::id(), ulid::Ulid::new());
         let mut base = fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
         if base.starts_with(root) {
             base = store.to_path_buf();
         }
+        sweep_fences(&base);
         let fence_dir = base.join(name);
         fs::create_dir_all(&fence_dir).map_err(|e| format!("fence dir: {e}"))?;
         let fence_dir = fs::canonicalize(&fence_dir).unwrap_or(fence_dir);
@@ -215,8 +216,60 @@ impl FsWatch {
     }
 }
 
+const FENCE_PREFIX: &str = "agent-shadow-fence-";
+
+/// Removes fence directories left behind by processes that exited without
+/// dropping their watcher (a crash, or a test process that never drops it).
+fn sweep_fences(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(FENCE_PREFIX)) else { continue };
+        // Names without a pid predate it: their owner is unknown, leave them.
+        let Some(pid) = rest.split_once('-').and_then(|(p, _)| p.parse::<u32>().ok()) else { continue };
+        if !process_alive(pid) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
+    // Signal 0 checks existence; EPERM means it exists under another user.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 impl Drop for FsWatch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.fence_dir);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fence_tests {
+    use super::*;
+
+    #[test]
+    fn fences_of_exited_processes_are_swept() {
+        let base = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let stale = base.path().join(format!("{FENCE_PREFIX}{dead}-{}", ulid::Ulid::new()));
+        let live = base.path().join(format!("{FENCE_PREFIX}{}-{}", std::process::id(), ulid::Ulid::new()));
+        let legacy = base.path().join(format!("{FENCE_PREFIX}{}", ulid::Ulid::new()));
+        for d in [&stale, &live, &legacy] {
+            fs::create_dir_all(d).unwrap();
+        }
+        sweep_fences(base.path());
+        assert!(!stale.exists());
+        assert!(live.exists() && legacy.exists());
     }
 }

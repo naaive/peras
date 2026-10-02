@@ -136,6 +136,11 @@ mod tests {
         let other = File::open(a.path()).unwrap();
         assert!(!try_lock(&other).unwrap());
         drop((a, b));
+        // The release can lag while a concurrently forked child execs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !try_lock(&other).unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(try_lock(&other).unwrap(), "released with the last holder");
     }
 
@@ -156,6 +161,14 @@ mod tests {
         );
         assert!(e.to_string().contains("separate git worktrees"), "{e}");
         drop(other);
-        assert!(WorkspaceLock::acquire(ws.path(), dir.path()).is_ok(), "the lease ended with its holder");
+        // A child forked concurrently by another test shares the descriptor
+        // until it execs (close-on-exec), so the release can lag briefly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got = WorkspaceLock::acquire(ws.path(), dir.path());
+        while got.is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            got = WorkspaceLock::acquire(ws.path(), dir.path());
+        }
+        assert!(got.is_ok(), "the lease ended with its holder");
     }
 }
