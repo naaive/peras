@@ -29,12 +29,13 @@ mod gate;
 mod hooks;
 mod observe;
 mod rebuild;
+mod reload;
 mod run;
 mod session;
 mod subagent;
 mod tool_set;
 
-pub use crate::agent::{Agent, Memory, Sqlite};
+pub use crate::agent::{Agent, Memory, Sqlite, MEMORY_SCOPES};
 pub use crate::error::Error;
 pub use crate::gate::Proposal;
 pub use crate::observe::{Observed, ToolFailed, ToolFinished, TurnFinished};
