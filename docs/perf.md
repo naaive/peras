@@ -60,7 +60,31 @@ Criterion (`cargo bench -p agent-bench`), same machine:
 | Framework overhead to first token, SQLite journal | p99 < 50 ms | mean 1.5 ms, p99 7.9 ms | mean 1.2 ms, **p99 4.0 ms** | within budget |
 | Journal size, 10,059-event session | (none) | 362 MB (348 MB in sample effects) | **10.5 MB** (0.28 MB in sample/compact effects) | linear |
 
-The shadow snapshot is unaffected by this change (see below).
+The shadow snapshot is unaffected by this change; it changed with the file
+watcher (next section).
+
+### Safe-point snapshot with the file watcher (2026-10-02)
+
+Re-measured after the watcher (`runtime/src/shadow/watch.rs`, inotify through
+`notify`; on by default in `ShadowCheckpointer::new`) at the design's scale:
+`AGENT_BENCH_FILES=100000 cargo bench -p agent-bench --bench budgets -- shadow`,
+release, rustc 1.97.0, workspace and store in the system temp dir (same
+ext4 disk), inotify `max_user_watches` 130057 (the workspace has about 500
+tracked directories).
+
+| Metric | Budget | Before (scan, no watcher) | With the watcher | Verdict |
+| --- | --- | --- | --- | --- |
+| Safe-point snapshot, incremental, 100k files, 3 touched | p99 < 200 ms | mean 452 ms, p99 540 ms | mean 51 ms, p50 47 ms, **p99 123 ms**, max 154 ms (n = 528) | within budget |
+| First full scan, 100k files | (none) | 13.5 s mean | 31 s mean, p50 40 s, max 48 s (n = 11) | one-off per store |
+
+Another agent was compiling on this 4-core VM during the run (load average
+about 2), so these are upper bounds. That contention, not the watcher,
+is the likely cause of the slower first scan: the first scan does the same
+work as before plus adding one inotify watch per tracked directory, and its
+spread (23 s to 48 s) follows the machine load. The criterion means were
+50.7 ms (incremental) and 33.6 s (first scan); criterion warned that 10 / 30
+samples did not fit its 20 s target, so its own estimates are coarse; the
+`[budget]` lines above come from every timed iteration.
 
 The budget test (`tests/budgets.rs`, release, `AGENT_BENCH_REPORT_ONLY=1`)
 agrees: kernel p99 0.34 ms (0.46 ms before the chunked lists, 1.7 to 1.9 ms
@@ -139,10 +163,15 @@ load + fold 5.3 s, first token p99 7.6 ms (memory) and 11.2 ms (SQLite).
    also re-copied in full every 512 events). They are now split into shared
    chunks, so a clone is proportional to the live context, not to the session.
    The fold of 10k events went from 182 ms to 21 ms for the same reasons.
-3. **The shadow scan is linear in workspace size** because it does not use a
-   file watcher. At 20k files it takes 78 ms, within budget. At 100k files it
-   takes 450 ms, over budget. The design's 100k budget assumes that file
-   watching is available, and the watcher has not been implemented yet.
+3. **The incremental snapshot needed the file watcher (fixed).** Without one,
+   each safe point re-scanned the workspace metadata, linear in its size: 78 ms
+   at 20k files, 450 ms (p99 540 ms) at 100k, over budget. The design's 100k
+   budget assumes file watching; with the watcher (commit 18a7969) a safe
+   point only re-stats the dirty paths and takes p99 123 ms at 100k files
+   (see "Safe-point snapshot with the file watcher"). When the watcher is
+   unavailable or loses events (queue overflow, watch limit) the checkpoint
+   falls back to the full scan, so that path still costs the old ~450 ms at
+   100k files.
 4. **First-token overhead is well within budget.** The SQLite journal was
    faster here than `MemJournal` before the change, because `MemJournal`
    round-trips every appended envelope through JSON by default and the
