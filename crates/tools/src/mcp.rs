@@ -1,5 +1,9 @@
-//! Minimal MCP client over stdio (JSON-RPC 2.0, newline-delimited messages):
-//! `initialize`, `notifications/initialized`, `tools/list`, `tools/call`.
+//! Minimal MCP client (JSON-RPC 2.0): `initialize`,
+//! `notifications/initialized`, `tools/list`, `tools/call`. Transports:
+//! stdio (a child process, newline-delimited messages), Streamable HTTP
+//! (messages POSTed to one endpoint, responses as JSON or an SSE stream, the
+//! `Mcp-Session-Id` the server assigns sent back) and, for servers that refuse
+//! it, HTTP+SSE (a GET event stream announcing a POST endpoint).
 //!
 //! Each remote tool is wrapped as an [`McpTool`] declaring `mcp:<server>/<tool>`
 //! (write), class `Network` by default, with results labelled
@@ -17,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+use futures::StreamExt;
 use tokio::sync::oneshot;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -33,6 +38,8 @@ pub enum McpError {
     Closed,
     #[error("request timed out")]
     Timeout,
+    #[error("http status {status}: {message}")]
+    Http { status: u16, message: String },
 }
 
 // ------------------------------------------------------------------ framing
@@ -146,15 +153,53 @@ pub struct McpCallResult {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, McpError>>>>>;
 
-/// A connection to one MCP server process.
+/// How messages reach the server.
+enum Transport {
+    /// A child process: newline-delimited JSON-RPC on stdin / stdout.
+    Stdio {
+        stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+        _child: tokio::sync::Mutex<Child>,
+    },
+    /// Streamable HTTP: every message is POSTed to the endpoint; a request's
+    /// response comes back as a JSON body or as an SSE stream.
+    Http(HttpTransport),
+    /// HTTP+SSE (the earlier remote transport): a long-lived GET event stream
+    /// carries the server's messages; client messages are POSTed to the
+    /// endpoint the stream announces.
+    Sse {
+        http: reqwest::Client,
+        endpoint: String,
+        headers: Vec<(String, String)>,
+        reader: tokio::task::JoinHandle<()>,
+    },
+}
+
+impl Drop for Transport {
+    fn drop(&mut self) {
+        if let Transport::Sse { reader, .. } = self {
+            reader.abort();
+        }
+    }
+}
+
+struct HttpTransport {
+    http: reqwest::Client,
+    url: String,
+    headers: Vec<(String, String)>,
+    /// `Mcp-Session-Id` assigned by the server at initialization.
+    session: Mutex<Option<String>>,
+    /// Negotiated protocol version (sent as `MCP-Protocol-Version`).
+    version: Mutex<Option<String>>,
+}
+
+/// A connection to one MCP server (a child process or a remote endpoint).
 pub struct McpClient {
     server: String,
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    transport: Transport,
     pending: Pending,
     next_id: AtomicU64,
     timeout: Duration,
     server_info: Mutex<Value>,
-    _child: tokio::sync::Mutex<Child>,
 }
 
 impl std::fmt::Debug for McpClient {
@@ -165,7 +210,189 @@ impl std::fmt::Debug for McpClient {
     }
 }
 
+/// Route a response to its waiter.
+fn deliver(pending: &Pending, id: &Value, result: Result<Value, McpError>) {
+    if let Some(id) = id.as_u64() {
+        if let Some(tx) = pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+fn fail_all(pending: &Pending, e: McpError) {
+    for (_, tx) in pending.lock().unwrap_or_else(|e| e.into_inner()).drain() {
+        let _ = tx.send(Err(e.clone()));
+    }
+}
+
+/// The reply to a server-initiated request: `ping` is answered, anything else
+/// is not supported by this client.
+fn reply_to(id: &Value, method: &str) -> String {
+    if method == "ping" {
+        encode_response(id, Ok(json!({})))
+    } else {
+        encode_response(id, Err((-32601, "method not found")))
+    }
+}
+
+/// Incremental parser of a `text/event-stream` body.
+#[derive(Debug, Default)]
+pub struct SseParser {
+    buf: String,
+}
+
+/// One server-sent event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    /// `event:` field (`message` when absent).
+    pub event: String,
+    /// `data:` lines joined with newlines.
+    pub data: String,
+}
+
+impl SseParser {
+    /// Feed text; returns the events it completed.
+    pub fn push(&mut self, chunk: &str) -> Vec<SseEvent> {
+        self.buf.push_str(&chunk.replace("\r\n", "\n"));
+        let mut out = Vec::new();
+        while let Some(end) = self.buf.find("\n\n") {
+            let block: String = self.buf.drain(..end + 2).collect();
+            let mut event = String::from("message");
+            let mut data: Vec<&str> = Vec::new();
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("data:") {
+                    data.push(v.strip_prefix(' ').unwrap_or(v));
+                } else if let Some(v) = line.strip_prefix("event:") {
+                    event = v.trim().to_string();
+                }
+            }
+            if !data.is_empty() {
+                out.push(SseEvent {
+                    event,
+                    data: data.join("\n"),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// JSON-RPC messages of a body: one object or a batch array.
+fn messages_of(body: &str) -> Vec<Result<Incoming, McpError>> {
+    match serde_json::from_str::<Value>(body) {
+        Ok(Value::Array(items)) => items
+            .iter()
+            .map(|v| decode_line(&v.to_string()))
+            .collect(),
+        Ok(v) => vec![decode_line(&v.to_string())],
+        Err(e) => vec![Err(McpError::Protocol(format!("bad json: {e}")))],
+    }
+}
+
+impl HttpTransport {
+    fn post(&self, body: String) -> reqwest::RequestBuilder {
+        let mut rb = self
+            .http
+            .post(&self.url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .body(body);
+        for (k, v) in &self.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        if let Some(s) = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            rb = rb.header("Mcp-Session-Id", s);
+        }
+        if let Some(v) = self.version.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            rb = rb.header("MCP-Protocol-Version", v);
+        }
+        rb
+    }
+
+    async fn send(&self, body: String) -> Result<reqwest::Response, McpError> {
+        let resp = self
+            .post(body)
+            .send()
+            .await
+            .map_err(|e| McpError::Io(e.to_string()))?;
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
+        }
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let message = resp.text().await.unwrap_or_default();
+            return Err(McpError::Http { status, message });
+        }
+        Ok(resp)
+    }
+
+    /// POST a request and wait for the response with `id`, in a JSON body or
+    /// on an SSE stream (server requests on the stream are answered).
+    async fn request(&self, id: u64, body: String) -> Result<Value, McpError> {
+        let resp = self.send(body).await?;
+        let sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.starts_with("text/event-stream"));
+        let want = json!(id);
+        if !sse {
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| McpError::Io(e.to_string()))?;
+            for m in messages_of(&text) {
+                if let Ok(Incoming::Response { id: rid, result }) = m {
+                    if rid == want {
+                        return result;
+                    }
+                }
+            }
+            return Err(McpError::Protocol(format!("no response to request {id}")));
+        }
+        let mut parser = SseParser::default();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| McpError::Io(e.to_string()))?;
+            for ev in parser.push(&String::from_utf8_lossy(&chunk)) {
+                match decode_line(&ev.data) {
+                    Ok(Incoming::Response { id: rid, result }) if rid == want => return result,
+                    Ok(Incoming::Request {
+                        id: rid, method, ..
+                    }) => {
+                        let _ = self.send(reply_to(&rid, &method)).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(McpError::Closed)
+    }
+}
+
 impl McpClient {
+    fn new(server: &str, transport: Transport, pending: Pending) -> Arc<McpClient> {
+        Arc::new(McpClient {
+            server: server.to_string(),
+            transport,
+            pending,
+            next_id: AtomicU64::new(1),
+            timeout: Duration::from_secs(120),
+            server_info: Mutex::new(Value::Null),
+        })
+    }
+
     /// Spawn `program args...` and perform the `initialize` handshake.
     pub async fn spawn(
         server: &str,
@@ -204,41 +431,138 @@ impl McpClient {
                     continue;
                 }
                 match decode_line(&line) {
-                    Ok(Incoming::Response { id, result }) => {
-                        if let Some(id) = id.as_u64() {
-                            if let Some(tx) =
-                                p.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
-                            {
-                                let _ = tx.send(result);
-                            }
-                        }
-                    }
+                    Ok(Incoming::Response { id, result }) => deliver(&p, &id, result),
                     Ok(Incoming::Request { id, method, .. }) => {
-                        let reply = if method == "ping" {
-                            encode_response(&id, Ok(json!({})))
-                        } else {
-                            encode_response(&id, Err((-32601, "method not found")))
-                        };
+                        let reply = reply_to(&id, &method);
                         let _ = w.lock().await.write_all(reply.as_bytes()).await;
                     }
                     Ok(Incoming::Notification { .. }) | Err(_) => {}
                 }
             }
-            for (_, tx) in p.lock().unwrap_or_else(|e| e.into_inner()).drain() {
-                let _ = tx.send(Err(McpError::Closed));
-            }
+            fail_all(&p, McpError::Closed);
         });
 
-        let client = Arc::new(McpClient {
-            server: server.to_string(),
+        let transport = Transport::Stdio {
             stdin,
-            pending,
-            next_id: AtomicU64::new(1),
-            timeout: Duration::from_secs(120),
-            server_info: Mutex::new(Value::Null),
             _child: tokio::sync::Mutex::new(child),
+        };
+        let client = McpClient::new(server, transport, pending);
+        client.initialize().await?;
+        Ok(client)
+    }
+
+    /// Connect to a remote server at `url` and perform the `initialize`
+    /// handshake. Streamable HTTP is tried first; a server that refuses the
+    /// POST with 400 / 404 / 405 is spoken to over HTTP+SSE (a GET event
+    /// stream). `headers` go with every request (e.g. authorization).
+    pub async fn connect(
+        server: &str,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Arc<McpClient>, McpError> {
+        let http = reqwest::Client::builder()
+            .build()
+            .map_err(|e| McpError::Io(e.to_string()))?;
+        let t = HttpTransport {
+            http: http.clone(),
+            url: url.to_string(),
+            headers: headers.to_vec(),
+            session: Mutex::new(None),
+            version: Mutex::new(None),
+        };
+        let client = McpClient::new(server, Transport::Http(t), Arc::default());
+        match client.initialize().await {
+            Ok(()) => Ok(client),
+            Err(McpError::Http { status: 400 | 404 | 405, .. }) => {
+                McpClient::connect_sse(server, url, headers, http).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn connect_sse(
+        server: &str,
+        url: &str,
+        headers: &[(String, String)],
+        http: reqwest::Client,
+    ) -> Result<Arc<McpClient>, McpError> {
+        let mut rb = http
+            .get(url)
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        for (k, v) in headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        let resp = rb.send().await.map_err(|e| McpError::Io(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(McpError::Http {
+                status: resp.status().as_u16(),
+                message: "event stream refused".into(),
+            });
+        }
+        let base = url::Url::parse(url).map_err(|e| McpError::Protocol(e.to_string()))?;
+        let pending: Pending = Arc::default();
+        let (ep_tx, ep_rx) = oneshot::channel::<String>();
+        let (p, h2, hdrs) = (pending.clone(), http.clone(), headers.to_vec());
+        let reader = tokio::spawn(async move {
+            let mut ep_tx = Some(ep_tx);
+            let mut endpoint: Option<String> = None;
+            let mut parser = SseParser::default();
+            let mut stream = resp.bytes_stream();
+            while let Some(Ok(chunk)) = stream.next().await {
+                for ev in parser.push(&String::from_utf8_lossy(&chunk)) {
+                    if ev.event == "endpoint" {
+                        let ep = base
+                            .join(ev.data.trim())
+                            .map(|u| u.to_string())
+                            .unwrap_or(ev.data);
+                        endpoint = Some(ep.clone());
+                        if let Some(tx) = ep_tx.take() {
+                            let _ = tx.send(ep);
+                        }
+                        continue;
+                    }
+                    match decode_line(&ev.data) {
+                        Ok(Incoming::Response { id, result }) => deliver(&p, &id, result),
+                        Ok(Incoming::Request { id, method, .. }) => {
+                            if let Some(ep) = &endpoint {
+                                let mut rb = h2
+                                    .post(ep)
+                                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                    .body(reply_to(&id, &method));
+                                for (k, v) in &hdrs {
+                                    rb = rb.header(k.as_str(), v.as_str());
+                                }
+                                let _ = rb.send().await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            fail_all(&p, McpError::Closed);
         });
-        let info = client
+        let endpoint = match tokio::time::timeout(Duration::from_secs(30), ep_rx).await {
+            Ok(Ok(ep)) => ep,
+            _ => {
+                reader.abort();
+                return Err(McpError::Protocol(
+                    "event stream announced no endpoint".into(),
+                ));
+            }
+        };
+        let transport = Transport::Sse {
+            http,
+            endpoint,
+            headers: headers.to_vec(),
+            reader,
+        };
+        let client = McpClient::new(server, transport, pending);
+        client.initialize().await?;
+        Ok(client)
+    }
+
+    async fn initialize(&self) -> Result<(), McpError> {
+        let info = self
             .request(
                 "initialize",
                 json!({
@@ -248,11 +572,24 @@ impl McpClient {
                 }),
             )
             .await?;
-        *client.server_info.lock().unwrap_or_else(|e| e.into_inner()) = info;
-        client
-            .notify("notifications/initialized", json!({}))
-            .await?;
-        Ok(client)
+        if let Transport::Http(h) = &self.transport {
+            let v = info
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(PROTOCOL_VERSION);
+            *h.version.lock().unwrap_or_else(|e| e.into_inner()) = Some(v.to_string());
+        }
+        *self.server_info.lock().unwrap_or_else(|e| e.into_inner()) = info;
+        self.notify("notifications/initialized", json!({})).await
+    }
+
+    /// The transport in use: `stdio`, `http` (Streamable HTTP) or `sse`.
+    pub fn transport(&self) -> &'static str {
+        match &self.transport {
+            Transport::Stdio { .. } => "stdio",
+            Transport::Http(_) => "http",
+            Transport::Sse { .. } => "sse",
+        }
     }
 
     pub fn server(&self) -> &str {
@@ -267,16 +604,53 @@ impl McpClient {
             .clone()
     }
 
+    /// Send one message on a transport whose responses arrive out of band
+    /// (stdio, HTTP+SSE), or a notification on any transport.
     async fn write(&self, s: &str) -> Result<(), McpError> {
-        let mut w = self.stdin.lock().await;
-        w.write_all(s.as_bytes())
-            .await
-            .map_err(|e| McpError::Io(e.to_string()))?;
-        w.flush().await.map_err(|e| McpError::Io(e.to_string()))
+        match &self.transport {
+            Transport::Stdio { stdin, .. } => {
+                let mut w = stdin.lock().await;
+                w.write_all(s.as_bytes())
+                    .await
+                    .map_err(|e| McpError::Io(e.to_string()))?;
+                w.flush().await.map_err(|e| McpError::Io(e.to_string()))
+            }
+            Transport::Sse {
+                http,
+                endpoint,
+                headers,
+                ..
+            } => {
+                let mut rb = http
+                    .post(endpoint)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(s.trim_end().to_string());
+                for (k, v) in headers {
+                    rb = rb.header(k.as_str(), v.as_str());
+                }
+                let resp = rb.send().await.map_err(|e| McpError::Io(e.to_string()))?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(McpError::Http {
+                        status: resp.status().as_u16(),
+                        message: resp.text().await.unwrap_or_default(),
+                    })
+                }
+            }
+            Transport::Http(h) => h.send(s.trim_end().to_string()).await.map(|_| ()),
+        }
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Transport::Http(h) = &self.transport {
+            let body = encode_request(id, method, params).trim_end().to_string();
+            return match tokio::time::timeout(self.timeout, h.request(id, body)).await {
+                Ok(r) => r,
+                Err(_) => Err(McpError::Timeout),
+            };
+        }
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
@@ -466,7 +840,7 @@ impl Tool for McpTool {
             staged: vec![],
             content,
             trust,
-            observed: vec![],
+            ..Default::default()
         })
     }
 }

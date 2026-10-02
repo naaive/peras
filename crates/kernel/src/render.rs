@@ -335,6 +335,8 @@ mod tests {
             is_error: false,
             trust: Trust::Internal,
             observed: vec![],
+            subagent: None,
+            instructions: vec![],
         };
         let out = render(&r, &prof, &Trust::Internal, &Event::ToolResulted { call, result }).unwrap();
         let s = serde_json::to_string(&out).unwrap();

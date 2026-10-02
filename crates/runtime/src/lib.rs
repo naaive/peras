@@ -9,6 +9,7 @@
 //! - [`registry`] — [`ToolRegistry`].
 //! - [`shadow`] — [`ShadowCheckpointer`] (content-addressed shadow snapshots).
 //! - [`tasks`] — background [`TaskRegistry`].
+//! - [`watch`] — [`ConfigWatcher`] for configuration hot reload.
 //! - [`mem`] — in-memory / null port implementations for tests and simulation.
 //! - [`metrics`] — [`Metrics`] (counters and histograms, `snapshot()`).
 //! - [`snapshot`] — [`JsonCodec`], a [`StateCodec`] for serde states.
@@ -34,12 +35,13 @@ pub mod registry;
 pub mod shadow;
 pub mod snapshot;
 pub mod tasks;
+pub mod watch;
 
 pub use assemble::Assembler;
 pub use cursors::{FileCursors, MemCursors};
-pub use dispatch::{Env, ObserverResume, RuntimeOptions};
+pub use dispatch::{Env, InstructionScan, ObserverResume, RuntimeOptions};
 pub use driver::{Applied, DriverError, Runtime, RuntimeBuilder, SessionHandle};
-pub use gate::{AnswerError, AskBoard, AutoRule, FnHook, FnRule, GateChain, Hook};
+pub use gate::{AnswerError, AskBoard, AutoRule, FnHook, FnRule, GateChain, Hook, FORWARDED_QUESTION_PREFIX};
 pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, RuleStats};
 pub use lock::{LockError, WorkspaceLock};
 pub use mem::*;
@@ -48,4 +50,5 @@ pub use redact::{RedactingBlobs, RedactingSecrets, Redactor};
 pub use registry::ToolRegistry;
 pub use shadow::ShadowCheckpointer;
 pub use snapshot::JsonCodec;
-pub use tasks::{TaskId, TaskInfo, TaskRegistry, TaskStatus};
+pub use tasks::{TaskId, TaskInfo, TaskNotifier, TaskRegistry, TaskStatus};
+pub use watch::{ConfigWatcher, WatchSpec};

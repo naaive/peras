@@ -223,6 +223,8 @@ pub struct ToolOutput {
     /// Isolated runs: workspace-relative paths changed and staged (merged
     /// only after review). (ADDITIVE)
     pub staged: Vec<String>,
+    /// Sub-agent tools: the child's outcome and usage (ADDITIVE).
+    pub subagent: Option<Box<SubagentReport>>,
 }
 
 impl ToolOutput {
@@ -258,6 +260,9 @@ pub struct ToolCtx {
     /// The call was approved to run isolated ([`Tool::isolated`]): run it with
     /// [`SandboxPort::run_staged`] under [`staged_key`]. (ADDITIVE)
     pub isolated: bool,
+    /// Background task registry (long-running work, background sub-agents)
+    /// (ADDITIVE).
+    pub tasks: Option<Arc<crate::tasks::TaskRegistry>>,
 }
 
 pub trait SecretSource: Send + Sync {
@@ -312,6 +317,11 @@ pub trait SubagentSpawner: Send + Sync {
         task: String,
         tainted_input: bool,
     ) -> Result<(TurnOutcome, bool), ToolError>;
+    /// The concrete spawner, for embedders that link sub-agent tools to the
+    /// parent runtime (ADDITIVE).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------- gates

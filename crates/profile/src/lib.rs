@@ -20,9 +20,14 @@
 //!   are set only by Managed / Cli / User; project layers may only tighten, and
 //!   loosening attempts are ignored with a [`Warning`];
 //! - `locked = [..]` in the managed file freezes keys for all other layers;
-//! - untrusted workspace: project hooks, MCP servers, commands, agents, system
+//! - untrusted workspace: project hooks, observers, MCP servers, commands, agents, system
 //!   additions and non-deny permission rules are dropped (with warnings), and
 //!   project instruction files / skills are marked untrusted.
+//!
+//! Plugins (`~/.agent/plugins/<p>/plugin.toml`, `.agent/plugins/<p>/plugin.toml`)
+//! are versioned bundles of hooks, MCP servers, observers, skills, commands,
+//! sub-agents and instruction files; [`compile`] merges each into the layer it
+//! is installed in (user / shared project), so the rules above apply to it.
 
 pub mod compile;
 pub mod frontmatter;
@@ -35,7 +40,10 @@ pub use compile::{accepts_sensitive, compile, is_project, on_ask_strictness, str
 pub use instructions::{apply_budget, InstructionFile, DEFAULT_INSTRUCTION_BUDGET};
 pub use profile::*;
 pub use settings::*;
-pub use sources::{discover, find_project_root, DiscoverOptions, Scope, SourceFile, Sources};
+pub use sources::{
+    config_locations, discover, find_project_root, is_config_path, DiscoverOptions, PluginSource, Scope, SourceFile,
+    Sources, INSTRUCTION_FILES, PLUGIN_MANIFEST,
+};
 
 /// Discover and compile in one go.
 pub fn load(opts: &DiscoverOptions) -> Result<Profile, LoadError> {

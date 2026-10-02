@@ -51,6 +51,107 @@ pub struct Sources {
     /// Tool specs known at compile time (usually filled later via `Profile::with_tools`).
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
+    /// Plugin bundles (`~/.agent/plugins/*`, `.agent/plugins/*`), user first.
+    #[serde(default)]
+    pub plugins: Vec<PluginSource>,
+}
+
+/// A discovered plugin directory: its manifest and bundled files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSource {
+    /// Plugin directory.
+    pub path: String,
+    pub scope: Scope,
+    /// `plugin.toml` text.
+    pub manifest: String,
+    #[serde(default)]
+    pub instructions: Vec<SourceFile>,
+    #[serde(default)]
+    pub skills: Vec<SourceFile>,
+    #[serde(default)]
+    pub commands: Vec<SourceFile>,
+    #[serde(default)]
+    pub agents: Vec<SourceFile>,
+}
+
+/// Plugin manifest file name.
+pub const PLUGIN_MANIFEST: &str = "plugin.toml";
+
+fn collect_plugins(dir: &Path, scope: Scope, out: &mut Vec<PluginSource>) -> io::Result<()> {
+    for p in sorted_entries(dir)? {
+        let Some(manifest) = read_opt(&p.join(PLUGIN_MANIFEST))? else { continue };
+        let mut ps = PluginSource { path: lossy(&p), scope, manifest, ..Default::default() };
+        for name in INSTRUCTION_FILES {
+            if let Some(t) = read_opt(&p.join(name))? {
+                ps.instructions.push(SourceFile::new(lossy(&p.join(name)), scope, t));
+            }
+        }
+        collect_skills(&p.join("skills"), scope, &mut ps.skills)?;
+        collect_md(&p.join("commands"), scope, &mut ps.commands)?;
+        collect_md(&p.join("agents"), scope, &mut ps.agents)?;
+        out.push(ps);
+    }
+    Ok(())
+}
+
+impl Default for PluginSource {
+    fn default() -> Self {
+        PluginSource {
+            path: String::new(),
+            scope: Scope::Project,
+            manifest: String::new(),
+            instructions: vec![],
+            skills: vec![],
+            commands: vec![],
+            agents: vec![],
+        }
+    }
+}
+
+/// Every location whose change affects the compiled profile (for hot reload):
+/// `(path, recursive)`. Directories that do not exist yet are included.
+pub fn config_locations(opts: &DiscoverOptions) -> Vec<(PathBuf, bool)> {
+    let cwd = std::fs::canonicalize(&opts.cwd).unwrap_or_else(|_| opts.cwd.clone());
+    let root = match &opts.project_root {
+        Some(r) => std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()),
+        None => find_project_root(&cwd),
+    };
+    let mut out = vec![];
+    if let Some(m) = &opts.managed_path {
+        out.push((m.clone(), false));
+    }
+    let mut agent_dirs = vec![root.join(".agent")];
+    if let Some(h) = &opts.home {
+        agent_dirs.push(h.join(".agent"));
+    }
+    for d in agent_dirs {
+        out.push((d.clone(), false));
+        for sub in ["skills", "commands", "agents", "plugins"] {
+            out.push((d.join(sub), true));
+        }
+    }
+    out.push((root.clone(), false));
+    if let Ok(rel) = cwd.strip_prefix(&root) {
+        let mut d = root.clone();
+        for c in rel.components() {
+            d = d.join(c);
+            out.push((d.clone(), false));
+        }
+    }
+    out
+}
+
+/// Whether a changed path can affect the compiled profile.
+pub fn is_config_path(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if INSTRUCTION_FILES.contains(&name) || name == PLUGIN_MANIFEST || (name.ends_with(".toml") && name.starts_with("settings")) {
+        return true;
+    }
+    if name == "managed.toml" {
+        return true;
+    }
+    let in_ext = p.components().any(|c| matches!(c.as_os_str().to_str(), Some("skills" | "commands" | "agents" | "plugins")));
+    in_ext && p.components().any(|c| c.as_os_str() == ".agent") && (name.ends_with(".md") || name.ends_with(".toml"))
 }
 
 /// Instruction file names, in the order they are collected within a directory.
@@ -207,5 +308,9 @@ pub fn discover(opts: &DiscoverOptions) -> io::Result<Sources> {
     collect_skills(&pdir.join("skills"), Scope::Project, &mut s.skills)?;
     collect_md(&pdir.join("commands"), Scope::Project, &mut s.commands)?;
     collect_md(&pdir.join("agents"), Scope::Project, &mut s.agents)?;
+    if let Some(u) = &udir {
+        collect_plugins(&u.join("plugins"), Scope::User, &mut s.plugins)?;
+    }
+    collect_plugins(&pdir.join("plugins"), Scope::Project, &mut s.plugins)?;
     Ok(s)
 }

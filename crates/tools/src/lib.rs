@@ -28,12 +28,15 @@ pub mod __private;
 
 pub use agent_macros::{agent_test, tool};
 pub use bash::{Bash, BashTool};
-pub use builtin::{edit, glob, grep, read, remember, web_fetch, write, LoadSkill, Recall};
+pub use builtin::{
+    edit, glob, grep, read, remember, web_fetch, write, LoadSkill, Recall, SkillLoader, TaskKill, TaskList,
+    TaskOutput,
+};
 pub use caps::{
     Capability, Cmd, Dir, Exec, File, Get, Key, Mem, Name, Net, Observations, Read, Secret, Url,
     Write,
 };
-pub use mcp::{McpClient, McpError, McpTool};
+pub use mcp::{McpClient, McpError, McpTool, SseEvent, SseParser};
 pub use schemars;
 pub use shell::{SemanticTable, ShellAnalysis};
 

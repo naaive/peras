@@ -15,10 +15,15 @@
 //! idle); Ctrl+D on empty input = quit; PgUp / PgDn = scroll; Ctrl+U = clear
 //! input. With an approval pending and empty input: y = allow, a = allow
 //! always, n = deny with a reason (Enter sends, Esc cancels).
+//!
+//! Slash commands: `/help`, `/quit`, `/pause`, `/resume`, `/interrupt`,
+//! `/model <id>` and `/clear-taint` are local actions; any other `/name args`
+//! is one of the server's commands (the profile's command table, listed by
+//! `/help`), expanded by the server into its template.
 
 pub mod app;
 pub mod model;
 pub mod ui;
 
 pub use app::{in_process, run, ws, Connect};
-pub use model::{Action, Entry, InputMode, Model, Phase};
+pub use model::{Action, Entry, InputMode, Model, Phase, LOCAL_COMMANDS};

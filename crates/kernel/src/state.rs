@@ -23,6 +23,21 @@ pub const OVERFLOW_KIND: &str = "kernel.context_overflow";
 /// (data: `{"signal": <Signal>, "reason": <String>}`), e.g. a wake whose
 /// continuation budget is exhausted with no user input queued to reset it.
 pub const SIGNAL_DROPPED_KIND: &str = "kernel.signal_dropped";
+/// `Event::Plugin` kind (first events of a sub-agent session) carrying the
+/// parent's taint at spawn time (data: `{"tainted", "labels", "private_read"}`):
+/// taint propagates from the parent's context into the child's.
+pub const TAINT_INHERITED_KIND: &str = "kernel.taint_inherited";
+/// `Event::Plugin` kind seeding a forked sub-agent with one rendered fragment
+/// of the parent's completed turns (data: `{"kind", "untrusted"}`; the
+/// fragment is the envelope's `rendered`, verbatim, so the inherited prefix is
+/// byte-identical).
+pub const FORK_ENTRY_KIND: &str = "kernel.fork_entry";
+/// `Event::Plugin` kind journaling an instruction file found in a subdirectory
+/// a tool accessed (data: `{"path", "text"}`); injected at the next step.
+pub const INSTRUCTIONS_PENDING_KIND: &str = "kernel.instructions_pending";
+/// `Event::Plugin` kind journaling a pending instruction file left out to stay
+/// within the instruction byte budget (data: `{"path", "hash"}`).
+pub const INSTRUCTIONS_OMITTED_KIND: &str = "kernel.instructions_omitted";
 
 /// Execution phase (a projection of state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -147,6 +162,9 @@ pub(crate) struct CompactInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Turn {
     pub no: u64,
+    /// Seq of the `TurnStarted` event (fork seeds stop before it).
+    #[serde(default)]
+    pub start_seq: Seq,
     pub cause: TurnCause,
     pub started_at: Timestamp,
     pub sample: Option<EffectId>,
@@ -170,9 +188,10 @@ pub(crate) struct Turn {
 }
 
 impl Turn {
-    fn new(no: u64, cause: TurnCause, at: Timestamp) -> Turn {
+    fn new(no: u64, cause: TurnCause, at: Timestamp, start_seq: Seq) -> Turn {
         Turn {
             no,
+            start_seq,
             cause,
             started_at: at,
             sample: None,
@@ -513,6 +532,23 @@ pub struct State {
     pub(crate) erased: BTreeSet<EventId>,
     /// Sub-agents spawned by this session, by spawning call.
     pub(crate) children: BTreeMap<CallId, Subagent>,
+    /// Subdirectory instruction files injected (or omitted) so far, by path.
+    #[serde(default)]
+    pub(crate) instr: BTreeMap<String, InstrState>,
+    /// Instruction files found by tools, waiting for the next step (path -> text).
+    #[serde(default)]
+    pub(crate) instr_pending: BTreeMap<String, String>,
+}
+
+/// A subdirectory instruction file known to the session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InstrState {
+    /// Hash of the file content last seen (changes are injected again).
+    pub hash: String,
+    /// The `InstructionsInjected` event; `None` when omitted for the budget.
+    pub event: Option<EventId>,
+    /// Injected text (re-injected when compaction removed it).
+    pub text: String,
 }
 
 impl State {
@@ -578,7 +614,7 @@ pub fn phase(s: &State) -> Phase {
 
 // ------------------------------------------------------------------ evolve
 
-fn taint(s: &mut State, id: &EventId, label: &str) {
+pub(crate) fn taint(s: &mut State, id: &EventId, label: &str) {
     s.taint.tainted = true;
     if s.taint.sources.len() < MAX_TAINT_SOURCES && !s.taint.sources.contains(id) {
         s.taint.sources.push(id.clone());
@@ -704,7 +740,7 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             });
             s.caps = Some(caps);
         }
-        Event::TurnStarted { cause } => on_turn_started(s, *cause, ev.at),
+        Event::TurnStarted { cause } => on_turn_started(s, *cause, ev.at, ev.seq),
         Event::UserMessage { .. } => {
             if let Some(e) = make_entry(ev) {
                 append(s, e);
@@ -720,6 +756,11 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
         }
         Event::AssistantReplied { message, effect } => on_reply(s, ev, message, *effect),
         Event::ToolResulted { call, result } => {
+            if let Some(r) = &result.subagent {
+                // The child's consumption is carved out of this session's budget.
+                s.tokens_used = s.tokens_used.saturating_add(r.tokens);
+                s.cost_used = s.cost_used.saturating_add(r.cost_micros);
+            }
             let id = result.call_id.clone();
             let entry = make_entry(ev);
             let mut deferred = None;
@@ -861,7 +902,17 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
                 append(s, e);
             }
         }
-        Event::InstructionsInjected { .. } | Event::MemoryLoaded { .. } => {
+        Event::InstructionsInjected { path, text } => {
+            let hash = match s.instr_pending.remove(path) {
+                Some(original) => crate::decide::fnv(&original),
+                None => s.instr.get(path).map(|i| i.hash.clone()).unwrap_or_else(|| crate::decide::fnv(text)),
+            };
+            s.instr.insert(path.clone(), InstrState { hash, event: Some(ev.id.clone()), text: text.clone() });
+            if let Some(e) = make_entry(ev) {
+                append(s, e);
+            }
+        }
+        Event::MemoryLoaded { .. } => {
             if let Some(e) = make_entry(ev) {
                 append(s, e);
             }
@@ -900,6 +951,21 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             } else if kind == SIGNAL_DROPPED_KIND {
                 if let Some(Ok(sig)) = data.get("signal").map(|v| serde_json::from_value::<Signal>(v.clone())) {
                     on_dropped_signal(s, sig);
+                }
+            } else if kind == TAINT_INHERITED_KIND {
+                crate::spawn::on_taint_inherited(s, &ev.id, data);
+            } else if kind == FORK_ENTRY_KIND {
+                if let Some(e) = crate::spawn::fork_entry(ev, data) {
+                    append(s, e);
+                }
+            } else if kind == INSTRUCTIONS_PENDING_KIND {
+                if let (Some(p), Some(t)) = (data.get("path").and_then(|v| v.as_str()), data.get("text").and_then(|v| v.as_str())) {
+                    s.instr_pending.insert(p.to_string(), t.to_string());
+                }
+            } else if kind == INSTRUCTIONS_OMITTED_KIND {
+                if let (Some(p), Some(h)) = (data.get("path").and_then(|v| v.as_str()), data.get("hash").and_then(|v| v.as_str())) {
+                    s.instr_pending.remove(p);
+                    s.instr.insert(p.to_string(), InstrState { hash: h.to_string(), event: None, text: String::new() });
                 }
             }
         }
@@ -1056,7 +1122,7 @@ fn on_pending_signal(s: &mut State, sig: Signal) {
     }
 }
 
-fn on_turn_started(s: &mut State, cause: TurnCause, at: Timestamp) {
+fn on_turn_started(s: &mut State, cause: TurnCause, at: Timestamp, seq: Seq) {
     if cause == TurnCause::Continuation {
         if let Some(t) = s.turn.as_mut() {
             if t.suspended {
@@ -1076,7 +1142,7 @@ fn on_turn_started(s: &mut State, cause: TurnCause, at: Timestamp) {
     }
     s.questions.clear();
     s.turns += 1;
-    s.turn = Some(Turn::new(s.turns, cause, at));
+    s.turn = Some(Turn::new(s.turns, cause, at, seq));
     match cause {
         TurnCause::User => s.continuations = 0,
         TurnCause::Queued => {

@@ -18,11 +18,14 @@ mod decide;
 pub mod gate;
 pub mod render;
 pub mod sched;
+mod spawn;
 pub mod state;
 
 pub use decide::{config_hash, start_session};
+pub use spawn::{child_budgets, fork_seed, inherited_taint, start_session_with, usage, ForkSeed, SessionStart};
 pub use state::{
-    Phase, State, Subagent, Taint, OVERFLOW_KIND, PENDING_CONFIG_KIND, PENDING_SIGNAL_KIND, SIGNAL_DROPPED_KIND,
+    Phase, State, Subagent, Taint, FORK_ENTRY_KIND, INSTRUCTIONS_OMITTED_KIND, INSTRUCTIONS_PENDING_KIND,
+    OVERFLOW_KIND, PENDING_CONFIG_KIND, PENDING_SIGNAL_KIND, SIGNAL_DROPPED_KIND, TAINT_INHERITED_KIND,
 };
 
 use agent_proto::{KernelConfig, Prompt, Question, Rendered, SeqHead};

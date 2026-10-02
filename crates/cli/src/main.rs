@@ -15,6 +15,12 @@
 //!   or on a remote server.
 //! - `agent serve --listen 127.0.0.1:PORT`: WebSocket session server over the
 //!   discovered agent.
+//! - `agent commands`: the slash commands of the discovered configuration.
+//!
+//! A prompt `/name args` naming a slash command (`.agent/commands/<name>.md`,
+//! user or plugin commands) is expanded into the command's template, in `run`
+//! and in sessions served by `tui` / `serve`. `tui` and `serve` reload the
+//! configuration when its files change.
 
 use agent::kernel::{Decider, Kernel};
 use agent::prelude::*;
@@ -77,6 +83,8 @@ enum Cmd {
     },
     /// List sessions in the journal.
     Sessions,
+    /// List slash commands (`/name args`).
+    Commands,
     /// Interactive terminal UI.
     Tui {
         /// Connect to a remote server (`ws://host:port`) instead of running
@@ -108,6 +116,15 @@ impl SessionOpener<Kernel> for AgentOpener {
             other => DriverError::Store(other.to_string()),
         })
     }
+
+    fn expand(&self, text: &str) -> Option<String> {
+        self.0.built_profile()?.expand_slash(text)
+    }
+
+    fn commands(&self) -> Vec<agent::proto::CommandInfo> {
+        let commands = self.0.built_profile().map(|p| p.commands).unwrap_or_default();
+        commands.into_iter().map(|c| agent::proto::CommandInfo { name: c.name, description: c.description }).collect()
+    }
 }
 
 /// A session server over the agent discovered in `dir`, journaling to `db`.
@@ -115,7 +132,7 @@ async fn local_server(dir: &Path, db: &Path) -> anyhow::Result<Server<Kernel>> {
     if let Some(parent) = db.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let agent = Agent::discover(dir).journal(Sqlite(db));
+    let agent = Agent::discover(dir).journal(Sqlite(db)).hot_reload();
     let rt = agent.runtime().await?;
     Ok(Server::new(Arc::new(rt), AgentOpener(agent)))
 }
@@ -184,6 +201,13 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
             use std::io::Write;
             // Ignore EPIPE (`agent schema | head`).
             let _ = writeln!(std::io::stdout().lock(), "{}", agent::proto::schema::export_json());
+            Ok(exit_code::OK)
+        }
+        Cmd::Commands => {
+            let p = Agent::discover(&cli.dir).profile().await?;
+            for c in &p.commands {
+                println!("/{:<20} {}", c.name, c.description);
+            }
             Ok(exit_code::OK)
         }
         Cmd::Sessions => {

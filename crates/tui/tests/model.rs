@@ -343,3 +343,52 @@ fn visible_window_clamps() {
     assert_eq!(visible_window(100, 10, 500), 0..10);
     assert_eq!(visible_window(3, 10, 2), 0..3);
 }
+
+#[test]
+fn slash_commands_local_actions_and_server_commands() {
+    let mut m = model();
+    assert_eq!(m.handshake().last(), Some(&ClientMessage::ListCommands));
+    m.apply(ServerMessage::Commands { commands: vec![CommandInfo { name: "review".into(), description: "Review code".into() }] });
+
+    type_text(&mut m, "/help");
+    assert!(m.on_key(key(KeyCode::Enter)).is_empty());
+    let Some(Entry::Notice(help)) = m.transcript.last() else { panic!("{:?}", m.transcript) };
+    assert!(help.contains("/review - Review code") && help.contains("/model"), "{help}");
+
+    type_text(&mut m, "/model fast-1");
+    let a = m.on_key(key(KeyCode::Enter));
+    assert!(matches!(command(&a[0]).1, Command::Control(Control::SwitchModel { model }) if model.as_str() == "fast-1"));
+    type_text(&mut m, "/clear-taint");
+    assert!(matches!(command(&m.on_key(key(KeyCode::Enter))[0]).1, Command::Control(Control::ClearTaint)));
+
+    // A server command is sent as typed (the server expands it).
+    type_text(&mut m, "/review src/lib.rs");
+    let a = m.on_key(key(KeyCode::Enter));
+    assert!(matches!(command(&a[0]).1, Command::Signal(Signal::Submit { text, .. }) if text == "/review src/lib.rs"));
+    // Unknown commands are refused locally.
+    type_text(&mut m, "/nope");
+    assert!(m.on_key(key(KeyCode::Enter)).is_empty());
+    assert!(matches!(m.transcript.last(), Some(Entry::Error(e)) if e.contains("unknown command /nope")));
+    type_text(&mut m, "/quit");
+    assert_eq!(m.on_key(key(KeyCode::Enter)), vec![Action::Quit]);
+}
+
+#[test]
+fn forwarded_subagent_questions_are_answerable() {
+    let mut m = model();
+    let q = Question {
+        id: QuestionId::new("subagent:s1/c1:q1"),
+        prompt: "[sub-agent fixer] edit README.md?".into(),
+        level: ApprovalLevel::Policy,
+        ring: Ring::Human,
+        rules: vec![],
+        remember_destination: None,
+    };
+    m.apply(ServerMessage::Question { session: sid(), question: q.clone() });
+    assert_eq!(m.pending, vec![q.clone()]);
+    assert_eq!(m.phase, Phase::Gated);
+    let a = m.on_key(key(KeyCode::Char('y')));
+    assert!(matches!(&a[0], Action::Send(ClientMessage::Answer { question, .. }) if *question == q.id));
+    m.apply(ServerMessage::QuestionClosed { session: sid(), question: q.id.clone() });
+    assert!(m.pending.is_empty());
+}

@@ -626,6 +626,8 @@ fn documented_example_compiles() {
     assert!(p.kernel.read_only_mode);
     assert_eq!(p.hooks.len(), 1);
     assert!(p.mcp.contains_key("github"));
+    assert_eq!(p.observers.len(), 1);
+    assert_eq!(p.observers[0].events, vec!["tool_resulted".to_string(), "turn_ended".to_string()]);
     assert_eq!(p.shell.len(), 1);
     assert!(p.sandbox.require);
 }
@@ -684,4 +686,172 @@ fn shell_rules_project_layers_only_opaque() {
     let mut s = src();
     s.user = Some("[[shell.commands]]\nprefix = \"  \"\neffect = \"opaque\"\n".into());
     assert!(matches!(compile(&s), Err(ConfigError::Invalid { .. })));
+}
+
+fn plugin(dir: &str, scope: Scope, manifest: &str) -> PluginSource {
+    PluginSource { path: dir.into(), scope, manifest: manifest.into(), ..Default::default() }
+}
+
+#[test]
+fn plugins_merge_like_their_layer() {
+    let mut s = src();
+    s.user = trusted_user();
+    let mut lint = plugin(
+        "/home/u/.agent/plugins/lint",
+        Scope::User,
+        r#"
+name = "lint"
+version = "1.2.0"
+description = "Lint on write"
+[[hooks]]
+point = "post_tool"
+executor = { command = "lint" }
+[mcp.linter]
+command = "lint-mcp"
+[[observers]]
+events = ["turn_ended"]
+executor = { http = "http://localhost:9/obs" }
+"#,
+    );
+    lint.skills = vec![SourceFile::new("/home/u/.agent/plugins/lint/skills/fix/SKILL.md", Scope::User, "Fix lint")];
+    lint.commands = vec![SourceFile::new("/home/u/.agent/plugins/lint/commands/lint.md", Scope::User, "Lint $ARGUMENTS")];
+    lint.agents = vec![SourceFile::new("/home/u/.agent/plugins/lint/agents/linter.md", Scope::User, "---\nmode: fork\n---\nLint.")];
+    lint.instructions = vec![SourceFile::new("/home/u/.agent/plugins/lint/AGENTS.md", Scope::User, "Plugin guidance")];
+    s.instructions = vec![
+        SourceFile::new("/home/u/.agent/AGENTS.md", Scope::User, "user"),
+        SourceFile::new("/repo/AGENTS.md", Scope::Project, "project"),
+    ];
+    s.plugins = vec![lint];
+    let p = compile(&s).unwrap();
+    assert_eq!(p.plugins.len(), 1);
+    assert_eq!((p.plugins[0].name.as_str(), p.plugins[0].version.as_str()), ("lint", "1.2.0"));
+    assert_eq!(p.hooks[0].name, "plugin:lint#0");
+    assert_eq!(p.hooks[0].layer, Layer::User);
+    assert!(p.mcp.contains_key("linter"));
+    assert_eq!(p.observers[0].name, "plugin:lint#0");
+    assert_eq!(p.skills[0].name, "fix");
+    assert_eq!(p.expand_slash("/lint src").as_deref(), Some("Lint src"));
+    assert!(p.agents[0].fork);
+    let order: Vec<&str> = p.instructions.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(order, vec!["/home/u/.agent/AGENTS.md", "/home/u/.agent/plugins/lint/AGENTS.md", "/repo/AGENTS.md"]);
+
+    // Any layer can disable a plugin.
+    let mut s2 = s.clone();
+    s2.shared_project = Some("[plugins]\ndisabled = [\"lint\"]\n".into());
+    let p = compile(&s2).unwrap();
+    assert!(p.plugins.is_empty() && p.hooks.is_empty() && p.commands.is_empty());
+    assert!(has_warning(&p, "plugins.lint"));
+}
+
+#[test]
+fn project_plugins_need_a_trusted_workspace_and_a_version() {
+    let manifest = "name = \"p\"\nversion = \"0.1.0\"\n[[hooks]]\npoint = \"pre_tool\"\nexecutor = { command = \"x\" }\n";
+    let mut pp = plugin("/repo/.agent/plugins/p", Scope::Project, manifest);
+    pp.commands = vec![SourceFile::new("/repo/.agent/plugins/p/commands/c.md", Scope::Project, "c")];
+    let mut s = src();
+    s.plugins = vec![pp.clone()];
+    let p = compile(&s).unwrap();
+    assert_eq!(p.plugins.len(), 1, "listed");
+    assert!(p.hooks.is_empty() && p.commands.is_empty(), "but inactive in an untrusted workspace");
+    s.user = trusted_user();
+    let p = compile(&s).unwrap();
+    assert_eq!(p.hooks.len(), 1);
+    assert_eq!(p.hooks[0].layer, Layer::SharedProject);
+
+    let mut bad = src();
+    bad.plugins = vec![plugin("/x/p", Scope::User, "name = \"p\"\nversion = \"one\"\n")];
+    assert!(matches!(compile(&bad), Err(ConfigError::Invalid { key, .. }) if key == "plugins.p"));
+    bad.plugins = vec![plugin("/x/p", Scope::User, "name = \"p\"\nversion = \"1.0.0\"\nsurprise = 1\n")];
+    assert!(compile(&bad).is_err(), "unknown manifest keys are errors");
+}
+
+#[test]
+fn hook_and_observer_executors() {
+    let mut s = src();
+    s.user = Some(
+        r#"
+[[hooks]]
+point = "pre_tool"
+executor = { prompt = "Is this call safe?", max_tokens = 200 }
+[[hooks]]
+point = "stop"
+executor = { agent = "reviewer" }
+[[hooks]]
+point = "post_tool"
+executor = { mcp = "guard/check" }
+[[observers]]
+name = "audit"
+executor = { command = "audit" }
+"#
+        .into(),
+    );
+    let p = compile(&s).unwrap();
+    assert!(matches!(&p.hooks[0].executor, HookExecutor::Model(m) if m.max_tokens == Some(200)));
+    assert!(matches!(&p.hooks[1].executor, HookExecutor::Subagent(a) if a.agent == "reviewer"));
+    assert!(matches!(&p.hooks[2].executor, HookExecutor::Mcp(_)));
+    assert_eq!(p.observers[0].name, "audit");
+    assert!(p.observers[0].wants("anything"));
+
+    let mut s = src();
+    s.user = Some("[[observers]]\nexecutor = { prompt = \"x\" }\n".into());
+    assert!(compile(&s).is_err(), "observers cannot call the model");
+
+    // Untrusted workspace: project observers are dropped like hooks.
+    let mut s = src();
+    s.shared_project = Some("[[observers]]\nexecutor = { command = \"x\" }\n".into());
+    let p = compile(&s).unwrap();
+    assert!(p.observers.is_empty());
+    assert!(has_warning(&p, "observers"));
+}
+
+#[test]
+fn slash_expansion_and_config_paths() {
+    let mut s = src();
+    s.user = trusted_user();
+    s.commands = vec![SourceFile::new("/repo/.agent/commands/review.md", Scope::Project, "---\ndescription: Review\n---\nReview $ARGUMENTS now")];
+    let p = compile(&s).unwrap();
+    assert_eq!(p.expand_slash("/review src/lib.rs").as_deref(), Some("Review src/lib.rs now"));
+    assert_eq!(p.expand_slash("/unknown x"), None);
+    assert_eq!(p.expand_slash("review x"), None);
+
+    for yes in [
+        "/r/.agent/settings.toml",
+        "/r/.agent/settings.local.toml",
+        "/h/.agent/commands/x.md",
+        "/h/.agent/plugins/p/plugin.toml",
+        "/r/sub/AGENTS.md",
+    ] {
+        assert!(is_config_path(std::path::Path::new(yes)), "{yes}");
+    }
+    for no in ["/r/.agent/runs.db", "/h/.agent/observer-cursors.json", "/r/src/main.rs", "/r/docs/x.md"] {
+        assert!(!is_config_path(std::path::Path::new(no)), "{no}");
+    }
+    let opts = DiscoverOptions { cwd: "/r/sub".into(), project_root: Some("/r".into()), home: Some("/h".into()), ..Default::default() };
+    let locs = config_locations(&opts);
+    assert!(locs.contains(&("/r/.agent/plugins".into(), true)));
+    assert!(locs.contains(&("/h/.agent".into(), false)));
+    assert!(locs.contains(&("/r/sub".into(), false)));
+}
+
+#[test]
+fn discovery_finds_plugins() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("repo");
+    let home = d.path().join("home");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let p = home.join(".agent/plugins/lint");
+    std::fs::create_dir_all(p.join("commands")).unwrap();
+    std::fs::create_dir_all(p.join("skills/fix")).unwrap();
+    std::fs::write(p.join("plugin.toml"), "name = \"lint\"\nversion = \"1.0.0\"\n").unwrap();
+    std::fs::write(p.join("commands/lint.md"), "Lint it").unwrap();
+    std::fs::write(p.join("skills/fix/SKILL.md"), "Fix").unwrap();
+    std::fs::create_dir_all(root.join(".agent/plugins/not-a-plugin")).unwrap();
+    let opts = DiscoverOptions { cwd: root.clone(), home: Some(home), ..Default::default() };
+    let s = discover(&opts).unwrap();
+    assert_eq!(s.plugins.len(), 1);
+    assert_eq!(s.plugins[0].scope, Scope::User);
+    assert_eq!(s.plugins[0].commands.len(), 1);
+    let prof = compile(&s).unwrap();
+    assert_eq!(prof.commands[0].name, "lint");
+    assert_eq!(prof.skills[0].name, "fix");
 }

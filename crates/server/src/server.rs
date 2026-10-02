@@ -19,7 +19,7 @@
 use crate::transport::{channel, ChannelClient, JsonLines, Transport, TransportError, TransportRead, TransportWrite, WsTransport};
 use agent_kernel::{Decider, Decision};
 use agent_proto::*;
-use agent_runtime::{AnswerError, DriverError, Runtime, SessionHandle};
+use agent_runtime::{AnswerError, DriverError, Runtime, SessionHandle, FORWARDED_QUESTION_PREFIX};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -92,6 +92,15 @@ impl Default for ServerOptions {
 #[async_trait]
 pub trait SessionOpener<D: Decider>: Send + Sync {
     async fn open(&self, rt: &Runtime<D>, id: &SessionId) -> Result<SessionHandle<D>, DriverError>;
+    /// Expand a slash command typed by a user (`/name args`) into the message
+    /// sent to the session. `None` = send the text as typed.
+    fn expand(&self, _text: &str) -> Option<String> {
+        None
+    }
+    /// The slash commands [`SessionOpener::expand`] knows (`ListCommands`).
+    fn commands(&self) -> Vec<CommandInfo> {
+        vec![]
+    }
 }
 
 /// Only resume sessions that already exist in the journal; unknown ids fail.
@@ -346,6 +355,24 @@ where
         self.inner.opener.open(&self.inner.rt, id).await
     }
 
+    /// Slash-command expansion of user text (submit / queue / steer).
+    fn expand(&self, command: Command) -> Command {
+        let opener = &self.inner.opener;
+        match command {
+            Command::Signal(Signal::Submit { text, attachments }) => {
+                let text = opener.expand(&text).unwrap_or(text);
+                Command::Signal(Signal::Submit { text, attachments })
+            }
+            Command::Signal(Signal::Queue { text }) => {
+                Command::Signal(Signal::Queue { text: opener.expand(&text).unwrap_or(text) })
+            }
+            Command::Signal(Signal::Steer { text }) => {
+                Command::Signal(Signal::Steer { text: opener.expand(&text).unwrap_or(text) })
+            }
+            other => other,
+        }
+    }
+
     fn hub(&self, id: &SessionId) -> Arc<Hub> {
         self.inner.hubs.lock().unwrap().entry(id.clone()).or_default().clone()
     }
@@ -565,6 +592,7 @@ where
                     self.answer(session, key, question, answer, responder).await
                 }
                 command => {
+                    let command = self.server.expand(command);
                     let ack = match self.server.session(&session).await {
                         Ok(h) => to_ack(h.command(key.clone(), command).await),
                         Err(e) => (false, Some(e.to_string())),
@@ -575,6 +603,10 @@ where
             ClientMessage::Answer { session, key, question, answer } => {
                 let responder = self.client.clone().unwrap_or_default();
                 self.answer(session, key, question, answer, responder).await
+            }
+            ClientMessage::ListCommands => {
+                let commands = self.server.inner.opener.commands();
+                self.reply(ServerMessage::Commands { commands }).await
             }
         }
         Ok(())
@@ -594,7 +626,8 @@ where
             .insert(self.id, Subscriber { out: self.out.clone(), closed: self.closed.clone() });
         let events = handle.subscribe(from_seq);
         let pulses = pulses.then(|| handle.pulses());
-        let task = tokio::spawn(pump(session.clone(), events, pulses, self.out.clone(), self.closed.clone()));
+        let asks = Forwarded { rx: handle.asks().subscribe(), pending: handle.asks().pending() };
+        let task = tokio::spawn(pump(session.clone(), events, pulses, asks, self.out.clone(), self.closed.clone()));
         self.subs.insert(session, Task(task));
     }
 
@@ -703,12 +736,30 @@ async fn pump(
     session: SessionId,
     mut events: BoxStream<'static, Envelope<Event>>,
     mut pulses: Option<broadcast::Receiver<Pulse>>,
+    asks: Forwarded,
     out: Outgoing,
     closed: Closed,
 ) {
     let mut tracker = QuestionTracker::default();
+    let Forwarded { rx: mut forwarded, pending } = asks;
+    let forwarded_msg = |q: Question| ServerMessage::Question { session: session.clone(), question: q };
+    for q in pending.into_iter().filter(|q| q.id.0.starts_with(FORWARDED_QUESTION_PREFIX)) {
+        if out.reliable(forwarded_msg(q), || slow_consumer("reconnect and resubscribe")).await.is_err() {
+            return;
+        }
+    }
+    let mut forwarded_open = true;
     loop {
         tokio::select! {
+            q = forwarded.recv(), if forwarded_open => match q {
+                Ok(q) if q.id.0.starts_with(FORWARDED_QUESTION_PREFIX) => {
+                    if out.reliable(forwarded_msg(q), || slow_consumer("reconnect and resubscribe")).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => forwarded_open = false,
+            },
             ev = events.next() => match ev {
                 Some(e) => {
                     let seq = e.seq;
@@ -741,6 +792,13 @@ async fn pump(
             },
         }
     }
+}
+
+/// Questions forwarded to a session's board from its sub-agents: those open
+/// at subscription time, then newly opened ones.
+struct Forwarded {
+    rx: broadcast::Receiver<Question>,
+    pending: Vec<Question>,
 }
 
 /// Next pulse; lagged receivers skip ahead. `None` when the channel closed;

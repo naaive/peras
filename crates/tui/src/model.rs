@@ -107,7 +107,20 @@ pub struct Model {
     pub ctrl_c_armed: bool,
     /// Transient hint shown in the status line.
     pub hint: Option<String>,
+    /// Slash commands the server expands (`ListCommands`).
+    pub commands: Vec<CommandInfo>,
 }
+
+/// Slash commands the client handles itself (local actions).
+pub const LOCAL_COMMANDS: [(&str, &str); 7] = [
+    ("help", "list slash commands"),
+    ("quit", "leave the TUI"),
+    ("pause", "stop dispatching new effects"),
+    ("resume", "resume dispatching"),
+    ("interrupt", "hard interrupt the turn"),
+    ("model", "switch model: /model <id>"),
+    ("clear-taint", "clear the session taint after reviewing the context"),
+];
 
 impl Model {
     pub fn new(session: SessionId, client_id: impl Into<String>) -> Model {
@@ -132,6 +145,7 @@ impl Model {
             page: 10,
             ctrl_c_armed: false,
             hint: None,
+            commands: vec![],
         }
     }
 
@@ -141,6 +155,7 @@ impl Model {
         vec![
             ClientMessage::Hello { versions: vec![PROTOCOL_VERSION], client: CLIENT_NAME.into() },
             ClientMessage::Subscribe { session: self.session.clone(), from_seq: self.next_seq, pulses: true },
+            ClientMessage::ListCommands,
         ]
     }
 
@@ -179,6 +194,15 @@ impl Model {
                 self.close_question(&question);
             }
             ServerMessage::QuestionClosed { .. } => {}
+            ServerMessage::Commands { commands } => self.commands = commands,
+            ServerMessage::Question { session, question } if session == self.session => {
+                self.transcript.push(Entry::Notice(format!("approval requested: {}", question.prompt)));
+                if !self.pending.iter().any(|q| q.id == question.id) {
+                    self.pending.push(question);
+                }
+                self.phase = Phase::Gated;
+            }
+            ServerMessage::Question { .. } => {}
             ServerMessage::Error { message } => {
                 if message.starts_with(agent_server::SLOW_CONSUMER) {
                     // The server drops us; the app reconnects from `next_seq`.
@@ -467,6 +491,7 @@ impl Model {
                 None => vec![],
             },
             KeyCode::Enter => match self.take_input() {
+                Some(text) if parse_slash(&text).is_some() => self.slash(text),
                 Some(text) if self.busy => vec![self.command(Command::Signal(Signal::Steer { text }))],
                 Some(text) => {
                     self.scroll = 0;
@@ -477,6 +502,40 @@ impl Model {
             code => {
                 self.edit(code, ctrl || alt);
                 vec![]
+            }
+        }
+    }
+
+    /// A slash command: local actions are handled here; the server's commands
+    /// (templates) are sent as typed and expanded by the server.
+    fn slash(&mut self, text: String) -> Vec<Action> {
+        let Some((name, args)) = parse_slash(&text) else { return vec![] };
+        let control = |m: &mut Model, c: Control| vec![m.command(Command::Control(c))];
+        match name {
+            "help" => {
+                let mut lines: Vec<String> = LOCAL_COMMANDS.iter().map(|(n, d)| format!("/{n} - {d}")).collect();
+                lines.extend(self.commands.iter().map(|c| format!("/{} - {}", c.name, c.description)));
+                self.transcript.push(Entry::Notice(lines.join("\n")));
+                vec![]
+            }
+            "quit" => vec![Action::Quit],
+            "pause" => control(self, Control::Pause),
+            "resume" => control(self, Control::Resume),
+            "interrupt" => control(self, Control::HardInterrupt),
+            "clear-taint" => control(self, Control::ClearTaint),
+            "model" if !args.is_empty() => control(self, Control::SwitchModel { model: ModelId::new(args.to_string()) }),
+            "model" => {
+                self.hint = Some("usage: /model <id>".into());
+                vec![]
+            }
+            n if !self.commands.is_empty() && !self.commands.iter().any(|c| c.name == n) => {
+                self.transcript.push(Entry::Error(format!("unknown command /{n} (try /help)")));
+                vec![]
+            }
+            _ if self.busy => vec![self.command(Command::Signal(Signal::Steer { text }))],
+            _ => {
+                self.scroll = 0;
+                vec![self.command(Command::Signal(Signal::Submit { text, attachments: vec![] }))]
             }
         }
     }

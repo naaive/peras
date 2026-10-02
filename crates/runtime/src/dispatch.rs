@@ -50,6 +50,20 @@ pub struct RuntimeOptions {
     pub heartbeat_ms: u64,
     /// Where observers start when a session is resumed.
     pub observer_resume: ObserverResume,
+    /// Subdirectory instruction files to look for along the directories a tool
+    /// call accessed (`None` = off).
+    pub instructions: Option<InstructionScan>,
+}
+
+/// Which instruction files the runtime looks for when a tool accesses a
+/// subdirectory of the workspace (they are injected at the next step).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstructionScan {
+    /// File names looked for in each directory (`AGENTS.md`, `CLAUDE.md`).
+    pub names: Vec<String>,
+    /// Files already in the Static layer (project root down to the working
+    /// directory): never reported.
+    pub loaded: Vec<PathBuf>,
 }
 
 /// Where observers start delivering when a session is resumed (new sessions
@@ -82,6 +96,7 @@ impl Default for RuntimeOptions {
             verify_requests: cfg!(debug_assertions),
             heartbeat_ms: 5000,
             observer_resume: ObserverResume::Cursor,
+            instructions: None,
         }
     }
 }
@@ -111,6 +126,8 @@ pub struct Env {
     /// Secret values to redact (`blobs` and `secrets` are wrapped with it,
     /// and the driver redacts every input).
     pub redactor: Arc<crate::redact::Redactor>,
+    /// Background tasks of every session of this runtime.
+    pub tasks: Arc<crate::tasks::TaskRegistry>,
 }
 
 /// Where effect tasks send their outputs.
@@ -324,6 +341,7 @@ pub async fn run_call(
         progress,
         subagents: env.subagents.clone(),
         isolated: call.isolated,
+        tasks: Some(env.tasks.clone()),
     };
     let started = Instant::now();
     let r = tool.call(call.input.clone(), ctx).await;
@@ -331,23 +349,67 @@ pub async fn run_call(
     match r {
         Ok(out) => {
             let content = spill(env, out.content).await.map_err(|e| e.to_string())?;
+            // A sub-agent that did not finish its task reports an error result.
+            let is_error = out.subagent.as_ref().is_some_and(|r| !matches!(r.outcome, TurnOutcome::Done { .. }));
             Ok(ToolResult {
                 call_id: call.id.clone(),
                 content,
-                is_error: false,
+                is_error,
                 trust: derive_trust(&call.name, out.trust, &grants),
                 observed: out.observed,
                 // Only an isolated run can stage changes.
                 staged: if call.isolated { out.staged } else { vec![] },
+                subagent: out.subagent,
+                instructions: scan_instructions(env, &grants),
             })
         }
         Err(ToolError::Infra(e)) => Err(e),
         Err(e) => {
             let mut r = ToolResult::text(call.id.clone(), e.to_string(), true);
             r.trust = derive_trust(&call.name, None, &grants);
+            r.instructions = scan_instructions(env, &grants);
             Ok(r)
         }
     }
+}
+
+/// Instruction files in the workspace directories from the root down to each
+/// filesystem resource the call was granted (globs are cut at their first
+/// wildcard), minus those already in the Static layer.
+pub fn scan_instructions(env: &Env, grants: &[Access]) -> Vec<FoundInstructions> {
+    let Some(scan) = &env.options.instructions else { return vec![] };
+    let root = &env.options.workspace;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for a in grants.iter().filter(|a| a.resource.scheme() == Some(Scheme::Fs)) {
+        let raw = a.resource.rest();
+        let literal = &raw[..raw.find(['*', '?', '[', '{']).unwrap_or(raw.len())];
+        let p = PathBuf::from(literal.trim_end_matches('/'));
+        let Ok(rel) = p.strip_prefix(root) else { continue };
+        let dir = if p.is_dir() { rel.to_path_buf() } else { rel.parent().map(|d| d.to_path_buf()).unwrap_or_default() };
+        let mut d = root.clone();
+        for c in dir.components() {
+            if !matches!(c, std::path::Component::Normal(_)) {
+                break;
+            }
+            d.push(c);
+            if !dirs.contains(&d) {
+                dirs.push(d.clone());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for d in dirs {
+        for name in &scan.names {
+            let f = d.join(name);
+            if scan.loaded.contains(&f) || !f.is_file() {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&f) {
+                out.push(FoundInstructions { path: f.display().to_string(), text });
+            }
+        }
+    }
+    out
 }
 
 fn grants_for(batch: &Batch, call: &CallId) -> Vec<Access> {
@@ -383,7 +445,8 @@ pub const NOT_RERUN: &str = "Interrupted by a crash; not re-run because it may h
 
 /// Crash recovery of an outstanding batch, per side-effect class:
 /// Pure -> re-run; LocalWrite -> restore originals (best effort) then re-run;
-/// Network / Irreversible / Opaque -> not run, error result [`NOT_RERUN`].
+/// Network / Irreversible / Opaque -> not run, error result [`NOT_RERUN`];
+/// sub-agent calls -> re-run, which resumes the same child session.
 ///
 /// Choice: we never ask through the `Asker` here even in interactive sessions,
 /// because such an ask would not be journaled as a `QuestionAsked` event. The
@@ -403,7 +466,11 @@ pub async fn recover_batch(
             return None;
         }
         let grants = grants_for(batch, &call.id);
+        // A sub-agent call resumes its child session (derived from the call
+        // id), which goes through its own recovery.
+        let subagent = env.tools.get(&call.name).is_some_and(|t| t.spec().subagent);
         let r = match call.class {
+            _ if subagent => run_call(env, session, call, grants, cancel.child_token(), pulses).await,
             EffectClass::Pure => run_call(env, session, call, grants, cancel.child_token(), pulses).await,
             EffectClass::LocalWrite => {
                 let writes: Vec<Access> = grants.iter().filter(|a| a.mode == AccessMode::Write).cloned().collect();

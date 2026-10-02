@@ -219,6 +219,7 @@ impl Run {
             let handle = match &target {
                 Target::New(id) | Target::Open(id) => agent.open(id).await,
             };
+            let input = expand_slash(&agent, input).await;
             match handle {
                 Ok(h) => drive(h, input, ctrl_rx, ask_tx, tx).await,
                 Err(e) => {
@@ -227,6 +228,21 @@ impl Run {
             }
         });
         self.st = St::Running(rx);
+    }
+}
+
+/// A submitted `/name args` naming a slash command of the profile becomes the
+/// command's template.
+async fn expand_slash(agent: &Agent, input: Input) -> Input {
+    match input {
+        Input::Signal(Signal::Submit { text, attachments }) if agent_proto::parse_slash(&text).is_some() => {
+            let text = match agent.expand(&text).await {
+                Ok(Some(t)) => t,
+                _ => text,
+            };
+            Input::Signal(Signal::Submit { text, attachments })
+        }
+        other => other,
     }
 }
 
@@ -262,6 +278,14 @@ pub(crate) async fn drive(
     let from = h.next_seq();
     let mut events = h.subscribe(from);
     let mut pulses = h.pulses();
+    // Questions a sub-agent asked, forwarded to this session's board.
+    let mut forwarded = h.asks().subscribe();
+    let mut forwarded_open = true;
+    for question in h.asks().pending() {
+        if question.id.0.starts_with(agent_runtime::FORWARDED_QUESTION_PREFIX) {
+            let _ = tx.send(Update::Ask(Ask { question, tx: ask_tx.clone() }));
+        }
+    }
     if let Err(e) = h.send(first).await {
         let _ = tx.send(Update::Done(TurnOutcome::Failed { error: e.to_string() }));
         return;
@@ -279,6 +303,13 @@ pub(crate) async fn drive(
                 if let Some(u) = update { let _ = tx.send(u); }
                 if done { return; }
             }
+            q = forwarded.recv(), if forwarded_open => match q {
+                Ok(question) if question.id.0.starts_with(agent_runtime::FORWARDED_QUESTION_PREFIX) => {
+                    let _ = tx.send(Update::Ask(Ask { question, tx: ask_tx.clone() }));
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => forwarded_open = false,
+            },
             p = pulses.recv(), if pulses_open => {
                 match p {
                     Ok(Pulse::TextDelta { text, .. }) => { let _ = tx.send(Update::Text(text)); }

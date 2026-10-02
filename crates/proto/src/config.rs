@@ -246,6 +246,20 @@ pub struct KernelConfig {
     /// Hook points that have hooks configured (the kernel only issues ring-4
     /// gate effects for these).
     pub hooked: Vec<crate::verdict::HookPoint>,
+    /// Byte budget for subdirectory instruction files injected on access.
+    #[serde(default = "default_instruction_budget", skip_serializing_if = "is_default_instruction_budget")]
+    pub instruction_budget: u32,
+}
+
+/// Default byte budget for subdirectory instructions injected on access.
+pub const DEFAULT_SUBDIR_INSTRUCTION_BUDGET: u32 = 64 * 1024;
+
+fn default_instruction_budget() -> u32 {
+    DEFAULT_SUBDIR_INSTRUCTION_BUDGET
+}
+
+fn is_default_instruction_budget(v: &u32) -> bool {
+    *v == DEFAULT_SUBDIR_INSTRUCTION_BUDGET
 }
 
 impl Default for KernelConfig {
@@ -264,6 +278,7 @@ impl Default for KernelConfig {
             encoder_version: 1,
             read_only_mode: false,
             hooked: vec![],
+            instruction_budget: DEFAULT_SUBDIR_INSTRUCTION_BUDGET,
         }
     }
 }
