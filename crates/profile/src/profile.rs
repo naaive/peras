@@ -21,6 +21,38 @@ pub struct HookDef {
     pub layer: Layer,
 }
 
+/// A configured observer (see [`crate::settings::ObserverSetting`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserverDef {
+    pub name: String,
+    /// Event type names; empty = every event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+    pub executor: HookExecutor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    pub layer: Layer,
+}
+
+impl ObserverDef {
+    /// Whether an event of type `type_name` is delivered to this observer.
+    pub fn wants(&self, type_name: &str) -> bool {
+        self.events.is_empty() || self.events.iter().any(|e| e == type_name)
+    }
+}
+
+/// A loaded plugin (its contents are merged into the rest of the profile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    pub name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Plugin directory.
+    pub path: String,
+    pub scope: Scope,
+}
+
 /// Ring-5 auto-answer rule (evaluated by the runtime before asking a human;
 /// never applies to invariant-level asks).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +76,8 @@ pub struct McpServer {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     pub trusted: bool,
     pub layer: Layer,
 }
@@ -86,6 +120,10 @@ pub struct AgentDef {
     pub model: Option<String>,
     /// System prompt of the child (the file body).
     pub prompt: String,
+    /// `mode: fork`: the child is seeded with the parent's completed turns
+    /// (default: a blank session with a self-contained task).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fork: bool,
     pub path: String,
     pub scope: Scope,
 }
@@ -130,6 +168,10 @@ pub struct Profile {
     pub commands: Vec<CommandDef>,
     pub agents: Vec<AgentDef>,
     pub sandbox: SandboxPrefs,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observers: Vec<ObserverDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginInfo>,
     /// Tool-name allowlist (set for sub-agent profiles); applied by
     /// [`Profile::with_tools`] too, so narrowing survives late tool assembly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,6 +217,14 @@ impl Profile {
 
     pub fn command(&self, name: &str) -> Option<&CommandDef> {
         self.commands.iter().find(|c| c.name == name)
+    }
+
+    /// Expand a slash command: `/name args` with a command `name` in the table
+    /// becomes its template with `$ARGUMENTS` substituted. Anything else
+    /// (plain text, unknown names) is `None`: sent as typed.
+    pub fn expand_slash(&self, text: &str) -> Option<String> {
+        let (name, args) = agent_proto::parse_slash(text)?;
+        self.command(name).map(|c| c.expand(args))
     }
 
     pub fn agent(&self, name: &str) -> Option<&AgentDef> {

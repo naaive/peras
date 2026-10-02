@@ -4,7 +4,7 @@ use crate::frontmatter;
 use crate::instructions::{apply_budget, InstructionFile, DEFAULT_INSTRUCTION_BUDGET};
 use crate::profile::*;
 use crate::settings::*;
-use crate::sources::{Scope, SourceFile, Sources};
+use crate::sources::{PluginSource, Scope, SourceFile, Sources};
 use agent_proto::{
     Budgets, CompactionConfig, KernelConfig, Layer, ModelCaps, ModelId, OnAsk, PolicyAction, PolicyRule,
     SecurityConfig, SnapshotRule,
@@ -40,7 +40,23 @@ pub fn on_ask_strictness(a: OnAsk) -> u8 {
 
 /// Compile the sources into a profile. Pure: no IO, no clock, no env.
 pub fn compile(sources: &Sources) -> Result<Profile, ConfigError> {
-    Compiler::new(sources)?.run(sources)
+    let mut c = Compiler::new(sources)?;
+    let (expanded, plugins) = c.expand_plugins(sources)?;
+    c.run(&expanded, plugins)
+}
+
+/// `MAJOR.MINOR.PATCH`, optionally followed by `-pre` / `+build`.
+fn valid_version(v: &str) -> bool {
+    let core = v.split(['-', '+']).next().unwrap_or("");
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn plugin_layer(scope: Scope) -> Layer {
+    match scope {
+        Scope::User => Layer::User,
+        Scope::Project => Layer::SharedProject,
+    }
 }
 
 struct Compiler {
@@ -200,7 +216,82 @@ impl Compiler {
         v
     }
 
-    fn run(mut self, src: &Sources) -> Result<Profile, ConfigError> {
+    /// Plugins: parse every manifest, drop disabled ones (any layer may disable
+    /// a plugin by name; a project plugin overrides a user one of the same
+    /// name), merge their hooks / MCP servers / observers into the settings of
+    /// the layer they are installed in and their files into the discovered
+    /// files, with the same scope. Everything then goes through the ordinary
+    /// rules (workspace trust, sensitive fields, deny-wins).
+    fn expand_plugins(&mut self, src: &Sources) -> Result<(Sources, Vec<PluginInfo>), ConfigError> {
+        let disabled: Vec<String> = self
+            .layers
+            .iter()
+            .flat_map(|(_, s)| s.plugins.iter().flat_map(|p| p.disabled.clone()))
+            .collect();
+        let mut chosen: BTreeMap<String, (PluginManifest, &PluginSource)> = BTreeMap::new();
+        for ps in &src.plugins {
+            let layer = plugin_layer(ps.scope);
+            let key = format!("plugins.{}", crate::compile::stem_of_dir(&ps.path));
+            let m: PluginManifest = toml::from_str(&ps.manifest)
+                .map_err(|e| ConfigError::Invalid { layer, key: key.clone(), message: e.to_string() })?;
+            if !valid_version(&m.version) {
+                return Err(ConfigError::Invalid {
+                    layer,
+                    key,
+                    message: format!("version `{}` is not MAJOR.MINOR.PATCH", m.version),
+                });
+            }
+            if disabled.contains(&m.name) {
+                self.warn(layer, &format!("plugins.{}", m.name), "disabled by configuration");
+                continue;
+            }
+            match chosen.get(&m.name) {
+                Some((_, prev)) if prev.scope > ps.scope => {}
+                _ => {
+                    chosen.insert(m.name.clone(), (m, ps));
+                }
+            }
+        }
+        let mut out = src.clone();
+        out.plugins.clear();
+        let mut infos = vec![];
+        // Plugin instruction files sit after the user's file, before the project's.
+        let mut at = out.instructions.iter().take_while(|f| f.scope == Scope::User).count();
+        for (name, (m, ps)) in chosen {
+            let layer = plugin_layer(ps.scope);
+            let settings = &mut self.layers.iter_mut().find(|(l, _)| *l == layer).expect("every layer present").1;
+            for (i, h) in m.hooks.iter().enumerate() {
+                let mut h = h.clone();
+                h.name = Some(h.name.unwrap_or_else(|| format!("plugin:{name}#{i}")));
+                settings.hooks.push(h);
+            }
+            for (server, def) in &m.mcp {
+                settings.mcp.entry(server.clone()).or_insert_with(|| def.clone());
+            }
+            for (i, o) in m.observers.iter().enumerate() {
+                let mut o = o.clone();
+                o.name = Some(o.name.unwrap_or_else(|| format!("plugin:{name}#{i}")));
+                settings.observers.push(o);
+            }
+            for f in &ps.instructions {
+                out.instructions.insert(at, f.clone());
+                at += 1;
+            }
+            out.skills.extend(ps.skills.iter().cloned());
+            out.commands.extend(ps.commands.iter().cloned());
+            out.agents.extend(ps.agents.iter().cloned());
+            infos.push(PluginInfo {
+                name,
+                version: m.version.clone(),
+                description: m.description.clone(),
+                path: ps.path.clone(),
+                scope: ps.scope,
+            });
+        }
+        Ok((out, infos))
+    }
+
+    fn run(mut self, src: &Sources, plugins: Vec<PluginInfo>) -> Result<Profile, ConfigError> {
         // ---- workspace trust (sensitive: decides what project config may do)
         let trusted = self.pick_sensitive_flag("security.workspace_trusted", |s| {
             s.security.as_ref().and_then(|x| x.workspace_trusted)
@@ -416,6 +507,31 @@ impl Compiler {
         hooked.sort();
         hooked.dedup();
 
+        // ---- observers (like hooks: project ones only in a trusted workspace)
+        let mut observers = vec![];
+        for (l, s) in &self.layers {
+            for (i, o) in s.observers.iter().enumerate() {
+                if is_project(*l) && !trusted {
+                    drop_notes.push((*l, "observers"));
+                    continue;
+                }
+                if o.executor.uses_model() {
+                    return Err(ConfigError::Invalid {
+                        layer: *l,
+                        key: format!("observers[{i}].executor"),
+                        message: "observers use command, http or mcp executors".into(),
+                    });
+                }
+                observers.push(ObserverDef {
+                    name: o.name.clone().unwrap_or_else(|| format!("{:?}-observer#{i}", l).to_lowercase()),
+                    events: o.events.clone(),
+                    executor: o.executor.clone(),
+                    timeout_ms: o.timeout_ms,
+                    layer: *l,
+                });
+            }
+        }
+
         // ---- MCP servers (by name; higher layers replace the whole entry)
         let mut mcp = BTreeMap::new();
         let mut mcp_warn = vec![];
@@ -444,6 +560,7 @@ impl Compiler {
                         args: m.args.clone(),
                         env: m.env.clone(),
                         url: m.url.clone(),
+                        headers: m.headers.clone(),
                         trusted: trusted_srv,
                         layer: *l,
                     },
@@ -568,6 +685,7 @@ impl Compiler {
             encoder_version,
             read_only_mode: read_only,
             hooked,
+            instruction_budget: u32::try_from(max_bytes).unwrap_or(u32::MAX),
         };
         let profile = Profile {
             kernel,
@@ -579,6 +697,8 @@ impl Compiler {
             commands,
             agents,
             sandbox,
+            observers,
+            plugins,
             tool_allowlist: None,
             warnings: self.warnings,
             explain: self.explain,
@@ -607,6 +727,12 @@ fn dedup_by_name<T>(items: Vec<T>, key: impl Fn(&T) -> (String, Scope)) -> Vec<T
 fn stem(path: &str) -> String {
     let p = std::path::Path::new(path);
     p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Last component of a directory path.
+pub(crate) fn stem_of_dir(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 fn parent_name(path: &str) -> String {
@@ -654,6 +780,7 @@ fn compile_agent(f: &SourceFile) -> AgentDef {
         description: fm.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         tools: fm.get("tools").map(|v| v.as_list()),
         model: fm.get("model").and_then(|v| v.as_str()).map(String::from),
+        fork: fm.get("mode").and_then(|v| v.as_str()) == Some("fork"),
         prompt: body,
         path: f.path.clone(),
         scope: f.scope,

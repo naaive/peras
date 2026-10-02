@@ -47,6 +47,15 @@
 //! point = "pre_tool"
 //! matcher = "bash"
 //! executor = { command = "./check.sh", args = ["--strict"] }   # or { http = ".." } / { mcp = "server/tool" }
+//!                                  # or { prompt = "..", max_tokens = 512 } (model call) / { agent = "reviewer" } (sub-agent)
+//!
+//! [[observers]]                    # event-stream subscribers (never affect execution)
+//! name = "audit"
+//! events = ["tool_resulted", "turn_ended"]   # event type names; omit = all
+//! executor = { command = "./audit.sh" }      # or { http = ".." } / { mcp = "server/tool" }
+//!
+//! [plugins]
+//! disabled = ["noisy-plugin"]      # any layer may disable a plugin
 //!
 //! [mcp.github]
 //! command = "github-mcp"
@@ -112,6 +121,10 @@ pub struct Settings {
     pub plan: Option<PlanSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<InstructionSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observers: Vec<ObserverSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<PluginSettings>,
 }
 
 impl Settings {
@@ -221,14 +234,45 @@ pub struct AutoAnswerSetting {
     pub answer: AutoAnswer,
 }
 
-/// A hook executor: `{ command = "..", args = [..] }`, `{ http = ".." }` or
-/// `{ mcp = "server/tool" }`.
+/// A hook executor: `{ command = "..", args = [..] }`, `{ http = ".." }`,
+/// `{ mcp = "server/tool" }`, a model call `{ prompt = ".." }` or a sub-agent
+/// `{ agent = "name" }`. The last two make a judgment with the model and
+/// consume budget; observers use only the first three.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum HookExecutor {
     Command(CommandExecutor),
     Http(HttpExecutor),
     Mcp(McpExecutor),
+    Model(ModelExecutor),
+    Subagent(SubagentExecutor),
+}
+
+impl HookExecutor {
+    /// Executors that call the model (hooks only).
+    pub fn uses_model(&self) -> bool {
+        matches!(self, HookExecutor::Model(_) | HookExecutor::Subagent(_))
+    }
+}
+
+/// Ask the model for a verdict: `prompt` is the judging instruction; the gate
+/// request is appended as JSON. The reply is a verdict JSON (see the hooks
+/// module of the SDK).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelExecutor {
+    pub prompt: String,
+    /// Output token limit of the judgment (default 1024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+}
+
+/// Hand the gate request to a sub-agent definition (`.agent/agents/<agent>.md`)
+/// whose final answer is the verdict JSON.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentExecutor {
+    pub agent: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -265,6 +309,51 @@ pub struct HookSetting {
     pub timeout_ms: Option<u64>,
 }
 
+/// An observer: an event-stream subscriber with its own cursor. Its executor
+/// receives each matching event envelope as JSON; it can only give feedback by
+/// answering with `{"signal": <Signal>}` (delivered to the session).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverSetting {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Event type names (`tool_resulted`, `turn_ended`...); empty = all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+    pub executor: HookExecutor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSettings {
+    /// Plugin names not to load (merged across layers: any layer may disable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled: Vec<String>,
+}
+
+/// `plugin.toml` at the root of a plugin directory. A plugin is a versioned
+/// bundle: besides the manifest's hooks / MCP servers / observers it may carry
+/// `skills/<name>/SKILL.md`, `commands/*.md`, `agents/*.md` and an
+/// instruction file (`AGENTS.md`), all merged like the files of the layer it
+/// is installed in (user: `~/.agent/plugins`, project: `.agent/plugins`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginManifest {
+    pub name: String,
+    /// `MAJOR.MINOR.PATCH` (optionally `-pre` / `+build`).
+    pub version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<HookSetting>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpSetting>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observers: Vec<ObserverSetting>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpSetting {
@@ -274,9 +363,13 @@ pub struct McpSetting {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    /// Remote server URL (alternative to `command`).
+    /// Remote server URL (alternative to `command`): Streamable HTTP, or
+    /// HTTP+SSE for servers that do not accept it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Extra HTTP headers for remote servers (e.g. authorization).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// Sensitive: results from trusted servers do not taint. Ignored in project layers.
     #[serde(default)]
     pub trusted: bool,
