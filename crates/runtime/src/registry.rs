@@ -5,7 +5,28 @@ use crate::ports::{AccessCtx, Tool, ToolEnv};
 use agent_proto::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+/// The registry a runtime dispatches with, replaced as a whole when the
+/// configuration's tool set changes (hot reload). Calls already dispatched
+/// keep the tool they resolved.
+pub struct LiveTools(RwLock<Arc<ToolRegistry>>);
+
+impl LiveTools {
+    pub fn new(registry: ToolRegistry) -> Self {
+        LiveTools(RwLock::new(Arc::new(registry)))
+    }
+
+    /// The current registry.
+    pub fn load(&self) -> Arc<ToolRegistry> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the registry.
+    pub fn store(&self, registry: ToolRegistry) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(registry);
+    }
+}
 
 #[derive(Clone)]
 pub struct ToolRegistry {

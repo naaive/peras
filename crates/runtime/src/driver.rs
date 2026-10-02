@@ -306,7 +306,7 @@ where
             journal: self.journal.unwrap_or_else(|| Arc::new(MemJournal::new())),
             blobs,
             model: self.model.unwrap_or_else(|| Arc::new(NoModel::default())),
-            tools: Arc::new(self.tools.unwrap_or_else(|| ToolRegistry::new(options.workspace.clone()))),
+            tools: crate::registry::LiveTools::new(self.tools.unwrap_or_else(|| ToolRegistry::new(options.workspace.clone()))),
             gates: self.gates.unwrap_or_else(|| Arc::new(GateChain::default())),
             checkpointer: self.checkpointer.unwrap_or_else(|| Arc::new(NullCheckpointer::default())),
             sandbox: self.sandbox.unwrap_or_else(|| Arc::new(NullSandbox)),
@@ -353,8 +353,17 @@ where
         &self.env
     }
 
-    pub fn tools(&self) -> &ToolRegistry {
-        &self.env.tools
+    /// The current tool registry.
+    pub fn tools(&self) -> Arc<ToolRegistry> {
+        self.env.tools.load()
+    }
+
+    /// Replace the tool registry (hot reload). Effects already dispatched
+    /// keep the tools they resolved; what the model may call is still
+    /// decided by each session's kernel configuration, which changes only
+    /// at its next idle point.
+    pub fn set_tools(&self, registry: ToolRegistry) {
+        self.env.tools.store(registry);
     }
 
     pub fn metrics(&self) -> &Arc<Metrics> {

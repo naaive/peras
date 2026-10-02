@@ -47,7 +47,7 @@ pub use lock::{LockError, WorkspaceLock};
 pub use mem::*;
 pub use ports::*;
 pub use redact::{RedactingBlobs, RedactingSecrets, Redactor};
-pub use registry::ToolRegistry;
+pub use registry::{LiveTools, ToolRegistry};
 pub use shadow::ShadowCheckpointer;
 pub use snapshot::JsonCodec;
 pub use tasks::{TaskId, TaskInfo, TaskNotifier, TaskRegistry, TaskStatus};

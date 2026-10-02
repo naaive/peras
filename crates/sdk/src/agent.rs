@@ -641,29 +641,120 @@ pub(crate) fn gate_chain(cfg: &Config, profile: &Profile, env: &HookEnv, workspa
     chain.unattended(unattended).disposable_env(disposable)
 }
 
-/// Connect every configured MCP server (stdio command or remote URL).
-async fn connect_mcp(profile: &Profile) -> BTreeMap<String, Arc<agent_tools::McpClient>> {
-    let mut out = BTreeMap::new();
-    for (name, server) in &profile.mcp {
-        let client = match (&server.command, &server.url) {
-            (Some(cmd), _) => {
-                let env: Vec<(String, String)> = server.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                agent_tools::McpClient::spawn(name, cmd, &server.args, &env).await
-            }
-            (None, Some(url)) => {
-                let headers: Vec<(String, String)> = server.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                agent_tools::McpClient::connect(name, url, &headers).await
-            }
-            (None, None) => continue,
-        };
-        match client {
-            Ok(c) => {
-                out.insert(name.clone(), c);
-            }
-            Err(e) => tracing::warn!(server = %name, error = %e, "mcp server unavailable"),
+/// Connect one configured MCP server (stdio command or remote URL).
+async fn connect_mcp(name: &str, server: &agent_profile::McpServer) -> Option<Arc<agent_tools::McpClient>> {
+    let client = match (&server.command, &server.url) {
+        (Some(cmd), _) => {
+            let env: Vec<(String, String)> = server.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            agent_tools::McpClient::spawn(name, cmd, &server.args, &env).await
+        }
+        (None, Some(url)) => {
+            let headers: Vec<(String, String)> = server.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            agent_tools::McpClient::connect(name, url, &headers).await
+        }
+        (None, None) => return None,
+    };
+    match client {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(server = %name, error = %e, "mcp server unavailable");
+            None
         }
     }
-    out
+}
+
+type McpClients = BTreeMap<String, Arc<agent_tools::McpClient>>;
+
+/// Assembles an agent's tool set from its profile: the configured (or
+/// default built-in) tools, the tools of the configured MCP servers, and the
+/// sub-agent definitions registered as tools, adapted to the sandbox. It
+/// keeps what it built so a hot reload reuses what did not change: an MCP
+/// connection whose server definition is unchanged, a sub-agent whose
+/// definition, derived profile and tools are unchanged (with its runtime and
+/// live child sessions).
+pub(crate) struct Toolbox {
+    model: Arc<dyn ModelPort>,
+    journal: JournalChoice,
+    sandbox: (Arc<dyn SandboxPort>, bool),
+    report: SandboxReport,
+    link: Arc<Link>,
+    state: Mutex<ToolboxState>,
+}
+
+#[derive(Default)]
+struct ToolboxState {
+    mcp: BTreeMap<String, (agent_profile::McpServer, Arc<agent_tools::McpClient>)>,
+    /// Sub-agent definitions: (fingerprint of what the child is built from, child).
+    children: BTreeMap<String, (String, Agent)>,
+}
+
+impl Toolbox {
+    pub(crate) fn new(
+        model: Arc<dyn ModelPort>,
+        journal: JournalChoice,
+        sandbox: (Arc<dyn SandboxPort>, bool),
+        report: SandboxReport,
+        link: Arc<Link>,
+    ) -> Self {
+        Toolbox { model, journal, sandbox, report, link, state: Mutex::default() }
+    }
+
+    /// The tool registry for `profile`, the connected MCP servers and the
+    /// sub-agent definitions. Sub-agent definitions are linked for spawning.
+    pub(crate) async fn assemble(&self, cfg: &Config, workspace: &Path, profile: &Profile) -> (ToolRegistry, McpClients, BTreeMap<String, Agent>) {
+        let tools = cfg.tools.clone().unwrap_or_else(|| if cfg.discover.is_some() { default_tools(cfg, profile) } else { vec![] });
+        // MCP: keep connections whose definition did not change; connect the
+        // new or changed ones; drop the others (closed with their last tool).
+        let previous = std::mem::take(&mut self.state.lock().unwrap().mcp);
+        let mut mcp = BTreeMap::new();
+        if cfg.preset.is_none() {
+            for (name, server) in &profile.mcp {
+                let client = match previous.get(name) {
+                    Some((def, c)) if def == server => Some(c.clone()),
+                    _ => connect_mcp(name, server).await,
+                };
+                if let Some(c) = client {
+                    mcp.insert(name.clone(), (server.clone(), c));
+                }
+            }
+        }
+        let mut base: Vec<Arc<dyn Tool>> = tools;
+        for (name, (server, client)) in &mcp {
+            match client.tools(server.trusted).await {
+                Ok(ts) => base.extend(ts.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>)),
+                Err(e) => tracing::warn!(server = %name, error = %e, "mcp tools/list failed"),
+            }
+        }
+        // Sub-agent definitions: each one a child agent registered as a tool;
+        // unchanged ones are kept (their runtime drives live child sessions).
+        let fresh = subagent::from_definitions(cfg, profile, &base, self.model.clone(), self.journal.clone(), self.sandbox.clone());
+        let base_names: Vec<String> = base.iter().map(|t| t.spec().name).collect();
+        let mut st = self.state.lock().unwrap();
+        let mut children = BTreeMap::new();
+        for (name, agent) in fresh {
+            let fp = format!("{}|{}", agent.cfg.preset.as_ref().map(|p| p.hash.as_str()).unwrap_or(""), base_names.join(","));
+            let agent = match st.children.get(&name) {
+                Some((old, kept)) if *old == fp => kept.clone(),
+                _ => agent,
+            };
+            children.insert(name, (fp, agent));
+        }
+        st.children = children;
+        st.mcp = mcp;
+        let children: BTreeMap<String, Agent> = st.children.iter().map(|(n, (_, a))| (n.clone(), a.clone())).collect();
+        let clients: McpClients = st.mcp.iter().map(|(n, (_, c))| (n.clone(), c.clone())).collect();
+        drop(st);
+        self.link.set_agents(children.clone());
+        let mut registry = ToolRegistry::new(workspace);
+        for t in &base {
+            registry.register(t.clone());
+        }
+        for c in children.values() {
+            registry.register(Arc::new(c.clone()));
+        }
+        registry.adapt(&ToolEnv { sandbox: self.report.clone(), shell_rules: profile.shell.clone() });
+        (registry, clients, children)
+    }
 }
 
 async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
@@ -713,35 +804,11 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     // call: a crash between the run and its merge loses nothing.
     sandbox.stage_in(&data_dir(&cfg).join("staged"));
 
-    // ---- tools
+    // ---- tools (built-ins, MCP servers, sub-agent definitions)
     let link = Arc::new(Link::default());
-    let mut registry = ToolRegistry::new(&workspace);
-    let tools = cfg.tools.clone().unwrap_or_else(|| {
-        if cfg.discover.is_some() {
-            default_tools(&cfg, &profile)
-        } else {
-            vec![]
-        }
-    });
-    let mcp = if cfg.preset.is_some() { BTreeMap::new() } else { connect_mcp(&profile).await };
-    let mut base: Vec<Arc<dyn Tool>> = tools.into_iter().collect();
-    for (name, client) in &mcp {
-        match client.tools(profile.mcp[name].trusted).await {
-            Ok(ts) => base.extend(ts.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>)),
-            Err(e) => tracing::warn!(server = %name, error = %e, "mcp tools/list failed"),
-        }
-    }
-    // Sub-agent definitions: each one a child agent registered as a tool.
     let shared = JournalChoice::Custom(journal.clone(), blobs.clone());
-    let children = subagent::from_definitions(&cfg, &profile, &base, model.clone(), shared, (sandbox.clone(), disposable));
-    link.set_agents(children.clone());
-    for t in &base {
-        registry.register(t.clone());
-    }
-    for c in children.values() {
-        registry.register(Arc::new(c.clone()));
-    }
-    registry.adapt(&ToolEnv { sandbox: report.clone(), shell_rules: profile.shell.clone() });
+    let toolbox = Toolbox::new(model.clone(), shared, (sandbox.clone(), disposable), report.clone(), link.clone());
+    let (registry, mcp, children) = toolbox.assemble(&cfg, &workspace, &profile).await;
     let specs = registry.specs();
     let profile = profile.with_tools(specs.clone());
 
@@ -752,7 +819,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
 
     // ---- gates
     let unattended = cfg.unattended.or(profile.kernel.unattended);
-    let hook_env = HookEnv { mcp: mcp.clone(), model: model.clone(), agents: children.clone(), link: link.clone() };
+    let hook_env = HookEnv { mcp, model: model.clone(), agents: children, link: link.clone() };
     let chain = gate_chain(&cfg, &profile, &hook_env, &workspace, unattended, disposable);
     let hooked = chain.hooked_points();
     let gates = Arc::new(ReloadableGates::new(chain));
@@ -828,7 +895,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     let built = Arc::new(Built {
         rt,
         compiled: RwLock::new(Compiled { config: kc, profile_hash, profile }),
-        reloader: reload::Reloader { assembly, gates, hook_env },
+        reloader: reload::Reloader::new(assembly, gates, hook_env, toolbox),
         _watcher: Mutex::new(None),
         lock,
         held: Default::default(),

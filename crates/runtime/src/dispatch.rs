@@ -6,7 +6,6 @@ use crate::assemble::Assembler;
 use crate::gate::AskBoard;
 use crate::metrics::Metrics;
 use crate::ports::*;
-use crate::registry::ToolRegistry;
 use agent_proto::*;
 use futures::StreamExt;
 use std::path::PathBuf;
@@ -106,7 +105,8 @@ pub struct Env {
     pub journal: Arc<dyn JournalStore>,
     pub blobs: Arc<dyn BlobStore>,
     pub model: Arc<dyn ModelPort>,
-    pub tools: Arc<ToolRegistry>,
+    /// The tools (replaceable: hot reload).
+    pub tools: crate::registry::LiveTools,
     pub gates: Arc<dyn GateExecutor>,
     pub checkpointer: Arc<dyn Checkpointer>,
     pub sandbox: Arc<dyn SandboxPort>,
@@ -169,7 +169,7 @@ pub async fn sample(
                     first_token = true;
                     env.metrics.first_token.observe(started.elapsed());
                 }
-                let pushed = asm.lock().unwrap().push(delta, &env.tools);
+                let pushed = asm.lock().unwrap().push(delta, &env.tools.load());
                 if let Some(t) = pushed.pulse_text {
                     let _ = pulses.send(Pulse::TextDelta { effect: id, text: t });
                 }
@@ -311,7 +311,7 @@ pub async fn run_call(
     cancel: CancellationToken,
     pulses: &broadcast::Sender<Pulse>,
 ) -> Result<ToolResult, String> {
-    let Some(tool) = env.tools.get(&call.name).cloned() else {
+    let Some(tool) = env.tools.load().get(&call.name).cloned() else {
         return Ok(ToolResult::text(call.id.clone(), format!("Unknown tool `{}`.", call.name), true));
     };
     // The kernel waived the unknown-effect invariant because the call was
@@ -468,7 +468,7 @@ pub async fn recover_batch(
         let grants = grants_for(batch, &call.id);
         // A sub-agent call resumes its child session (derived from the call
         // id), which goes through its own recovery.
-        let subagent = env.tools.get(&call.name).is_some_and(|t| t.spec().subagent);
+        let subagent = env.tools.load().get(&call.name).is_some_and(|t| t.spec().subagent);
         let r = match call.class {
             _ if subagent => run_call(env, session, call, grants, cancel.child_token(), pulses).await,
             EffectClass::Pure => run_call(env, session, call, grants, cancel.child_token(), pulses).await,

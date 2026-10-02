@@ -2,10 +2,29 @@
 //! session as `Control::Reconfigure`; the kernel applies them at the session's
 //! next idle point (a busy session journals them as pending), so tool
 //! definitions never change mid-turn. Hooks and auto-answer rules are swapped
-//! in the gate executor at once. The tool set (built-ins, MCP servers,
-//! sub-agent definitions) is fixed when the agent is built; restart to change it.
+//! in the gate executor at once.
+//!
+//! The tool set is reassembled too ([`Toolbox`]): MCP servers added, changed
+//! or removed (unchanged ones keep their connection), sub-agent definitions
+//! added, changed or removed (unchanged ones keep their runtime and live
+//! child sessions), default built-ins (the skills catalog) and shell rules.
+//! The runtime's registry is replaced at once, but what the model sees and
+//! may call only changes when each session applies the new configuration at
+//! its next idle point (removed tools are then denied, added ones load with
+//! the next request sequence). While a session is busy, removed tools stay
+//! registered so its turn can still finish with the definitions it started
+//! with; they are dropped by a later reload that finds every session idle.
+//!
+//! Not reloaded, because they are fixed when the agent is built:
+//! - the model port, journal, sandbox and checkpointer (live sessions and
+//!   in-flight effects hold them; changing them is a restart);
+//! - observers (each is attached to the runtime with its own persistent
+//!   delivery cursor when it is built);
+//! - whether the agent takes the workspace lock (decided by the tool set at
+//!   build; a read-only agent that gains writing tools by a reload does not
+//!   start taking it mid-process).
 
-use crate::agent::{compile_profile, discover_options, gate_chain, kernel_config, Assembly, Built, Compiled, Config};
+use crate::agent::{compile_profile, discover_options, gate_chain, kernel_config, Assembly, Built, Compiled, Config, Toolbox};
 use crate::error::Error;
 use crate::hooks::HookEnv;
 use agent_profile::Profile;
@@ -52,21 +71,57 @@ impl GateExecutor for ReloadableGates {
 
 /// What a reload needs besides the configuration.
 pub(crate) struct Reloader {
-    pub assembly: Assembly,
+    assembly: std::sync::Mutex<Assembly>,
     pub gates: Arc<ReloadableGates>,
-    pub hook_env: HookEnv,
+    hook_env: std::sync::Mutex<HookEnv>,
+    toolbox: Toolbox,
+    /// One reload at a time (the watcher and `Agent::reload`).
+    serial: tokio::sync::Mutex<()>,
 }
 
-/// Recompile and reconfigure the live sessions (no-op for them when the
-/// kernel configuration did not change).
+impl Reloader {
+    pub(crate) fn new(assembly: Assembly, gates: Arc<ReloadableGates>, hook_env: HookEnv, toolbox: Toolbox) -> Self {
+        Reloader {
+            assembly: std::sync::Mutex::new(assembly),
+            gates,
+            hook_env: std::sync::Mutex::new(hook_env),
+            toolbox,
+            serial: tokio::sync::Mutex::new(()),
+        }
+    }
+}
+
+/// Recompile, reassemble the tool set and reconfigure the live sessions
+/// (no-op for them when the kernel configuration did not change).
 pub(crate) async fn reload(cfg: &Config, b: &Built) -> Result<Profile, Error> {
     let r = &b.reloader;
-    let profile = compile_profile(cfg, &r.assembly.workspace)?.with_tools(r.assembly.specs.clone());
+    let _serial = r.serial.lock().await;
+    let base = r.assembly.lock().unwrap().clone();
+    let profile = compile_profile(cfg, &base.workspace)?;
+    let (mut registry, mcp, agents) = r.toolbox.assemble(cfg, &base.workspace, &profile).await;
+    let specs = registry.specs();
+    // A busy session still runs on the definitions its turn started with.
+    let busy = b.rt.live_sessions().iter().any(|h| h.with_state(|s| agent_kernel::phase(s) != agent_kernel::Phase::Idle));
+    if busy {
+        let old = b.rt.tools();
+        for name in old.names() {
+            if registry.get(&name).is_none() {
+                if let Some(t) = old.get(&name) {
+                    registry.register(t.clone());
+                }
+            }
+        }
+    }
+    b.rt.set_tools(registry);
+    let profile = profile.with_tools(specs.clone());
+    let hook_env = HookEnv { mcp, agents, ..r.hook_env.lock().unwrap().clone() };
     let unattended = cfg.unattended.or(profile.kernel.unattended);
-    let chain = gate_chain(cfg, &profile, &r.hook_env, &r.assembly.workspace, unattended, r.assembly.disposable);
-    let assembly = Assembly { unattended, hooked: chain.hooked_points(), ..r.assembly.clone() };
+    let chain = gate_chain(cfg, &profile, &hook_env, &base.workspace, unattended, base.disposable);
+    let assembly = Assembly { specs, unattended, hooked: chain.hooked_points(), ..base };
     let config = kernel_config(cfg, &profile, &assembly);
     r.gates.set(chain);
+    *r.hook_env.lock().unwrap() = hook_env;
+    *r.assembly.lock().unwrap() = assembly;
     let changed = b.compiled().config != config;
     let profile_hash = format!("{}:{}", profile.hash, agent_kernel::config_hash(&config));
     *b.compiled.write().unwrap() = Compiled { config: config.clone(), profile_hash, profile: profile.clone() };

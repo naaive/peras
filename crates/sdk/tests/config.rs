@@ -302,3 +302,167 @@ async fn the_user_layer_comes_from_the_tests_own_home() {
     let p = discover(d.path(), &policy, Script::new()).home(None::<&Path>).profile().await.unwrap();
     assert!(!p.kernel.system.iter().any(|s| s == "From the user layer."));
 }
+
+fn tool_names(p: &agent::profile::Profile) -> Vec<String> {
+    p.kernel.tools.iter().map(|t| t.name.clone()).collect()
+}
+
+/// Wait until the live session runs with a configuration satisfying `f`.
+async fn session_config(agent: &Agent, chat: &Chat, f: impl Fn(&agent::proto::KernelConfig) -> bool) -> bool {
+    let h = agent.runtime().await.unwrap().session(chat.id()).unwrap();
+    wait_for(|| h.with_state(|s| agent::kernel::config(s).is_some_and(&f))).await
+}
+
+#[agent::test]
+async fn reload_adds_and_removes_mcp_servers() {
+    let url = guard_server().await;
+    let (d, policy) = project("");
+    let model = Script::new().say("one").say("two").say("three");
+    let agent = discover(d.path(), &policy, model.clone());
+    let chat = agent.session("mcp-reload");
+    assert_eq!(chat.send("hi").await.unwrap(), "one");
+    let rt = agent.runtime().await.unwrap();
+    assert!(rt.tools().get("mcp__guard__check").is_none());
+
+    // Added: connected, registered, and the idle session takes it.
+    let settings = d.path().join(".agent/settings.toml");
+    std::fs::write(&settings, format!("[mcp.guard]\nurl = \"{url}\"\n")).unwrap();
+    let p = agent.reload().await.unwrap();
+    assert!(tool_names(&p).contains(&"mcp__guard__check".to_string()), "{:?}", tool_names(&p));
+    assert!(rt.tools().get("mcp__guard__check").is_some());
+    assert!(session_config(&agent, &chat, |c| c.tools.iter().any(|t| t.name == "mcp__guard__check")).await);
+    assert_eq!(chat.send("again").await.unwrap(), "two");
+    let req = serde_json::to_string(&model.requests().last().unwrap().body).unwrap();
+    assert!(req.contains("mcp__guard__check"), "the model is told about the new tool");
+    // A new session has it in its request sequence's head.
+    let p = agent.profile().await.unwrap();
+    assert!(tool_names(&p).contains(&"mcp__guard__check".to_string()));
+
+    // Removed: gone from the registry (every session is idle) and the session.
+    std::fs::write(&settings, "").unwrap();
+    let p = agent.reload().await.unwrap();
+    assert!(!tool_names(&p).contains(&"mcp__guard__check".to_string()));
+    assert!(rt.tools().get("mcp__guard__check").is_none());
+    assert!(session_config(&agent, &chat, |c| !c.tools.iter().any(|t| t.name == "mcp__guard__check")).await);
+    assert_eq!(chat.send("more").await.unwrap(), "three");
+}
+
+/// Send, allowing every ask (embedding code answering as the user).
+async fn send_allowing(chat: &Chat, text: &str) -> String {
+    let mut run = chat.stream(text);
+    let mut out = None;
+    while let Some(u) = run.next().await {
+        match u {
+            Update::Ask(a) => a.allow(),
+            Update::Done(o) => out = Some(o),
+            _ => {}
+        }
+    }
+    match out {
+        Some(TurnOutcome::Done { text }) => text,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The child sessions a parent session started.
+async fn children(chat: &Chat) -> Vec<agent::proto::SessionId> {
+    chat.events()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.body {
+            Event::SubagentStarted { child, .. } => Some(child.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn child_system(agent: &Agent, child: &agent::proto::SessionId) -> Vec<String> {
+    let rt = agent.runtime().await.unwrap();
+    let events = rt.env().journal.load(child, 0).await.unwrap();
+    match &events[0].body {
+        Event::SessionStarted { config, .. } => config.system.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[agent::test]
+async fn reload_applies_subagent_definition_changes() {
+    let (d, policy) = project("");
+    let defs = d.path().join(".agent/agents");
+    std::fs::create_dir_all(&defs).unwrap();
+    let model = Script::new()
+        .say("one")
+        .call("helper", json!({ "task": "first" }))
+        .say("child v1")
+        .say("lead two")
+        .call("helper", json!({ "task": "second" }))
+        .say("child v2")
+        .say("lead three")
+        .say("lead four");
+    let agent = discover(d.path(), &policy, model);
+    let live = agent.session("defs-reload");
+    assert_eq!(live.send("hi").await.unwrap(), "one");
+
+    // Added: the live session takes it at its idle point (announced; its
+    // definition loads with the next request sequence), new sessions have it.
+    std::fs::write(defs.join("helper.md"), "---\ndescription: Helps\n---\nVersion one.").unwrap();
+    assert!(tool_names(&agent.reload().await.unwrap()).contains(&"helper".to_string()));
+    assert!(session_config(&agent, &live, |c| c.tools.iter().any(|t| t.name == "helper")).await);
+    let chat = agent.session("defs-1");
+    assert_eq!(send_allowing(&chat, "delegate").await, "lead two");
+    let first = children(&chat).await;
+    assert_eq!(first.len(), 1);
+    assert!(child_system(&agent, &first[0]).await.iter().any(|s| s == "Version one."));
+
+    // Changed: new children run the new definition.
+    std::fs::write(defs.join("helper.md"), "---\ndescription: Helps more\n---\nVersion two.").unwrap();
+    agent.reload().await.unwrap();
+    assert!(session_config(&agent, &live, |c| c.tools.iter().any(|t| t.name == "helper" && t.description == "Helps more")).await);
+    let chat = agent.session("defs-2");
+    assert_eq!(send_allowing(&chat, "delegate again").await, "lead three");
+    let second = children(&chat).await;
+    assert_eq!(second.len(), 1);
+    let system = child_system(&agent, &second[0]).await;
+    assert!(system.iter().any(|s| s == "Version two.") && !system.iter().any(|s| s == "Version one."), "{system:?}");
+
+    // Removed.
+    std::fs::remove_file(defs.join("helper.md")).unwrap();
+    assert!(!tool_names(&agent.reload().await.unwrap()).contains(&"helper".to_string()));
+    let rt = agent.runtime().await.unwrap();
+    assert!(rt.tools().get("helper").is_none());
+    assert!(session_config(&agent, &live, |c| !c.tools.iter().any(|t| t.name == "helper")).await);
+    assert_eq!(live.send("bye").await.unwrap(), "lead four");
+}
+
+#[agent::test]
+async fn a_busy_session_keeps_removed_tools_until_its_turn_ends() {
+    let (d, policy) = project("");
+    let defs = d.path().join(".agent/agents");
+    std::fs::create_dir_all(&defs).unwrap();
+    std::fs::write(defs.join("helper.md"), "---\ndescription: Helps\n---\nHelp.").unwrap();
+    let model = Script::new().call(read, json!({ "file": "README.md" })).say("done");
+    let agent = discover(d.path(), &policy, model).gate(|_| Verdict::ask("hold on"));
+    let chat = agent.session("busy");
+    let mut run = chat.stream("read");
+    // The turn waits on an approval: the session is busy.
+    let ask = loop {
+        match run.next().await.unwrap() {
+            Update::Ask(a) => break a,
+            _ => continue,
+        }
+    };
+    std::fs::remove_file(defs.join("helper.md")).unwrap();
+    let p = agent.reload().await.unwrap();
+    assert!(!tool_names(&p).contains(&"helper".to_string()), "new sessions do not get it");
+    let rt = agent.runtime().await.unwrap();
+    assert!(rt.tools().get("helper").is_some(), "the busy session's turn still runs on its definitions");
+    let h = rt.session(chat.id()).unwrap();
+    assert!(h.with_state(|s| agent::kernel::config(s).is_some_and(|c| c.tools.iter().any(|t| t.name == "helper"))));
+    ask.allow();
+    while run.next().await.is_some() {}
+    assert!(session_config(&agent, &chat, |c| !c.tools.iter().any(|t| t.name == "helper")).await, "applied when idle");
+    // A later reload with every session idle drops the removed tool.
+    agent.reload().await.unwrap();
+    assert!(rt.tools().get("helper").is_none());
+}

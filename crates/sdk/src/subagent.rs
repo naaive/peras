@@ -41,7 +41,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 pub(crate) struct Link {
     rt: OnceLock<Runtime<Kernel>>,
-    agents: OnceLock<BTreeMap<String, Agent>>,
+    /// Sub-agent definitions by name (replaced on hot reload).
+    agents: std::sync::RwLock<BTreeMap<String, Agent>>,
 }
 
 impl Link {
@@ -50,7 +51,7 @@ impl Link {
     }
 
     pub(crate) fn set_agents(&self, agents: BTreeMap<String, Agent>) {
-        let _ = self.agents.set(agents);
+        *self.agents.write().unwrap_or_else(|e| e.into_inner()) = agents;
     }
 
     pub(crate) fn session(&self, id: &SessionId) -> Option<SessionHandle<Kernel>> {
@@ -74,8 +75,10 @@ impl SubagentSpawner for Link {
     ) -> Result<(TurnOutcome, bool), ToolError> {
         let a = self
             .agents
-            .get()
-            .and_then(|m| m.get(agent))
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(agent)
+            .cloned()
             .ok_or_else(|| ToolError::Failed(format!("unknown sub-agent `{agent}`")))?;
         let taint = tainted_input.then(|| Taint { tainted: true, labels: ["parent".to_string()].into(), ..Default::default() });
         let start = SessionStart { taint, ..Default::default() };
