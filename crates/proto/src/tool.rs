@@ -1,7 +1,8 @@
 //! Tool specs, calls and results.
 
 use crate::envelope::Trust;
-use crate::ids::{BlobRef, CallId};
+use crate::effect::TurnOutcome;
+use crate::ids::{BlobRef, CallId, SessionId};
 use crate::resource::{Access, EffectClass};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,36 @@ pub struct ToolResult {
     /// Content hashes observed by reads (used for stale-write detection).
     #[serde(default)]
     pub observed: Vec<Access>,
+    /// Sub-agent calls: the child's outcome and what it consumed (charged to
+    /// the calling session's budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<Box<SubagentReport>>,
+    /// Instruction files found along the directories this call accessed
+    /// (attached by the runtime). The kernel journals new or changed ones as
+    /// pending instructions and strips them from the recorded result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instructions: Vec<FoundInstructions>,
+}
+
+/// What a sub-agent call reports back to its parent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SubagentReport {
+    pub child: SessionId,
+    pub outcome: TurnOutcome,
+    /// Tokens (input + output + cache) the child consumed.
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub cost_micros: u64,
+}
+
+/// An instruction file (`AGENTS.md` and the like) in a subdirectory a tool
+/// accessed: injected into the context at the next step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FoundInstructions {
+    /// Absolute path of the file.
+    pub path: String,
+    pub text: String,
 }
 
 impl ToolResult {
@@ -64,6 +95,8 @@ impl ToolResult {
             is_error,
             trust: Trust::Internal,
             observed: vec![],
+            subagent: None,
+            instructions: vec![],
         }
     }
     /// The result synthesised for a denied call: the reason is returned to the model.

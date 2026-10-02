@@ -20,7 +20,7 @@ pub(crate) struct Cx {
     k: u64,
 }
 
-fn fnv(s: &str) -> String {
+pub(crate) fn fnv(s: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h ^= b as u64;
@@ -36,7 +36,7 @@ pub fn config_hash(c: &KernelConfig) -> String {
     fnv(&gate::canonical(&v))
 }
 
-fn user_draft(body: Event) -> Draft<Event> {
+pub(crate) fn user_draft(body: Event) -> Draft<Event> {
     Draft { audience: Audience::User, ..Draft::internal(body) }
 }
 
@@ -89,7 +89,7 @@ pub fn start_session(session: SessionId, profile_hash: String, config: KernelCon
 /// configuration, so successive updates each describe only their own delta).
 /// Tools added mid-sequence are announced but their definitions only enter the
 /// next sequence head; removed tools are denied at runtime until then.
-fn static_update_notice(old: &KernelConfig, new: &KernelConfig, head: &SeqHead) -> Option<String> {
+pub(crate) fn static_update_notice(old: &KernelConfig, new: &KernelConfig, head: &SeqHead) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if new.system != old.system {
         parts.push(format!("System instructions updated:\n{}", new.system.join("\n")));
@@ -133,9 +133,13 @@ fn static_update_notice(old: &KernelConfig, new: &KernelConfig, head: &SeqHead) 
 }
 
 impl Cx {
+    pub(crate) fn new(s: State, at: Timestamp) -> Cx {
+        Cx { s, at, out: Decision::default(), k: 0 }
+    }
+
     // ------------------------------------------------------------ emitting
 
-    fn emit(&mut self, d: Draft<Event>) {
+    pub(crate) fn emit(&mut self, d: Draft<Event>) {
         let Draft { parent, origin, trust, audience, body, rendered } = d;
         let env = Envelope {
             id: EventId(format!("~draft.{}.{}", self.s.next_seq, self.k)),
@@ -155,11 +159,11 @@ impl Cx {
         self.out.events.push(Draft { parent, origin, trust, audience, body, rendered });
     }
 
-    fn internal(&mut self, ev: Event) {
+    pub(crate) fn internal(&mut self, ev: Event) {
         self.emit(Draft::internal(ev));
     }
 
-    fn user(&mut self, ev: Event) {
+    pub(crate) fn user(&mut self, ev: Event) {
         self.emit(user_draft(ev));
     }
 
@@ -168,7 +172,7 @@ impl Cx {
     }
 
     /// A model-visible event, rendered at write time.
-    fn visible(&mut self, origin: Origin, trust: Trust, body: Event) {
+    pub(crate) fn visible(&mut self, origin: Origin, trust: Trust, body: Event) {
         let rendered = render::render(&RuleSet::default(), &self.profile(), &trust, &body);
         self.emit(Draft { parent: Parent::Head, origin, trust, audience: Audience::Both, body, rendered });
     }
@@ -199,7 +203,7 @@ impl Cx {
         self.emit(Draft { audience: Audience::Model, ..Draft::internal(Event::Replaced(rep)) });
     }
 
-    fn cfg(&self) -> &KernelConfig {
+    pub(crate) fn cfg(&self) -> &KernelConfig {
         self.s.config.as_ref().expect("config present")
     }
 
@@ -219,7 +223,13 @@ impl Cx {
         } else {
             result.trust.clone()
         };
+        let found = std::mem::take(&mut result.instructions);
+        let ended = self.subagent_ended(call, &result, executed);
         self.visible(Origin::Tool(call.name.clone()), trust, Event::ToolResulted { call: call.clone(), result });
+        if let Some(ev) = ended {
+            self.user(ev);
+        }
+        self.instructions_found(found);
     }
 
     fn end_turn(&mut self, outcome: TurnOutcome) {
@@ -452,7 +462,7 @@ impl Cx {
 
     // ------------------------------------------------------------ sequences / config
 
-    fn open_sequence(&mut self, rerender: bool) {
+    pub(crate) fn open_sequence(&mut self, rerender: bool) {
         let cfg = self.cfg().clone();
         let caps = self.s.caps.clone().unwrap_or_else(|| cfg.caps.clone());
         let seq_no = self.s.head.as_ref().map(|h| h.seq_no + 1).unwrap_or(0);
@@ -775,6 +785,8 @@ impl Cx {
                     Verdict::Rewrite(Proposal::Result(mut r)) => {
                         // A rewrite never launders trust.
                         r.trust = Trust::weakest(&result.trust, &r.trust);
+                        r.subagent = result.subagent.clone();
+                        r.instructions = result.instructions.clone();
                         r
                     }
                     _ => result.clone(),
@@ -1048,7 +1060,8 @@ impl Cx {
             }
             let calls: Vec<ToolCall> = chosen.iter().map(|c| (*c).clone()).collect();
             let grants = calls.iter().map(|c| (c.id.clone(), c.access.clone())).collect();
-            self.issue(Effect::Execute(Batch { calls, grants }));
+            self.issue(Effect::Execute(Batch { calls: calls.clone(), grants }));
+            self.subagents_started(&calls);
             return true;
         }
         if running {
@@ -1171,6 +1184,7 @@ impl Cx {
             self.issue(Effect::Gate(req));
             return true;
         }
+        self.inject_instructions();
         for m in self.s.mailbox.clone() {
             self.visible(m.origin, m.trust, Event::Injected { source: m.source, text: m.text });
         }

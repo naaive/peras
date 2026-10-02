@@ -287,9 +287,11 @@ where
     /// `NullCheckpointer`, `NullSandbox`, `EnvSecrets`, `SystemClock`, `UlidGen`).
     pub fn build(self) -> Runtime<D> {
         let options = self.options;
+        let blobs: Arc<dyn BlobStore> = self.blobs.unwrap_or_else(|| Arc::new(MemBlobStore::new()));
+        let tasks = Arc::new(crate::tasks::TaskRegistry::new(blobs.clone()));
         let env = Env {
             journal: self.journal.unwrap_or_else(|| Arc::new(MemJournal::new())),
-            blobs: self.blobs.unwrap_or_else(|| Arc::new(MemBlobStore::new())),
+            blobs,
             model: self.model.unwrap_or_else(|| Arc::new(NoModel::default())),
             tools: Arc::new(self.tools.unwrap_or_else(|| ToolRegistry::new(options.workspace.clone()))),
             gates: self.gates.unwrap_or_else(|| Arc::new(GateChain::default())),
@@ -305,8 +307,23 @@ where
             metrics: self.metrics.unwrap_or_default(),
             rebuilder: self.rebuilder,
             cursors: self.cursors,
+            tasks,
         };
-        Runtime { env: Arc::new(env), sessions: Arc::default(), codec: self.codec, _d: PhantomData }
+        let sessions: Arc<Mutex<HashMap<SessionId, SessionHandle<D>>>> = Arc::default();
+        // A finished background task is delivered to its session as a
+        // notification (next safe point).
+        let weak = Arc::downgrade(&sessions);
+        env.tasks.set_notifier(Arc::new(move |t: &crate::tasks::TaskInfo| {
+            let (Some(owner), Some(sessions)) = (&t.owner, weak.upgrade()) else { return };
+            let Some(h) = sessions.lock().unwrap().get(owner).cloned() else { return };
+            let _ = h.post(Input::Signal(Signal::Notify {
+                source: "task".into(),
+                key: format!("task:{}", t.id),
+                text: crate::tasks::describe(t),
+                untrusted: false,
+            }));
+        }));
+        Runtime { env: Arc::new(env), sessions, codec: self.codec, _d: PhantomData }
     }
 }
 
@@ -333,6 +350,16 @@ where
     /// Live session handle, if this runtime drives it.
     pub fn session(&self, id: &SessionId) -> Option<SessionHandle<D>> {
         self.sessions.lock().unwrap().get(id).cloned()
+    }
+
+    /// Every session this runtime currently drives.
+    pub fn live_sessions(&self) -> Vec<SessionHandle<D>> {
+        self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Background tasks of this runtime's sessions.
+    pub fn tasks(&self) -> &Arc<crate::tasks::TaskRegistry> {
+        &self.env.tasks
     }
 
     /// Start a new session: acquire the lease, append `initial`'s events (for

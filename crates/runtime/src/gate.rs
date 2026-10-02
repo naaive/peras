@@ -35,12 +35,24 @@ struct Slot {
 }
 
 /// Per-session pending questions with compare-and-swap answering.
-#[derive(Default)]
 pub struct AskBoard {
     slots: Mutex<BTreeMap<QuestionId, Slot>>,
+    /// Every newly opened question (clients that do not follow the journal,
+    /// e.g. questions forwarded from a sub-agent, learn about them here).
+    opened: tokio::sync::broadcast::Sender<Question>,
+}
+
+impl Default for AskBoard {
+    fn default() -> Self {
+        AskBoard { slots: Mutex::default(), opened: tokio::sync::broadcast::channel(64).0 }
+    }
 }
 
 const MAX_ANSWERED_KEPT: usize = 1024;
+
+/// Id prefix of questions a sub-agent asked that were forwarded to the
+/// parent session's board (`subagent:<child session>:<question id>`).
+pub const FORWARDED_QUESTION_PREFIX: &str = "subagent:";
 
 impl AskBoard {
     pub fn new() -> Self {
@@ -53,6 +65,7 @@ impl AskBoard {
         if !slots.contains_key(&q.id) {
             let (tx, _) = watch::channel(None);
             slots.insert(q.id.clone(), Slot { question: q.clone(), tx });
+            let _ = self.opened.send(q.clone());
         }
         if slots.len() > MAX_ANSWERED_KEPT {
             let answered: Vec<QuestionId> =
@@ -83,6 +96,11 @@ impl AskBoard {
         };
         let r = rx.wait_for(|v| v.is_some()).await.ok()?.clone();
         r
+    }
+
+    /// Questions opened from now on.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Question> {
+        self.opened.subscribe()
     }
 
     /// Unanswered questions (for clients that connect late).

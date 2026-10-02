@@ -116,6 +116,15 @@ impl H {
         h
     }
 
+    /// A session started with [`start_session_with`] (sub-agent children,
+    /// memory loaded at start).
+    pub fn start(id: &str, c: KernelConfig, start: SessionStart) -> H {
+        let mut h = H { s: State::default(), log: vec![], at: 1_000, pending: vec![], steps: vec![], requests: vec![] };
+        let d = start_session_with(id.into(), "hash".into(), c, start);
+        h.apply(d);
+        h
+    }
+
     pub fn apply(&mut self, d: Decision) -> Vec<(EffectId, Effect)> {
         // Every effect is logged (in this decision or, for resumed ones, earlier).
         for (id, _) in &d.effects {

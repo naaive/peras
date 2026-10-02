@@ -196,6 +196,8 @@ pub struct ToolOutput {
     pub trust: Option<Trust>,
     /// Content hashes observed while reading.
     pub observed: Vec<Access>,
+    /// Sub-agent tools: the child's outcome and usage (ADDITIVE).
+    pub subagent: Option<Box<SubagentReport>>,
 }
 
 impl ToolOutput {
@@ -228,6 +230,9 @@ pub struct ToolCtx {
     pub progress: Arc<dyn Fn(String) + Send + Sync>,
     /// For sub-agent tools: spawns a child session.
     pub subagents: Option<Arc<dyn SubagentSpawner>>,
+    /// Background task registry (long-running work, background sub-agents)
+    /// (ADDITIVE).
+    pub tasks: Option<Arc<crate::tasks::TaskRegistry>>,
 }
 
 pub trait SecretSource: Send + Sync {
@@ -261,6 +266,11 @@ pub trait SubagentSpawner: Send + Sync {
         task: String,
         tainted_input: bool,
     ) -> Result<(TurnOutcome, bool), ToolError>;
+    /// The concrete spawner, for embedders that link sub-agent tools to the
+    /// parent runtime (ADDITIVE).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------- gates
