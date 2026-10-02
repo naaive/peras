@@ -19,6 +19,9 @@ pub const PENDING_CONFIG_KIND: &str = "kernel.pending_config";
 /// `Event::Plugin` kind journaling that the model rejected a request as too
 /// long (the overflow path of pressure relief is in progress for the turn).
 pub const OVERFLOW_KIND: &str = "kernel.context_overflow";
+/// `Event::Plugin` kind journaling the focus of a `Control::Compact`
+/// (data: the focus text), right after its `TurnStarted`.
+pub const COMPACT_FOCUS_KIND: &str = "kernel.compact_focus";
 /// `Event::Plugin` kind used to journal a queued signal the kernel dropped
 /// (data: `{"signal": <Signal>, "reason": <String>}`), e.g. a wake whose
 /// continuation budget is exhausted with no user input queued to reset it.
@@ -185,6 +188,12 @@ pub(crate) struct Turn {
     pub executed_step: bool,
     pub calls: u32,
     pub repeats: BTreeMap<String, u32>,
+    /// `Control::Compact`: what the summary should focus on.
+    #[serde(default)]
+    pub focus: Vec<String>,
+    /// A summary replaced history during this turn.
+    #[serde(default)]
+    pub compacted: bool,
 }
 
 impl Turn {
@@ -211,6 +220,8 @@ impl Turn {
             executed_step: false,
             calls: 0,
             repeats: BTreeMap::new(),
+            focus: vec![],
+            compacted: false,
         }
     }
 
@@ -892,6 +903,9 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             }
             if let Some(t) = s.turn.as_mut() {
                 t.relief = true;
+                if rep.kind == ReplacementKind::Summary {
+                    t.compacted = true;
+                }
             }
         }
         Event::StateSnapshot { key, text } => {
@@ -947,6 +961,10 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
             } else if kind == PENDING_CONFIG_KIND {
                 if let Ok(cfg) = serde_json::from_value::<KernelConfig>(data.clone()) {
                     s.pending_config = Some(cfg);
+                }
+            } else if kind == COMPACT_FOCUS_KIND {
+                if let (Some(t), Some(f)) = (s.turn.as_mut(), data.as_str()) {
+                    t.focus.push(f.to_string());
                 }
             } else if kind == OVERFLOW_KIND {
                 if let Some(t) = s.turn.as_mut() {
@@ -1162,6 +1180,7 @@ fn on_turn_started(s: &mut State, cause: TurnCause, at: Timestamp, seq: Seq) {
             }
         }
         TurnCause::Continuation => s.continuations += 1,
+        TurnCause::Compact => {}
     }
 }
 

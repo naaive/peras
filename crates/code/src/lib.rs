@@ -25,6 +25,7 @@
 //! ```
 
 pub mod builtin;
+pub mod context;
 pub mod history;
 pub mod mode;
 pub mod print;
@@ -159,6 +160,8 @@ pub struct Options {
     pub hot_reload: bool,
     /// The user's home (user configuration layer); default `$HOME`.
     pub home: Option<Option<PathBuf>>,
+    /// Long-term memory (`remember` / `recall`, loaded at session start).
+    pub memory: bool,
 }
 
 impl Options {
@@ -177,6 +180,7 @@ impl Options {
             unattended: None,
             hot_reload: false,
             home: None,
+            memory: true,
         }
     }
 
@@ -219,6 +223,10 @@ impl Options {
         if !perms.is_empty() {
             t.insert("permissions".into(), toml::Value::Array(perms));
         }
+        let mut git = toml::Table::new();
+        git.insert("key".into(), context::GIT_KEY.into());
+        git.insert("min_interval_ms".into(), (context::GIT_MIN_INTERVAL_MS as i64).into());
+        t.insert("snapshots".into(), toml::Value::Array(vec![toml::Value::Table(git)]));
         t.to_string()
     }
 
@@ -252,6 +260,16 @@ impl Options {
         if let Some(home) = &self.home {
             agent = agent.home(home.clone());
         }
+        if self.memory {
+            let home = match &self.home {
+                Some(h) => h.clone(),
+                None => std::env::var_os("HOME").map(PathBuf::from),
+            };
+            match context::ScopedMemory::new(home.as_deref(), &self.dir) {
+                Ok(m) => agent = agent.memory(m),
+                Err(e) => tracing::warn!(error = %e, "long-term memory unavailable"),
+            }
+        }
         if let Some(port) = &self.port {
             agent = agent.model_port(port.clone());
         }
@@ -265,7 +283,7 @@ impl Options {
             agent = agent.hot_reload();
         }
         let port_model = self.port.as_ref().map(|p| p.caps().model.to_string());
-        Coding { agent, permissions, todos, dir: self.dir.clone(), db, port_model }
+        Coding { agent, permissions, todos, dir: self.dir.clone(), db, port_model, state: context::StateSync::default() }
     }
 }
 
@@ -306,6 +324,8 @@ pub struct Coding {
     pub db: PathBuf,
     /// The model of the port given in [`Options::port`].
     pub port_model: Option<String>,
+    /// State values already sent per session.
+    pub state: context::StateSync,
 }
 
 impl Coding {
@@ -320,6 +340,19 @@ impl Coding {
         } else {
             id
         })
+    }
+
+    /// Send the session's state values that changed (mode, task list, git
+    /// state, date); the kernel turns them into snapshots at its next safe
+    /// point. Call before each turn.
+    pub async fn sync_state(&self, session: &str) -> Result<(), agent::Error> {
+        let id = agent::proto::SessionId::new(session.to_string());
+        let values = context::StateSync::values(&self.dir, self.permissions.mode(), &self.todos, &id);
+        let chat = self.agent.session(session.to_string());
+        for (k, v) in self.state.changed(&id, values) {
+            chat.set_state(k, v).await?;
+        }
+        Ok(())
     }
 
     /// The conversation index of this workspace.

@@ -393,6 +393,9 @@ impl Repl {
             let _ = self.coding.history().record(&self.session, &text);
             self.recorded = true;
         }
+        if let Err(e) = self.coding.sync_state(&self.session).await {
+            self.say(&render::red(&format!("  could not update the session state: {e}")));
+        }
         let mut run = self.coding.agent.session(self.session.clone()).stream(text);
         let ctl = run.control();
         let mut calls: HashMap<CallId, ToolCall> = HashMap::new();
@@ -674,38 +677,24 @@ impl Repl {
         }
     }
 
-    /// Summarize the conversation and start a new one from the summary.
+    /// Summarize the conversation in place: the kernel replaces the history
+    /// with a summary (which keeps its taint) and later turns continue from it.
     async fn compact(&mut self, focus: &str) {
-        self.say(&render::dim("Compacting the conversation..."));
-        let mut instruction = format!(
-            "{}\n\nReply with the summary only, as plain text. Do not call any tools.",
-            agent::proto::config::DEFAULT_SUMMARY_INSTRUCTION
-        );
-        if !focus.is_empty() {
-            instruction.push_str(&format!("\nFocus on: {focus}"));
+        if !self.recorded {
+            self.say("Nothing to compact.");
+            return;
         }
-        let mut run = self.coding.agent.session(self.session.clone()).stream(instruction);
-        let mut summary = None;
+        self.say(&render::dim("Compacting the conversation..."));
+        let focus = (!focus.is_empty()).then(|| focus.to_string());
+        let mut run = self.coding.agent.session(self.session.clone()).compact(focus);
         while let Some(u) = run.next().await {
             match u {
-                Update::Reply(m) => self.totals.add(&m.usage),
-                Update::Ask(a) => a.deny("Compacting: no tools."),
-                Update::Done(TurnOutcome::Done { text }) => summary = Some(text),
+                Update::Ask(a) => a.deny("Compacting: nothing to approve."),
+                Update::Done(TurnOutcome::Done { text }) => self.say(&render::dim(&text)),
                 Update::Done(o) => self.outcome(&o),
                 _ => {}
             }
         }
-        let Some(summary) = summary.filter(|s| !s.trim().is_empty()) else {
-            self.say(&render::red("Compaction failed; the conversation is unchanged."));
-            return;
-        };
-        let previous = std::mem::replace(&mut self.session, new_id());
-        self.recorded = false;
-        self.pending.push(format!(
-            "This conversation continues an earlier one ({previous}) that was compacted. Summary of the earlier conversation:\n<summary>\n{}\n</summary>",
-            summary.trim()
-        ));
-        self.say(&render::dim(&format!("Compacted ({} chars). The summary goes with your next message.", summary.len())));
     }
 
     async fn resume(&mut self, args: &str) {

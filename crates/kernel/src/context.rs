@@ -277,6 +277,11 @@ pub(crate) fn plan_summary(s: &State) -> Option<SummaryPlan> {
     plan_from(&s.context, tail_start(&s.context, keep_recent(s)))
 }
 
+/// Manual compaction: the whole context.
+pub(crate) fn plan_all(s: &State) -> Option<SummaryPlan> {
+    plan_from(&s.context, s.context.len())
+}
+
 /// Overflow path: only the earliest segment (about half a window), never the last group.
 pub(crate) fn plan_overflow_segment(s: &State) -> Option<SummaryPlan> {
     let ctx = &s.context;

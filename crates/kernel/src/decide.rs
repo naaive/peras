@@ -401,6 +401,15 @@ impl Cx {
                 }
             }
             Control::ClearTaint => self.user(Event::TaintCleared),
+            Control::Compact { focus } => {
+                if !self.idle() {
+                    return Err(Rejection::new("busy: compact between turns"));
+                }
+                self.user(Event::TurnStarted { cause: TurnCause::Compact });
+                if let Some(f) = focus.filter(|f| !f.trim().is_empty()) {
+                    self.internal(Event::Plugin { kind: COMPACT_FOCUS_KIND.into(), ignorable: true, data: serde_json::Value::String(f) });
+                }
+            }
             Control::Reconfigure { config } => {
                 if self.idle() {
                     self.apply_config(*config);
@@ -1003,6 +1012,29 @@ impl Cx {
         }
     }
 
+    /// A `Control::Compact` turn: the PreCompact hook (if any), one summary
+    /// of the whole context, then the end of the turn.
+    fn manual_compact_step(&mut self) -> bool {
+        let Some(t) = self.s.turn.clone() else { return false };
+        if t.compacted {
+            self.end_turn(TurnOutcome::Done { text: "Conversation compacted.".into() });
+            return true;
+        }
+        if t.relief {
+            self.end_turn(TurnOutcome::Failed { error: "compaction did not shorten the conversation".into() });
+            return true;
+        }
+        if t.precompact == PreCompact::None && self.s.hooked(HookPoint::PreCompact) {
+            self.pre_compact_gate();
+            return true;
+        }
+        match context::plan_all(&self.s).filter(|_| self.s.head.is_some()) {
+            Some(plan) => self.issue_compact(plan, false),
+            None => self.end_turn(TurnOutcome::Done { text: "Nothing to compact.".into() }),
+        }
+        true
+    }
+
     fn pre_compact_gate(&mut self) {
         let req = self.gate_req(HookPoint::PreCompact, Ring::Hook, GateSubject::PreCompact, None);
         self.issue(Effect::Gate(req));
@@ -1014,10 +1046,11 @@ impl Cx {
         // Pressure path: the current request replayed verbatim; overflow path:
         // only the earliest segment. Both are prefixes of the context.
         let entries = if overflow { plan.entries } else { self.s.context.len() };
-        let preserve = match self.s.turn.as_ref().map(|t| &t.precompact) {
+        let mut preserve = match self.s.turn.as_ref().map(|t| &t.precompact) {
             Some(PreCompact::Ready(p) | PreCompact::Done(p)) => p.clone(),
             _ => vec![],
         };
+        preserve.extend(self.s.turn.as_ref().map(|t| t.focus.clone()).unwrap_or_default());
         let mut instruction = cfg.compaction.instruction.clone();
         if !preserve.is_empty() {
             instruction.push_str("\n\nPoints to preserve:");
@@ -1324,6 +1357,9 @@ impl Cx {
         if let Some(what) = self.turn_budget_exhausted() {
             self.end_turn(TurnOutcome::BudgetExhausted { what });
             return true;
+        }
+        if cause == TurnCause::Compact {
+            return self.manual_compact_step();
         }
         let (relief, ready, overflow) = self
             .s

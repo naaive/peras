@@ -457,3 +457,85 @@ async fn openai_compatible_provider_end_to_end() {
     assert!(body["messages"][0]["content"].to_string().contains("You are Peras"));
     assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "multi_edit"));
 }
+
+// ------------------------------------------------------------------ context engineering
+
+#[tokio::test]
+async fn state_snapshots_reach_the_model_when_they_change() {
+    let ws = workspace();
+    let script = Arc::new(Script::new().say("one").say("two").say("three"));
+    let mut o = options(&ws, Script::new());
+    o.port = Some(script.clone());
+    o.mode = PermissionMode::Plan;
+    let c = o.build();
+    let chat_id = "snap".to_string();
+    for (i, prompt) in ["first", "second", "third"].iter().enumerate() {
+        if i == 2 {
+            c.permissions.set_mode(PermissionMode::AcceptEdits);
+        }
+        c.sync_state(&chat_id).await.unwrap();
+        let (out, _) = drive(c.agent.session(chat_id.clone()).stream(prompt.to_string()), false).await;
+        assert!(matches!(out, Some(TurnOutcome::Done { .. })));
+    }
+    let bodies: Vec<String> = script.requests().iter().map(|r| r.body.to_string()).collect();
+    assert!(bodies[0].contains("Permission mode: plan") && bodies[0].contains("Today's date"), "{}", bodies[0]);
+    let id = SessionId::new(chat_id);
+    let events = c.agent.runtime().await.unwrap().env().journal.load(&id, 0).await.unwrap();
+    let snaps: Vec<String> = events
+        .iter()
+        .filter_map(|e| match &e.body {
+            Event::StateSnapshot { key, .. } => Some(key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(snaps.iter().filter(|k| *k == "permission_mode").count(), 2, "unchanged values are not repeated: {snaps:?}");
+    assert_eq!(snaps.iter().filter(|k| *k == "date").count(), 1, "{snaps:?}");
+    assert!(bodies[2].contains("Permission mode: accept edits"), "{}", bodies[2]);
+    let system = script.requests()[0].body["system"].to_string();
+    assert!(!system.contains("Today's date"), "the system prompt stays stable: {system}");
+}
+
+#[tokio::test]
+async fn compact_replaces_history_in_place() {
+    let ws = workspace();
+    let script = Arc::new(Script::new().say("first answer").say("SUMMARY-OF-EARLIER").say("after compaction"));
+    let mut o = options(&ws, Script::new());
+    o.port = Some(script.clone());
+    let c = o.build();
+    let out = repl(c.clone(), &["the first question", "/compact the parser", "next question", "/exit"], None).await;
+    assert!(out.contains("Conversation compacted."), "{out}");
+    assert!(out.contains("after compaction"), "{out}");
+    let reqs = script.requests();
+    assert_eq!(reqs.len(), 3);
+    assert!(reqs[1].body.to_string().contains("the parser"), "the focus goes into the summary instruction");
+    let last = reqs[2].body.to_string();
+    assert!(last.contains("SUMMARY-OF-EARLIER"), "{last}");
+    assert!(!last.contains("the first question"), "the summarised history is gone from the request: {last}");
+    assert_eq!(c.history().list().len(), 1, "the same conversation continues");
+}
+
+#[tokio::test]
+async fn memory_written_in_one_session_is_loaded_in_the_next() {
+    let ws = workspace();
+    let home = tempfile::tempdir().unwrap();
+    let script = Arc::new(
+        Script::new()
+            .call("remember", json!({"key": "project/test-cmd", "value": "cargo test -p core"}))
+            .say("noted")
+            .say("hello again"),
+    );
+    let mut o = options(&ws, Script::new());
+    o.port = Some(script.clone());
+    o.home = Some(Some(home.path().to_path_buf()));
+    o.mode = PermissionMode::BypassPermissions;
+    let c = o.build();
+    let (out, _) = drive(c.agent.run("remember how to test"), false).await;
+    assert_eq!(out, done("noted"));
+    assert!(ws.path().join(".agent/memory").read_dir().unwrap().next().is_some(), "project memory lives in the workspace");
+    let (out, _) = drive(c.agent.run("new session"), false).await;
+    assert_eq!(out, done("hello again"));
+    let second = script.requests()[2].body.to_string();
+    assert!(second.contains("project/test-cmd: cargo test -p core"), "{second}");
+    let names: Vec<String> = c.agent.runtime().await.unwrap().tools().specs().into_iter().map(|s| s.name).collect();
+    assert!(names.contains(&"remember".to_string()) && names.contains(&"recall".to_string()), "{names:?}");
+}

@@ -69,4 +69,12 @@ pub enum Control {
     ClearTaint,
     /// Configuration was recompiled; applied at the next idle.
     Reconfigure { config: Box<crate::config::KernelConfig> },
+    /// Summarise the whole conversation now (between turns): a turn of its
+    /// own that replaces the history with a summary (taint carries over) and
+    /// ends without sampling. `focus` is added to the summary instruction.
+    /// (ADDITIVE)
+    Compact {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<String>,
+    },
 }

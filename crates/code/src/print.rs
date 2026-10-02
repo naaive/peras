@@ -93,11 +93,9 @@ impl Outcome {
 /// workspace's conversation index).
 pub async fn run(coding: &Coding, resume: Option<String>, prompt: String, format: OutputFormat, out: &mut dyn Write) -> Outcome {
     let started = std::time::Instant::now();
-    let mut run = match &resume {
-        Some(id) => coding.agent.session(id.clone()).stream(prompt.clone()),
-        None => coding.agent.run(prompt.clone()),
-    };
-    let session = run.session_id().to_string();
+    let session = resume.clone().unwrap_or_else(|| ulid::Ulid::new().to_string());
+    let _ = coding.sync_state(&session).await;
+    let mut run = coding.agent.session(session.clone()).stream(prompt.clone());
     if resume.is_none() {
         let _ = coding.history().record(&session, &prompt);
     }

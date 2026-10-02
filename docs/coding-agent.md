@@ -9,7 +9,8 @@ tools, permission modes, built-in sub-agents and commands, workspace trust, a co
 
 | Module | Role |
 |---|---|
-| `prompt` | Coding system prompt (replaces the framework's base prompt) and the environment block: working directory, git branch / status / recent commits, platform, date |
+| `prompt` | Coding system prompt (replaces the framework's base prompt) and the static environment block: working directory, platform, whether it is a git repository |
+| `context` | State snapshots (permission mode, task list, git state, date) and long-term memory (`user` scope in `~/.agent/memory`, `project` scope in `.agent/memory`) |
 | `tools` | `edit` with `replace_all` (replaces the built-in `edit`), atomic `multi_edit`, `ls`, `todo_write`, `exit_plan_mode` |
 | `mode` | Permission modes and session grants: a ring-4 gate (plan mode) and a ring-5 auto-answer rule (accept edits, bypass, grants) |
 | `builtin` | Sub-agents `explore`, `plan`, `general-purpose` and commands `/init`, `/review`, `/security-review`, `/commit`, added to the discovered files with the lowest precedence |
@@ -30,6 +31,24 @@ Supporting framework changes:
 - `Chat::control` and `Ask::subject`.
 - Questions an auto-answer rule answers are opened already answered (`GateExecutor::auto_answer`,
   `AskBoard::open_answered`), so clients only ever see questions a human has to answer.
+
+## Context engineering
+
+The framework does most of it on its own: three layers, append-only requests with write-time rendering, cache
+breakpoints, pressure relief (spill, trim, image offload, summaries), subdirectory instructions injected on access,
+skills loaded progressively, and the trust framing. `peras` uses that machinery in four places.
+
+- **Stable system prompt.** The system prompt holds only what does not change during a session, so its cache prefix
+  survives.
+- **State snapshots.** Before each turn, the values that changed are sent as state (`Chat::set_state`): the
+  permission mode, the open task list, the git state (at most once a minute, via `[[snapshots]]`) and the date. The
+  kernel appends a snapshot only when a value changed. Old snapshots are superseded and dropped first under
+  pressure. The model sees a mode change without a change to the tool definitions: the design's "visibility is
+  separate from executability".
+- **Manual compaction.** `/compact` goes through the kernel's own summary path: a replacement event, the
+  `PreCompact` hook, taint carried over to the summary. It does not start a new session.
+- **Long-term memory.** Memory is loaded into the Durable layer when a session starts. `remember` and `recall` are
+  `mem:` resources. Memory is a persistence target, so a tainted session cannot write it without a human.
 
 ## Compared with Claude Code
 
@@ -54,7 +73,8 @@ Supporting framework changes:
 | `!` bash mode | ✅ | The output goes with the next message. |
 | Hooks, MCP servers, plugins, skills | ✅ | From the framework (`[[hooks]]`, `[mcp.*]`, plugins, `skills/*/SKILL.md`). Changes are hot reloaded between turns. |
 | Checkpoints, `/rewind` | ✅ | Restores the conversation and the agent's file changes. Conflicting edits and irreversible operations are reported. |
-| Auto-compaction, `/compact` | ✅ | The kernel compacts under context pressure. `/compact` starts a new conversation seeded with a summary. |
+| Auto-compaction, `/compact` | ✅ | The kernel compacts under context pressure. `/compact [focus]` is `Control::Compact`: a turn of its own that replaces the whole history with a summary, which keeps its taint. |
+| Memory (`#`, CLAUDE.md) | ✅ | `#note` → `AGENTS.md`. `remember` / `recall` give durable memory that is loaded into the next session; writes are gated, and a tainted session needs a human to approve them. |
 | `/cost`, `/status`, `/model` | ✅ | Cost shows only when the meter has a price for the model. |
 | Workspace trust dialog | ✅ | Remembered per directory; `--trust` skips the prompt. |
 | Sandboxed bash | ➕ | bubblewrap / landlock / seatbelt / container. An opaque command runs isolated and its file changes are reviewed before they merge. |
@@ -74,4 +94,8 @@ Supporting framework changes:
 - the assembled tool set;
 - built-in definitions yielding to project files;
 - print mode (`json`, `stream-json`, denied questions);
-- the REPL: commands, approval with "don't ask again", denial with an instruction, `!` and `#`.
+- the REPL: commands, approval with "don't ask again", denial with an instruction, `!` and `#`;
+- the OpenAI-compatible provider against a local endpoint;
+- state snapshots reaching the model only when they change;
+- `/compact` replacing history in place;
+- memory written in one session being loaded in the next.

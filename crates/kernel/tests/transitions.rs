@@ -935,3 +935,44 @@ fn hook_spend_is_charged_to_the_session_budget() {
     // Replay charges it again (it is in the journal, hooks are not re-run).
     assert_eq!(usage(&h.replay()), (150, 7));
 }
+
+#[test]
+fn manual_compaction_summarises_everything_keeps_taint_and_never_samples() {
+    let mut h = H::new(cfg());
+    h.submit("start");
+    let c = net_call("c1", "example.com");
+    h.sample(reply("", vec![c.clone()]));
+    let (xid, _) = h.take("execute");
+    h.complete(xid, EffectResult::Executed(vec![ok(&c, &"page ".repeat(200))]));
+    h.pending.retain(|(_, e)| e.kind() != "checkpoint");
+    h.sample(reply("done", vec![]));
+    assert_eq!(h.last_outcome(), Some(TurnOutcome::Done { text: "done".into() }));
+    assert!(is_tainted(&h.s), "the web read tainted the session");
+    let before = context(&h.s).len();
+
+    let eff = h.control(Control::Compact { focus: Some("the parser bug".into()) });
+    let Some((kid, Effect::Compact(job))) = eff.into_iter().find(|(_, e)| e.kind() == "compact") else { panic!("no compaction issued") };
+    assert!(!job.overflow);
+    let last = job.prompt.body.last().unwrap();
+    assert!(matches!(&last.blocks[0], RBlock::Text { text } if text.contains("the parser bug")), "{last:?}");
+    h.pending.retain(|(id, _)| *id != kid);
+    let eff = h.complete(kid, EffectResult::Compacted { summary: "S".into(), trust: Trust::Internal });
+    assert!(eff.iter().all(|(_, e)| e.kind() != "sample"), "a compaction turn never samples: {eff:?}");
+    assert_eq!(h.last_outcome(), Some(TurnOutcome::Done { text: "Conversation compacted.".into() }));
+    let ctx = context_sources(&h.s);
+    assert!(ctx.len() < before, "{} -> {}", before, ctx.len());
+    assert_eq!(ctx[0].kind, "replaced:summary");
+    assert!(is_tainted(&h.s), "the summary carries the taint of what it replaced");
+    assert_eq!(context(&h.replay()), context(&h.s));
+    assert!(matches!(phase(&h.s), Phase::Idle), "{:?}", phase(&h.s));
+}
+
+#[test]
+fn manual_compaction_is_refused_while_busy_and_trivial_when_empty() {
+    let mut h = H::new(cfg());
+    h.submit("start");
+    assert!(h.input(Input::Control(Control::Compact { focus: None })).is_err());
+    let mut h = H::new(cfg());
+    h.control(Control::Compact { focus: None });
+    assert_eq!(h.last_outcome(), Some(TurnOutcome::Done { text: "Nothing to compact.".into() }));
+}

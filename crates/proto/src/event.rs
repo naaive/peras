@@ -26,6 +26,9 @@ pub enum TurnCause {
     Wake,
     /// Stop hook asked to continue / undelivered steer.
     Continuation,
+    /// `Control::Compact`: summarise the conversation now, then end the turn
+    /// without sampling. (ADDITIVE)
+    Compact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

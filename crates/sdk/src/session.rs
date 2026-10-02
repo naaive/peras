@@ -39,6 +39,24 @@ impl Chat {
         Ok(())
     }
 
+    /// Set a state value ("what is true now": the mode, the environment).
+    /// The kernel appends it as a snapshot at the next safe point when it
+    /// changed (rate-limited by `[[snapshots]]`); an empty value clears it.
+    pub async fn set_state(&self, key: impl Into<String>, value: impl Into<String>) -> Result<(), Error> {
+        let h = self.agent.open(&self.id).await?;
+        h.send(Input::Signal(Signal::Silent { key: key.into(), value: value.into() })).await?;
+        Ok(())
+    }
+
+    /// Summarise the whole conversation now (between turns): the history is
+    /// replaced by a summary that keeps its taint, and later turns continue
+    /// from it. `focus` is added to the summary instruction. The run ends
+    /// with `Done` ("Conversation compacted." / "Nothing to compact.") or
+    /// `Failed`.
+    pub fn compact(&self, focus: Option<String>) -> Run {
+        Run::with_input(self.agent.clone(), Target::Open(self.id.clone()), Input::Control(Control::Compact { focus }))
+    }
+
     /// Next seq (useful as a rewind point).
     pub async fn next_seq(&self) -> Result<Seq, Error> {
         Ok(self.agent.open(&self.id).await?.next_seq())
