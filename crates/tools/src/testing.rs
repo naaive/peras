@@ -9,14 +9,42 @@ use agent_runtime::{
     AccessCtx, BlobStore, ExecOutput, MemoryStore, SandboxPort, SandboxReport, SandboxSpec,
     SecretSource, StoreError, Tool, ToolCtx, ToolError, ToolOutput,
 };
+use agent_sim::VirtualClock;
 use async_trait::async_trait;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-tokio::task_local! {
-    static WORKSPACE: PathBuf;
+/// What an `#[agent_test]` provides: a temporary workspace, a framework data
+/// directory next to it (shadow snapshots, locks, cursors), and a virtual
+/// clock. Agents built inside the test default to all three.
+#[derive(Debug, Clone)]
+pub struct TestScope {
+    pub workspace: PathBuf,
+    pub data_dir: PathBuf,
+    /// The time the runtime stamps on events. It starts at [`TEST_EPOCH_MS`]
+    /// and only moves when the test advances it.
+    pub clock: VirtualClock,
+}
+
+/// Start of the virtual clock (2026-01-01T00:00:00Z).
+pub const TEST_EPOCH_MS: u64 = 1_767_225_600_000;
+
+thread_local! {
+    // The test body runs on a current-thread runtime: every task it spawns
+    // (e.g. a run building its agent) runs on this thread.
+    static SCOPE: RefCell<Option<TestScope>> = const { RefCell::new(None) };
+}
+
+/// The scope of the current `#[agent_test]`, `None` outside one.
+pub fn scope() -> Option<TestScope> {
+    SCOPE.with(|s| s.borrow().clone())
+}
+
+fn current() -> TestScope {
+    scope().expect("agent_tools::testing called outside #[agent_test]")
 }
 
 /// The temporary workspace of the current `#[agent_test]`.
@@ -24,27 +52,49 @@ tokio::task_local! {
 /// # Panics
 /// Outside an `#[agent_test]`.
 pub fn workspace() -> PathBuf {
-    WORKSPACE
-        .try_with(|p| p.clone())
-        .expect("agent_tools::testing::workspace() called outside #[agent_test]")
+    current().workspace
 }
 
-/// Runs an `#[agent_test]` body: current-thread runtime, fresh temp workspace.
+/// The virtual clock of the current `#[agent_test]` (advance it to move
+/// the time agents see: turn budgets, snapshot intervals).
+///
+/// # Panics
+/// Outside an `#[agent_test]`.
+pub fn clock() -> VirtualClock {
+    current().clock
+}
+
+/// Runs an `#[agent_test]` body: current-thread runtime, fresh temp
+/// workspace and data directory, virtual clock.
 pub fn run_test<F, Fut, R>(f: F) -> R
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = R>,
 {
     let dir = tempfile::tempdir().expect("create temp workspace");
-    let path = dir
-        .path()
-        .canonicalize()
-        .expect("canonicalize temp workspace");
+    let root = dir.path().canonicalize().expect("canonicalize temp dir");
+    let scope = TestScope {
+        workspace: root.join("ws"),
+        data_dir: root.join("data"),
+        clock: VirtualClock::new(TEST_EPOCH_MS),
+    };
+    std::fs::create_dir_all(&scope.workspace).expect("create temp workspace");
+    std::fs::create_dir_all(&scope.data_dir).expect("create temp data dir");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let r = rt.block_on(WORKSPACE.scope(path, f()));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SCOPE.with(|s| s.borrow_mut().take());
+        }
+    }
+    SCOPE.with(|s| *s.borrow_mut() = Some(scope));
+    let reset = Reset;
+    let r = rt.block_on(f());
+    drop(rt);
+    drop(reset);
     drop(dir);
     r
 }

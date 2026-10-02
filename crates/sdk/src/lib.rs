@@ -50,7 +50,8 @@ pub use agent_runtime as runtime;
 pub use agent_sim as sim;
 pub use agent_tools as tools;
 
-/// `#[agent::test]`: async test with a fresh temporary workspace.
+/// `#[agent::test]`: async test with a fresh temporary workspace (the default
+/// for agents built in it) and a virtual clock.
 pub use agent_tools::agent_test as test;
 /// `#[agent::tool]`.
 pub use agent_tools::tool;

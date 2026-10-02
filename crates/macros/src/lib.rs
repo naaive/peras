@@ -411,12 +411,19 @@ fn expand_tool(
 }
 
 /// Wraps an async test in a current-thread tokio runtime with a fresh temporary
-/// workspace (re-exported by the facade as `#[agent::test]`).
+/// workspace and a virtual clock (re-exported by the facade as
+/// `#[agent::test]`).
 ///
 /// The workspace directory is created before the body runs, is reachable from
-/// inside the test through `agent_tools::testing::workspace()` (a task-local),
-/// and is deleted after the test. The clock is the real tokio clock (a paused
-/// clock would make subprocess timeouts fire immediately).
+/// inside the test through `agent_tools::testing::workspace()`, and is deleted
+/// after the test. Agents built in the test default to it (never the real
+/// current directory), keep their framework data (shadow snapshots, locks)
+/// in a temporary directory too, and stamp events with the virtual clock
+/// (`agent_tools::testing::clock()`), which only moves when the test advances
+/// it. Tokio timers stay real (a paused tokio clock would make subprocess
+/// timeouts fire immediately). Awaiting a run inside the test allows
+/// policy-level asks on the temporary workspace (the test is the user);
+/// invariant-level asks are still denied.
 #[proc_macro_attribute]
 pub fn agent_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {

@@ -23,6 +23,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+agent-sim.workspace = true
 ignore = "0.4"
 regex = "1"
 url = "2"

@@ -76,6 +76,11 @@ async fn edits_readme() -> anyhow::Result<()> {
 }
 ```
 
+Inside `#[agent::test]` an agent works on the temporary workspace (`agent::tools::testing::workspace()`,
+never the real current directory) and stamps events with a virtual clock (`testing::clock()`), and awaiting a
+run allows policy-level asks there (the test is the user); invariant-level asks still need a real human. This
+example is `crates/sdk/tests/readme.rs`.
+
 ## CLI
 
 ```sh

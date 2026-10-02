@@ -136,6 +136,9 @@ pub struct Run {
     ctrl_rx: Option<mpsc::UnboundedReceiver<Ctrl>>,
     outcome: Option<TurnOutcome>,
     detached: bool,
+    /// Awaited inside `#[agent::test]` on its temporary workspace: policy-level
+    /// asks are allowed (see `into_future`).
+    test_approver: bool,
 }
 
 impl Run {
@@ -144,6 +147,7 @@ impl Run {
     }
 
     pub(crate) fn with_input(agent: Agent, target: Target, input: Input) -> Run {
+        let test_approver = agent.in_test_workspace();
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         Run {
             session: target.id().clone(),
@@ -152,6 +156,7 @@ impl Run {
             ctrl_rx: Some(ctrl_rx),
             outcome: None,
             detached: false,
+            test_approver,
         }
     }
 
@@ -352,12 +357,21 @@ impl IntoFuture for Run {
     type IntoFuture = Pin<Box<dyn Future<Output = Result<String, Error>> + Send>>;
 
     /// Awaiting drains the remaining updates. Asks nobody handles are denied
-    /// (the run is awaited without an approver attached).
+    /// (the run is awaited without an approver attached), except inside
+    /// `#[agent::test]` on the test's temporary workspace: there the test is
+    /// the embedding code, which counts as the user, and allows policy-level
+    /// asks (recorded as answered by code). Invariant-level asks still need a
+    /// real human and are denied; handle `Update::Ask` to test asks.
     fn into_future(mut self) -> Self::IntoFuture {
         Box::pin(async move {
+            let approve = self.test_approver;
             while let Some(u) = self.next().await {
                 if let Update::Ask(a) = u {
-                    a.deny("no approver attached (the run was awaited without handling Update::Ask)");
+                    if approve && a.question.level == ApprovalLevel::Policy {
+                        a.allow();
+                    } else {
+                        a.deny("no approver attached (the run was awaited without handling Update::Ask)");
+                    }
                 }
             }
             let o = self.outcome.clone().ok_or(Error::Ended)?;

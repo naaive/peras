@@ -162,6 +162,15 @@ impl Agent {
         self.edit(|c| c.policy = Some(p))
     }
 
+    /// Inside `#[agent::test]` and working on the test's temporary workspace.
+    pub(crate) fn in_test_workspace(&self) -> bool {
+        let Some(t) = agent_tools::testing::scope() else { return false };
+        match &self.cfg.workspace {
+            None => true,
+            Some(w) => std::fs::canonicalize(w).map(|w| w.starts_with(&t.workspace)).unwrap_or(false),
+        }
+    }
+
     pub fn workspace(self, dir: impl AsRef<Path>) -> Agent {
         let p = dir.as_ref().to_path_buf();
         self.edit(|c| c.workspace = Some(p))
@@ -347,9 +356,13 @@ fn read_file(p: &Path) -> Result<String, Error> {
 }
 
 async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
-    let workspace = match &cfg.workspace {
-        Some(w) => w.clone(),
-        None => std::env::current_dir().map_err(|e| Error::Config(e.to_string()))?,
+    // Inside `#[agent::test]` the default is the test's temporary workspace
+    // (never the real current directory) and time is the virtual clock.
+    let test = agent_tools::testing::scope();
+    let workspace = match (&cfg.workspace, &test) {
+        (Some(w), _) => w.clone(),
+        (None, Some(t)) => t.workspace.clone(),
+        (None, None) => std::env::current_dir().map_err(|e| Error::Config(e.to_string()))?,
     };
     let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
 
@@ -537,6 +550,9 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     if let Some(m) = &cfg.memory {
         builder = builder.memory(m.clone());
     }
+    if let Some(t) = &test {
+        builder = builder.clock(Arc::new(t.clock.clone()));
+    }
     for o in &cfg.observers {
         builder = builder.observer(o.clone());
     }
@@ -544,8 +560,12 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     Ok(Arc::new(Built { rt, config: kc, profile_hash, profile, _lock: lock }))
 }
 
-/// Framework data directory (`$AGENT_DATA_DIR`, else `~/.agent`).
+/// Framework data directory (`$AGENT_DATA_DIR`, else `~/.agent`; inside
+/// `#[agent::test]`, the test's temporary one).
 fn data_dir() -> PathBuf {
+    if let Some(t) = agent_tools::testing::scope() {
+        return t.data_dir;
+    }
     std::env::var_os("AGENT_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".agent")))

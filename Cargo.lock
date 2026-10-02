@@ -203,6 +203,7 @@ dependencies = [
  "agent-macros",
  "agent-proto",
  "agent-runtime",
+ "agent-sim",
  "anyhow",
  "async-trait",
  "futures",
