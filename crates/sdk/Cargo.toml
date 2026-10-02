@@ -29,3 +29,4 @@ reqwest.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 anyhow.workspace = true
+tokio-util.workspace = true

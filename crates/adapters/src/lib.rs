@@ -19,7 +19,7 @@ pub use model::{
 
 pub use memory::FileMemoryStore;
 pub use sandbox::{
-    apply_isolated_changes, detect, probe, BwrapSandbox, Container, DirectExec, EgressProxy, LandlockSandbox,
-    SeatbeltSandbox,
+    apply_isolated_changes, check_required, detect, detect_with, probe, probe_with, BwrapSandbox, Container, DirectExec,
+    EgressProxy, LandlockSandbox, SandboxChoice, SeatbeltSandbox,
 };
 pub use store::{FsBlobStore, Sqlite, SqliteBlobStore, SqliteJournal};

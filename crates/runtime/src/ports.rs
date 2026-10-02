@@ -247,6 +247,21 @@ pub trait Tool: Send + Sync {
         self.spec().class
     }
     async fn call(&self, input: serde_json::Value, ctx: ToolCtx) -> Result<ToolOutput, ToolError>;
+    /// Adapt to the execution environment before registration (the probed
+    /// sandbox, configuration that extends built-in tools). `None` = keep
+    /// this tool as it is. (ADDITIVE)
+    fn adapt(&self, _env: &ToolEnv) -> Option<Arc<dyn Tool>> {
+        None
+    }
+}
+
+/// What a tool can adapt to (see [`Tool::adapt`]). (ADDITIVE)
+#[derive(Debug, Clone, Default)]
+pub struct ToolEnv {
+    /// The sandbox commands run in.
+    pub sandbox: SandboxReport,
+    /// Shell semantic-table extensions from the profile (`[[shell.commands]]`).
+    pub shell_rules: Vec<ShellRuleDef>,
 }
 
 /// Spawns sub-agent sessions (implemented by the runtime / sdk).

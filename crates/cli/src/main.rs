@@ -233,7 +233,20 @@ async fn real_main(cli: Cli) -> anyhow::Result<i32> {
             Ok(exit_code::OK)
         }
         Cmd::Doctor => {
-            let r = agent::adapters::probe();
+            // Probe the way a run selects: honoring `[sandbox] prefer / require`.
+            let prefs = agent::profile::discover(&agent::profile::DiscoverOptions::from_env(&cli.dir))
+                .ok()
+                .and_then(|s| agent::profile::compile(&s).ok())
+                .map(|p| p.sandbox)
+                .unwrap_or_default();
+            let choice = agent::adapters::SandboxChoice { prefer: prefs.prefer, require: prefs.require };
+            let r = match agent::adapters::probe_with(&choice) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("sandbox: error: {e}");
+                    agent::adapters::probe()
+                }
+            };
             println!("sandbox: {} (available: {}, isolation: {}, egress proxy: {})", r.implementation, r.available, r.isolation, r.egress_proxy);
             for n in &r.notes {
                 println!("  note: {n}");

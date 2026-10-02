@@ -403,14 +403,19 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
             Err(e) => tracing::warn!(server = %name, error = %e, "mcp server failed to start"),
         }
     }
-    let profile = profile.with_tools(registry.specs());
-
-    // ---- sandbox
+    // ---- sandbox (`[sandbox] prefer / require`); tools adapt to it
+    let choice = agent_adapters::SandboxChoice {
+        prefer: profile.sandbox.prefer.clone(),
+        require: profile.sandbox.require,
+    };
     let (sandbox, disposable) = match &cfg.sandbox {
         Some((s, d)) => (s.clone(), *d),
-        None => (agent_adapters::detect(), false),
+        None => (agent_adapters::detect_with(&choice).map_err(Error::Config)?, false),
     };
     let report = sandbox.report();
+    agent_adapters::check_required(choice.require, &report).map_err(Error::Config)?;
+    registry.adapt(&ToolEnv { sandbox: report.clone(), shell_rules: profile.shell.clone() });
+    let profile = profile.with_tools(registry.specs());
 
     // ---- gates
     let mut chain = GateChain::new();

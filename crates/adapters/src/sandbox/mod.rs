@@ -41,6 +41,83 @@ pub fn detect() -> Arc<dyn SandboxPort> {
     select().0
 }
 
+/// Sandbox selection preferences (the profile's `[sandbox]` table).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxChoice {
+    /// Try this implementation first (`bubblewrap`, `landlock`, `seatbelt`,
+    /// `none`); when it is unavailable the platform order applies.
+    pub prefer: Option<String>,
+    /// Fail instead of running commands without a sandbox.
+    pub require: bool,
+}
+
+/// [`detect`] honoring preferences. `Err` when `require` is set and no
+/// sandbox is available (the message carries the probe notes).
+pub fn detect_with(choice: &SandboxChoice) -> Result<Arc<dyn SandboxPort>, String> {
+    select_with(choice).map(|(s, _)| s)
+}
+
+/// [`probe`] honoring preferences (see [`detect_with`]).
+pub fn probe_with(choice: &SandboxChoice) -> Result<SandboxReport, String> {
+    select_with(choice).map(|(_, r)| r)
+}
+
+/// `Err` when `require` is set and `report` is not an available sandbox.
+pub fn check_required(require: bool, report: &SandboxReport) -> Result<(), String> {
+    if require && !report.available {
+        return Err(format!(
+            "sandbox.require is set but no sandbox is available ({}): {}",
+            report.implementation,
+            report.notes.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+/// A selected sandbox and its report.
+type Selected = (Arc<dyn SandboxPort>, SandboxReport);
+
+fn select_with(choice: &SandboxChoice) -> Result<Selected, String> {
+    let mut notes = vec![];
+    let preferred: Option<Result<Selected, String>> =
+        choice.prefer.as_deref().map(|p| match p {
+            "bubblewrap" | "bwrap" => BwrapSandbox::probe().map(|b| {
+                let r = b.report();
+                (Arc::new(b) as Arc<dyn SandboxPort>, r)
+            }),
+            "landlock" => LandlockSandbox::probe().map(|l| {
+                let r = l.report();
+                (Arc::new(l) as Arc<dyn SandboxPort>, r)
+            }),
+            "seatbelt" => {
+                let r = SeatbeltSandbox::probe_report();
+                if r.available {
+                    Ok((Arc::new(SeatbeltSandbox::new()) as Arc<dyn SandboxPort>, r))
+                } else {
+                    Err(r.notes.join("; "))
+                }
+            }
+            "none" => {
+                let d = DirectExec::new(vec!["sandbox.prefer = \"none\"".into()]);
+                let r = d.report();
+                Ok((Arc::new(d) as Arc<dyn SandboxPort>, r))
+            }
+            other => Err(format!("unknown sandbox `{other}`")),
+        });
+    let (port, mut report) = match preferred {
+        Some(Ok(chosen)) => chosen,
+        Some(Err(e)) => {
+            notes.push(format!("preferred sandbox `{}` unavailable: {e}", choice.prefer.as_deref().unwrap_or("")));
+            select()
+        }
+        None => select(),
+    };
+    notes.append(&mut report.notes);
+    report.notes = notes;
+    check_required(choice.require, &report)?;
+    Ok((port, report))
+}
+
 /// Linux preference: bubblewrap > landlock + seccomp > direct. The chosen
 /// report carries the reasons earlier candidates were rejected.
 fn select() -> (Arc<dyn SandboxPort>, SandboxReport) {

@@ -4,7 +4,7 @@
 
 use crate::ids::ModelId;
 use crate::model::ModelCaps;
-use crate::resource::AccessMode;
+use crate::resource::{AccessMode, EffectClass};
 use crate::tool::ToolSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -134,6 +134,49 @@ impl Default for SecurityConfig {
             isolation_available: false,
         }
     }
+}
+
+/// What a configured shell command does (see [`ShellRuleDef`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellEffect {
+    /// Pure: reads the workspace; runs in a read-only, offline sandbox.
+    ReadOnly,
+    /// LocalWrite on the workspace plus `git:refs`.
+    RepoWrite,
+    /// Behaviour defined by workspace files (`files`): authorization is bound
+    /// to their content hash. LocalWrite over the workspace, offline.
+    DefinitionBound,
+    /// Explicit `class`, `reads` and `writes` (`{ws}` = workspace root).
+    Custom,
+    /// Never analysed (always Opaque).
+    Opaque,
+}
+
+/// A shell semantic-table entry from configuration (`[[shell.commands]]`):
+/// an argv prefix and what it does. It only changes how commands are
+/// classified, so it only reduces approvals; the sandbox enforces the
+/// resulting declaration. Project layers may only add `opaque` entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ShellRuleDef {
+    /// Argv prefix, split on whitespace (`"just test"`).
+    pub prefix: String,
+    pub effect: ShellEffect,
+    /// Flags that make the command unanalysable (`-exec`, `--output`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_flags: Vec<String>,
+    /// `definition_bound`: the defining files (the first existing one is hashed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// `custom`: the class (default `local_write`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<EffectClass>,
+    /// `custom`: resource URIs read / written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    pub layer: Layer,
 }
 
 /// What to do with asks when nobody is attended.

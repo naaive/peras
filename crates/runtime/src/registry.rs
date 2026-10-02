@@ -1,7 +1,7 @@
 //! Tool registry: name -> tool, specs for the Static layer, and enrichment of
 //! model tool-use blocks into [`ToolCall`]s (access declaration + class).
 
-use crate::ports::{AccessCtx, Tool};
+use crate::ports::{AccessCtx, Tool, ToolEnv};
 use agent_proto::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,6 +27,17 @@ impl ToolRegistry {
     /// Register a tool under its spec name (replaces an existing one).
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
         self.tools.insert(tool.spec().name, tool);
+        self
+    }
+
+    /// Let every tool adapt to the execution environment ([`Tool::adapt`]),
+    /// e.g. `Bash` classifies commands only once a sandbox is known to exist.
+    pub fn adapt(&mut self, env: &ToolEnv) -> &mut Self {
+        for tool in self.tools.values_mut() {
+            if let Some(t) = tool.adapt(env) {
+                *tool = t;
+            }
+        }
         self
     }
 

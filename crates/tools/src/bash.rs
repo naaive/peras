@@ -1,15 +1,18 @@
 //! The `Bash` tool.
 //!
-//! `Bash` (a unit struct, usable as `.tools((read, edit, Bash))`) assumes no
-//! sandbox is available: every command is `Opaque`, exclusive over the
-//! workspace. `Bash::new(true)` returns a [`BashTool`] that applies the
-//! [`SemanticTable`] to classify commands; only use it when an OS sandbox
-//! enforces the compiled [`SandboxSpec`](agent_runtime::SandboxSpec).
+//! `Bash` (a unit struct, usable as `.tools((read, edit, Bash))`) knows
+//! nothing about the sandbox it will run in, so on its own every command is
+//! `Opaque`, exclusive over the workspace. Registered through the SDK it is
+//! adapted ([`Tool::adapt`]) to the probed sandbox: when an OS sandbox
+//! enforces the compiled [`SandboxSpec`](agent_runtime::SandboxSpec), the
+//! [`SemanticTable`] (extended by `[[shell.commands]]` from the profile)
+//! classifies commands. `Bash::new(true)` returns such a [`BashTool`]
+//! directly; only use it when an OS sandbox enforces the spec.
 
 use crate::caps::{check_granted, compile_spec};
-use crate::shell::{self, SemanticTable, ShellAnalysis};
+use crate::shell::{self, Rule, SemanticTable, ShellAnalysis};
 use agent_proto::{Access, EffectClass, ToolContent, ToolSpec};
-use agent_runtime::{AccessCtx, Tool, ToolCtx, ToolError, ToolOutput};
+use agent_runtime::{AccessCtx, Tool, ToolCtx, ToolEnv, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -77,6 +80,18 @@ impl BashTool {
     }
     pub fn sandbox_available(&self) -> bool {
         self.sandbox_available
+    }
+
+    /// This tool adapted to `env`: the semantic table applies only if the
+    /// sandbox is really available (never more than this tool already
+    /// assumed), and the configured rules extend the table.
+    fn adapted(&self, env: &ToolEnv) -> BashTool {
+        let mut table = (*self.table).clone();
+        table.extend(env.shell_rules.iter().map(Rule::from_def));
+        BashTool {
+            sandbox_available: self.sandbox_available && env.sandbox.available,
+            table: Arc::new(table),
+        }
     }
 
     /// The analysis used for access/class: the semantic table when a sandbox is
@@ -238,6 +253,9 @@ impl Tool for BashTool {
     async fn call(&self, input: Value, ctx: ToolCtx) -> Result<ToolOutput, ToolError> {
         self.run(input, ctx).await
     }
+    fn adapt(&self, env: &ToolEnv) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(self.adapted(env)))
+    }
 }
 
 #[async_trait]
@@ -253,6 +271,11 @@ impl Tool for Bash {
     }
     async fn call(&self, input: Value, ctx: ToolCtx) -> Result<ToolOutput, ToolError> {
         BashTool::default().run(input, ctx).await
+    }
+    /// Classify commands with the semantic table once a sandbox is known
+    /// to enforce the declarations.
+    fn adapt(&self, env: &ToolEnv) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(BashTool::new(true).adapted(env)))
     }
 }
 

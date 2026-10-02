@@ -626,4 +626,62 @@ fn documented_example_compiles() {
     assert!(p.kernel.read_only_mode);
     assert_eq!(p.hooks.len(), 1);
     assert!(p.mcp.contains_key("github"));
+    assert_eq!(p.shell.len(), 1);
+    assert!(p.sandbox.require);
+}
+
+#[test]
+fn sandbox_prefs_require_only_tightens() {
+    let mut s = src();
+    s.user = Some("[sandbox]\nprefer = \"landlock\"\nrequire = true\n".into());
+    s.shared_project = Some("[sandbox]\nrequire = false\nprefer = \"none\"\n".into());
+    let p = compile(&s).unwrap();
+    assert!(p.sandbox.require, "a project layer cannot drop `require`");
+    assert_eq!(p.sandbox.prefer.as_deref(), Some("landlock"), "a project layer cannot turn the sandbox off");
+    assert!(has_warning(&p, "sandbox.prefer"));
+    assert_eq!(p.explain("sandbox.require").unwrap().layer, Layer::User);
+
+    // Any layer can require a sandbox; a project layer may prefer a real one.
+    let mut s = src();
+    s.shared_project = Some("[sandbox]\nrequire = true\nprefer = \"bubblewrap\"\n".into());
+    let p = compile(&s).unwrap();
+    assert!(p.sandbox.require);
+    assert_eq!(p.sandbox.prefer.as_deref(), Some("bubblewrap"));
+
+    // The user may turn it off.
+    let mut s = src();
+    s.user = Some("[sandbox]\nprefer = \"none\"\n".into());
+    assert_eq!(compile(&s).unwrap().sandbox.prefer.as_deref(), Some("none"));
+}
+
+#[test]
+fn shell_rules_project_layers_only_opaque() {
+    let mut s = src();
+    s.user = Some(
+        "[[shell.commands]]\nprefix = \"just test\"\neffect = \"definition_bound\"\nfiles = [\"justfile\"]\n\
+         [[shell.commands]]\nprefix = \"tool\"\neffect = \"custom\"\nclass = \"pure\"\nreads = [\"fs://{ws}/**\"]\n"
+            .into(),
+    );
+    s.shared_project = Some(
+        "[[shell.commands]]\nprefix = \"python3\"\neffect = \"read_only\"\n\
+         [[shell.commands]]\nprefix = \"npm publish\"\neffect = \"opaque\"\n"
+            .into(),
+    );
+    let p = compile(&s).unwrap();
+    let got: Vec<(&str, agent_proto::ShellEffect, Layer)> =
+        p.shell.iter().map(|r| (r.prefix.as_str(), r.effect, r.layer)).collect();
+    use agent_proto::ShellEffect::*;
+    assert_eq!(
+        got,
+        vec![
+            ("just test", DefinitionBound, Layer::User),
+            ("tool", Custom, Layer::User),
+            ("npm publish", Opaque, Layer::SharedProject),
+        ]
+    );
+    assert_eq!(p.shell[0].files, vec!["justfile".to_string()]);
+    assert!(has_warning(&p, "shell.commands"), "the project's read_only rule is ignored");
+    let mut s = src();
+    s.user = Some("[[shell.commands]]\nprefix = \"  \"\neffect = \"opaque\"\n".into());
+    assert!(matches!(compile(&s), Err(ConfigError::Invalid { .. })));
 }

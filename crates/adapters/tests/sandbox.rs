@@ -277,3 +277,20 @@ async fn container_runs_when_available() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn prefer_and_require() {
+    use agent_adapters::sandbox::{probe_with, SandboxChoice};
+    let choice = |p: Option<&str>, require| SandboxChoice { prefer: p.map(str::to_string), require };
+    let r = probe_with(&choice(Some("none"), false)).unwrap();
+    assert_eq!((r.implementation.as_str(), r.available), ("none", false));
+    let e = probe_with(&choice(Some("none"), true)).unwrap_err();
+    assert!(e.contains("sandbox.require"), "{e}");
+    let r = probe_with(&choice(Some("nope"), false)).unwrap();
+    assert!(r.notes[0].contains("preferred sandbox `nope` unavailable"), "{:?}", r.notes);
+    assert_eq!(r.implementation, probe().implementation, "falls back to the platform order");
+    // `require` succeeds exactly when the platform has a sandbox.
+    assert_eq!(probe_with(&choice(None, true)).is_ok(), probe().available);
+    let e = agent_adapters::check_required(true, &DirectExec::default().report()).unwrap_err();
+    assert!(e.contains("no sandbox is available"), "{e}");
+}

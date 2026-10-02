@@ -10,7 +10,7 @@
 
 use crate::caps::sha256_hex;
 use crate::fsafe;
-use agent_proto::{Access, AccessMode, EffectClass, ResourceUri};
+use agent_proto::{Access, AccessMode, EffectClass, ResourceUri, ShellEffect, ShellRuleDef};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -425,6 +425,31 @@ impl Rule {
     pub fn deny(mut self, flags: &[&str]) -> Self {
         self.deny_flags.extend(flags.iter().map(|f| f.to_string()));
         self
+    }
+    /// A rule from configuration (`[[shell.commands]]`).
+    pub fn from_def(def: &ShellRuleDef) -> Rule {
+        let effect = match def.effect {
+            ShellEffect::ReadOnly => CommandEffect::ReadOnly,
+            ShellEffect::RepoWrite => CommandEffect::RepoWrite,
+            ShellEffect::DefinitionBound => CommandEffect::DefinitionBound {
+                files: def.files.clone(),
+            },
+            ShellEffect::Custom => CommandEffect::Custom {
+                class: def.class.unwrap_or(EffectClass::LocalWrite),
+                accesses: def
+                    .reads
+                    .iter()
+                    .map(|r| (r.clone(), AccessMode::Read))
+                    .chain(def.writes.iter().map(|w| (w.clone(), AccessMode::Write)))
+                    .collect(),
+            },
+            ShellEffect::Opaque => CommandEffect::Opaque,
+        };
+        Rule {
+            prefix: def.prefix.split_whitespace().map(str::to_string).collect(),
+            effect,
+            deny_flags: def.deny_flags.clone(),
+        }
     }
     fn denies(&self, args: &[String]) -> Option<String> {
         for a in args {

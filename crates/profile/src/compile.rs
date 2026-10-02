@@ -7,7 +7,7 @@ use crate::settings::*;
 use crate::sources::{Scope, SourceFile, Sources};
 use agent_proto::{
     Budgets, CompactionConfig, KernelConfig, Layer, ModelCaps, ModelId, OnAsk, PolicyAction, PolicyRule,
-    SecurityConfig, SnapshotRule,
+    SecurityConfig, ShellEffect, ShellRuleDef, SnapshotRule,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -488,10 +488,66 @@ impl Compiler {
         }
 
         // ---- sandbox / plan / instructions budget
-        let sandbox = SandboxPrefs {
-            prefer: self.pick("sandbox.prefer", None, |s| s.sandbox.as_ref().map(|x| x.prefer.clone()).filter(Option::is_some)),
-            require: self.pick("sandbox.require", false, |s| s.sandbox.as_ref().and_then(|x| x.require)),
-        };
+        // `prefer = "none"` turns the sandbox off: a project layer cannot ask
+        // for that. `require` only tightens: any layer can set it.
+        let prefs: Vec<(Layer, String)> = self
+            .layers
+            .iter()
+            .filter_map(|(l, s)| s.sandbox.as_ref().and_then(|x| x.prefer.clone()).map(|p| (*l, p)))
+            .collect();
+        let mut prefer = (Layer::Default, None);
+        for (l, p) in prefs {
+            if is_project(l) && p == "none" {
+                self.warn(l, "sandbox.prefer", "project layers cannot turn the sandbox off; ignored");
+                continue;
+            }
+            prefer = (l, Some(p));
+            break;
+        }
+        self.record("sandbox.prefer", &prefer.1, prefer.0);
+        let prefer = prefer.1;
+        let require_layer = self.layers.iter().find(|(_, s)| s.sandbox.as_ref().and_then(|x| x.require) == Some(true));
+        let (layer, require) = require_layer.map(|(l, _)| (*l, true)).unwrap_or((Layer::Default, false));
+        self.record("sandbox.require", &require, layer);
+        let sandbox = SandboxPrefs { prefer, require };
+
+        // ---- shell semantic table extensions (lower layers first: later
+        // entries win ties, so higher layers override)
+        let mut shell = vec![];
+        let mut shell_warn = vec![];
+        for (l, s) in self.layers.iter().rev() {
+            for c in s.shell.iter().flat_map(|x| &x.commands) {
+                if c.prefix.split_whitespace().next().is_none() {
+                    return Err(ConfigError::Invalid {
+                        layer: *l,
+                        key: "shell.commands".into(),
+                        message: "empty prefix".into(),
+                    });
+                }
+                if is_project(*l) && c.effect != ShellEffect::Opaque {
+                    shell_warn.push((*l, c.prefix.clone()));
+                    continue;
+                }
+                shell.push(ShellRuleDef {
+                    prefix: c.prefix.clone(),
+                    effect: c.effect,
+                    deny_flags: c.deny_flags.clone(),
+                    files: c.files.clone(),
+                    class: c.class,
+                    reads: c.reads.clone(),
+                    writes: c.writes.clone(),
+                    layer: *l,
+                });
+            }
+        }
+        for (l, p) in shell_warn {
+            self.warn(
+                l,
+                "shell.commands",
+                format!("sensitive field: project layers can only mark commands opaque; `{p}` ignored"),
+            );
+        }
+        self.record("shell.commands", &shell, shell.last().map(|r| r.layer).unwrap_or(Layer::Default));
         let read_only = self.pick("plan.read_only", false, |s| s.plan.as_ref().and_then(|p| p.read_only));
         let max_bytes = self.pick("instructions.max_bytes", DEFAULT_INSTRUCTION_BUDGET, |s| {
             s.instructions.as_ref().and_then(|i| i.max_bytes)
@@ -579,6 +635,7 @@ impl Compiler {
             commands,
             agents,
             sandbox,
+            shell,
             tool_allowlist: None,
             warnings: self.warnings,
             explain: self.explain,

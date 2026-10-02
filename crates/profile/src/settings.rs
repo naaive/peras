@@ -62,8 +62,13 @@
 //! pressure_ratio = 0.7
 //!
 //! [sandbox]
-//! prefer = "bubblewrap"
-//! require = true
+//! prefer = "bubblewrap"            # bubblewrap | landlock | seatbelt | none
+//! require = true                   # only tightens: any layer can require it
+//!
+//! [[shell.commands]]               # sensitive (project layers: opaque only)
+//! prefix = "just test"             # argv prefix; the longest match wins
+//! effect = "definition_bound"      # read_only | repo_write | definition_bound | custom | opaque
+//! files = ["justfile"]
 //!
 //! [plan]
 //! read_only = true
@@ -72,7 +77,7 @@
 //! max_bytes = 65536
 //! ```
 
-use agent_proto::{AccessMode, HookPoint, OnAsk, PolicyAction, SnapshotRule};
+use agent_proto::{AccessMode, EffectClass, HookPoint, OnAsk, PolicyAction, ShellEffect, SnapshotRule};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -108,6 +113,8 @@ pub struct Settings {
     pub compaction: Option<CompactionSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,6 +311,32 @@ pub struct SandboxSettings {
     /// Refuse to run commands when no sandbox is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require: Option<bool>,
+}
+
+/// `[[shell.commands]]`: extends the bash semantic table (sensitive: project
+/// layers may only add `opaque` entries).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellSettings {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<ShellCommandSetting>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellCommandSetting {
+    pub prefix: String,
+    pub effect: ShellEffect,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<EffectClass>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

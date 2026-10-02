@@ -130,6 +130,9 @@ pub struct Profile {
     pub commands: Vec<CommandDef>,
     pub agents: Vec<AgentDef>,
     pub sandbox: SandboxPrefs,
+    /// Shell semantic-table extensions (`[[shell.commands]]`), lowest layer first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shell: Vec<agent_proto::ShellRuleDef>,
     /// Tool-name allowlist (set for sub-agent profiles); applied by
     /// [`Profile::with_tools`] too, so narrowing survives late tool assembly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
