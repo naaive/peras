@@ -40,6 +40,10 @@ async fn writing_session_in_another_process_is_refused() {
     let e = writer.check().await.unwrap_err();
     assert!(matches!(&e, Error::WorkspaceLocked(m) if m.contains("separate git worktrees")), "{e}");
     assert!(e.to_string().contains(&format!("pid {}", child.id())), "names the holder: {e}");
+    // Running fails the same way; reading the profile (`agent doctor`) does not.
+    let e = writer.run("hi").await.unwrap_err();
+    assert!(e.to_string().contains("in use by another writing session"), "{e}");
+    assert!(writer.profile().await.is_ok());
     // A read-only agent takes no lock.
     let reader = Agent::new(Script::new().say("read")).workspace(d.path()).tools((read,));
     assert_eq!(reader.run("look").await.unwrap(), "read");

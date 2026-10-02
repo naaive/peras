@@ -88,8 +88,28 @@ pub(crate) struct Built {
     pub config: KernelConfig,
     pub profile_hash: String,
     pub profile: Profile,
-    /// Held while the agent can write the workspace (released with the last clone).
-    _lock: Option<WorkspaceLock>,
+    /// Writing agents: (workspace, lock directory) of the workspace lock.
+    lock: Option<(PathBuf, PathBuf)>,
+    /// Held from the first session on, released with the last clone.
+    held: std::sync::OnceLock<WorkspaceLock>,
+}
+
+impl Built {
+    /// One writing session per workspace (shared by the agents of this
+    /// process, e.g. sub-agents). Taken when a session opens, so building
+    /// the agent for its profile (`agent doctor`) never contends.
+    fn lock(&self) -> Result<(), Error> {
+        let Some((workspace, dir)) = &self.lock else { return Ok(()) };
+        if self.held.get().is_some() {
+            return Ok(());
+        }
+        let l = WorkspaceLock::acquire(workspace, dir).map_err(|e| match e {
+            LockError::Held { .. } => Error::WorkspaceLocked(e.to_string()),
+            LockError::Io { .. } => Error::Config(e.to_string()),
+        })?;
+        let _ = self.held.set(l);
+        Ok(())
+    }
 }
 
 /// An agent: a model, tools, policy, storage. Cheap to clone; clones share the
@@ -293,9 +313,10 @@ impl Agent {
         Chat::new(self.clone(), SessionId::new(id.into()))
     }
 
-    /// Fail early on configuration problems.
+    /// Fail early on configuration problems, and take the workspace lock of a
+    /// writing agent (`Error::WorkspaceLocked` when another process has it).
     pub async fn check(&self) -> Result<(), Error> {
-        self.built().await.map(|_| ())
+        self.built().await?.lock()
     }
 
     /// The compiled profile (after `check`/first run).
@@ -326,6 +347,7 @@ impl Agent {
     /// Open (create or resume) a session handle.
     pub(crate) async fn open(&self, id: &SessionId) -> Result<SessionHandle<Kernel>, Error> {
         let b = self.built().await?;
+        b.lock()?;
         let (cfg, hash) = (b.config.clone(), b.profile_hash.clone());
         let sid = id.clone();
         Ok(b.rt.open_session(id.clone(), move || agent_kernel::start_session(sid, hash, cfg)).await?)
@@ -432,17 +454,10 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     registry.adapt(&ToolEnv { sandbox: report.clone(), shell_rules: profile.shell.clone() });
     let profile = profile.with_tools(registry.specs());
 
-    // ---- one writing session per workspace (shared by the agents of this
-    // process, e.g. sub-agents); read-only agents take no lock.
+    // ---- one writing session per workspace: taken when the first session
+    // opens (see `Built::lock`); read-only agents take none.
     let writes = registry.specs().iter().any(|t| t.class != EffectClass::Pure || t.subagent);
-    let lock = if writes {
-        Some(WorkspaceLock::acquire(&workspace, &data_dir().join("locks")).map_err(|e| match e {
-            LockError::Held { .. } => Error::WorkspaceLocked(e.to_string()),
-            LockError::Io { .. } => Error::Config(e.to_string()),
-        })?)
-    } else {
-        None
-    };
+    let lock = writes.then(|| (workspace.clone(), data_dir().join("locks")));
 
     // ---- gates
     let mut chain = GateChain::new();
@@ -557,7 +572,7 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
         builder = builder.observer(o.clone());
     }
     let rt = builder.build();
-    Ok(Arc::new(Built { rt, config: kc, profile_hash, profile, _lock: lock }))
+    Ok(Arc::new(Built { rt, config: kc, profile_hash, profile, lock, held: Default::default() }))
 }
 
 /// Framework data directory (`$AGENT_DATA_DIR`, else `~/.agent`; inside
