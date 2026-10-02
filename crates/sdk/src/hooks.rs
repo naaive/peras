@@ -7,7 +7,8 @@
 //! is the response). Hooks may also make a judgment with the model: a model
 //! call (`{ prompt = ".." }`: the instruction plus the gate request) or a
 //! sub-agent (`{ agent = "name" }`: a sub-agent definition given the request
-//! as its task). Both consume tokens (metered with the runtime's usage).
+//! as its task). Both consume tokens: metered with the runtime's usage and
+//! charged to the budget of the session whose gate they evaluate.
 //!
 //! A hook's answer is either the protocol `Verdict` JSON or the short form
 //! `{"decision": "allow"|"deny"|"ask", "reason": "...", "context": "..."}`.
@@ -97,7 +98,17 @@ async fn execute(exec: &HookExecutor, env: &HookEnv, payload: &serde_json::Value
         HookExecutor::Subagent(s) => {
             let agent = env.agents.get(&s.agent).ok_or_else(|| format!("no sub-agent definition `{}`", s.agent))?;
             let task = format!("{VERDICT_FORMAT}\n\nRequest:\n{}", serde_json::to_string_pretty(payload).unwrap_or_default());
-            agent.run(task).await.map(Ok).map_err(|e| e.to_string())
+            let run = agent.run(task);
+            let child = run.session_id().clone();
+            let answer = run.await;
+            // The judging session's consumption is the gated session's.
+            if let Ok(rt) = agent.runtime().await {
+                if let Some(h) = rt.session(&child) {
+                    let (tokens, cost_micros) = h.with_state(agent_kernel::usage);
+                    agent_runtime::charge_hook_spend(Spend { tokens, cost_micros });
+                }
+            }
+            answer.map(Ok).map_err(|e| e.to_string())
         }
     }
 }
@@ -128,6 +139,8 @@ async fn model_judgment(env: &HookEnv, prompt: &str, max_tokens: u32, payload: &
                 if let Some(m) = env.link.metrics() {
                     m.observe_usage(&u);
                 }
+                // Charged to the budget of the session being gated.
+                agent_runtime::charge_hook_spend(Spend::of(&u));
             }
             _ => {}
         }

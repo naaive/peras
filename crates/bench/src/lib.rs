@@ -277,7 +277,7 @@ impl SessionDriver {
                     .collect(),
             ),
             Effect::Gate(_) => {
-                EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("bench".into()), remember: false }
+                EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("bench".into()), remember: false, spend: Default::default() }
             }
             Effect::Checkpoint(_) => EffectResult::Checkpointed(CheckpointInfo {
                 id: CheckpointId::new(format!("cp{}", self.log.len())),

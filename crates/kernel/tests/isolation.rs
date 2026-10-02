@@ -103,7 +103,7 @@ fn isolated_run_then_human_approves_the_diff() {
     assert_eq!(pending_questions(&h.s).len(), 1);
     assert_eq!(phase(&h.s), Phase::Acting);
     // Approved: merged, then the result is written with a note.
-    let eff = h.complete(*gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("u".into()), remember: false });
+    let eff = h.complete(*gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("u".into()), remember: false, spend: Default::default() });
     let [(mid, Effect::Merge(plan))] = &eff[..] else { panic!("{eff:?}") };
     assert!(plan.apply && plan.call.id == call.id);
     assert_eq!(h.count("tool_resulted"), 0, "nothing written before the merge");
@@ -242,7 +242,7 @@ fn disposable_env_does_not_vouch_for_host_tools_or_merges() {
     let eff = execute(&mut h, call.clone(), staged(&call, "", &[".agent/hooks.toml"]));
     let [(gid, Effect::Gate(req))] = &eff[..] else { panic!("{eff:?}") };
     assert_eq!(req.level, ApprovalLevel::Invariant);
-    let eff = h.complete(*gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::DisposableEnv, remember: false });
+    let eff = h.complete(*gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::DisposableEnv, remember: false, spend: Default::default() });
     let [(_, Effect::Merge(plan))] = &eff[..] else { panic!("{eff:?}") };
     assert!(!plan.apply, "{plan:?}");
 }
@@ -253,7 +253,7 @@ fn merge_failure_is_reported_to_the_model() {
     let call = isolated_bash_call("b1", "make");
     let eff = execute(&mut h, call.clone(), staged(&call, "", &["out"]));
     let [(gid, _)] = &eff[..] else { panic!() };
-    let eff = h.complete(*gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("u".into()), remember: false });
+    let eff = h.complete(*gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("u".into()), remember: false, spend: Default::default() });
     let [(mid, _)] = &eff[..] else { panic!() };
     h.complete(*mid, EffectResult::Merged(MergeReport { applied: vec![], error: Some("the workspace changed".into()) }));
     let text = final_text(&h, &call.id);

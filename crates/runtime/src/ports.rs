@@ -430,11 +430,14 @@ pub struct GateOutcome {
     pub verdict: Verdict,
     pub responder: Responder,
     pub remember: bool,
+    /// What hooks consumed judging with a model or a sub-agent (charged to
+    /// the session's budget). (ADDITIVE)
+    pub spend: Spend,
 }
 
 impl GateOutcome {
     pub fn new(verdict: Verdict, responder: Responder) -> Self {
-        GateOutcome { verdict, responder, remember: false }
+        GateOutcome { verdict, responder, remember: false, spend: Spend::default() }
     }
 }
 

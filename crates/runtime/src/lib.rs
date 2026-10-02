@@ -41,7 +41,7 @@ pub use assemble::Assembler;
 pub use cursors::{FileCursors, MemCursors};
 pub use dispatch::{Env, InstructionScan, ObserverResume, RuntimeOptions};
 pub use driver::{Applied, DriverError, Runtime, RuntimeBuilder, SessionHandle};
-pub use gate::{AnswerError, AskBoard, AutoRule, FnHook, FnRule, GateChain, Hook, FORWARDED_QUESTION_PREFIX};
+pub use gate::{charge_hook_spend, AnswerError, AskBoard, AutoRule, FnHook, FnRule, GateChain, Hook, FORWARDED_QUESTION_PREFIX};
 pub use metrics::{Histogram, HistogramSnapshot, Metrics, MetricsSnapshot, RuleStats};
 pub use lock::{LockError, WorkspaceLock};
 pub use mem::*;

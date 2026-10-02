@@ -242,7 +242,7 @@ impl Driver {
                 } else {
                     gate_verdict(&req, v)
                 };
-                EffectResult::Gated { verdict, responder, remember: v % 4 == 0 }
+                EffectResult::Gated { verdict, responder, remember: v % 4 == 0, spend: Default::default() }
             }
             Effect::Compact(_) | Effect::CompactRef(_) => {
                 if !benign && v % 10 == 9 {

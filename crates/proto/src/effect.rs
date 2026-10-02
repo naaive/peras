@@ -2,7 +2,7 @@
 
 use crate::envelope::Trust;
 use crate::ids::{CallId, CheckpointId, EffectId, EventId, Seq};
-use crate::model::{AssistantMessage, ModelError, SeqHead};
+use crate::model::{AssistantMessage, ModelError, SeqHead, Spend};
 use crate::render::Rendered;
 use crate::resource::Access;
 use crate::signal::{Control, Signal};
@@ -282,6 +282,10 @@ pub enum EffectResult {
         /// The human chose "allow this destination for the rest of the session".
         #[serde(default)]
         remember: bool,
+        /// What the hooks that gave the verdict consumed judging with a model
+        /// or a sub-agent (charged to the session's budget).
+        #[serde(default, skip_serializing_if = "Spend::is_zero")]
+        spend: Spend,
     },
     Compacted { summary: String, trust: Trust },
     CompactFailed(ModelError),

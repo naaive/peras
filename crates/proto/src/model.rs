@@ -65,6 +65,31 @@ impl Usage {
     }
 }
 
+/// Tokens and money consumed outside the session's own samples (hooks that
+/// judge with a model or a sub-agent), charged to the session's budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct Spend {
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub cost_micros: u64,
+}
+
+impl Spend {
+    /// What one model reply consumed (every token kind counts, like a sample).
+    pub fn of(u: &Usage) -> Spend {
+        let tokens = u.input_tokens as u64 + u.output_tokens as u64 + u.cache_read_tokens as u64 + u.cache_write_tokens as u64;
+        Spend { tokens, cost_micros: u.cost_micros }
+    }
+    pub fn is_zero(&self) -> bool {
+        self.tokens == 0 && self.cost_micros == 0
+    }
+    pub fn add(&mut self, other: Spend) {
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        self.cost_micros = self.cost_micros.saturating_add(other.cost_micros);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {

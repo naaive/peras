@@ -77,7 +77,7 @@ fn write_call_asks_then_checkpoints_then_executes() {
     // the late gate completion is ignored
     let (gid, _) = h.take("gate");
     let before = h.log.len();
-    h.complete(gid, EffectResult::Gated { verdict: Verdict::deny("late"), responder: Responder::Human("bob".into()), remember: false });
+    h.complete(gid, EffectResult::Gated { verdict: Verdict::deny("late"), responder: Responder::Human("bob".into()), remember: false, spend: Default::default() });
     assert_eq!(h.log.len(), before);
     let (cid, _) = h.take("checkpoint");
     let eff = h.complete(
@@ -325,7 +325,7 @@ fn unattended_policy_ask_goes_to_ring5_gate() {
     let Effect::Gate(req) = &eff[0].1 else { panic!() };
     assert_eq!((req.ring, req.level), (Ring::Human, ApprovalLevel::Policy));
     let (gid, _) = h.take("gate");
-    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::deny("unattended"), responder: Responder::Unattended, remember: false });
+    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::deny("unattended"), responder: Responder::Unattended, remember: false, spend: Default::default() });
     assert!(matches!(&eff[0].1, Effect::Sample(_)));
 }
 
@@ -337,7 +337,7 @@ fn auto_rule_cannot_answer_invariant() {
     h.sample(reply("", vec![b.clone()]));
     let (gid, Effect::Gate(req)) = h.take("gate") else { panic!() };
     assert_eq!(req.level, ApprovalLevel::Invariant);
-    h.complete(gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::AutoRule("yolo".into()), remember: false });
+    h.complete(gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::AutoRule("yolo".into()), remember: false, spend: Default::default() });
     assert!(!h.log.iter().any(|e| matches!(&e.body, Event::EffectIssued { effect: Effect::Execute(_), .. })));
     assert!(h.log.iter().any(|e| matches!(&e.body, Event::ToolResulted { result, .. } if result.is_error)));
 }
@@ -667,7 +667,7 @@ fn hook_rewrite_rechecks_and_depth_is_bounded() {
         let mut c2 = r.clone();
         c2.id = "whatever".into();
         c2.input = serde_json::json!({ "file": format!("/ws/a{i}") });
-        h.complete(gid, EffectResult::Gated { verdict: Verdict::Rewrite(Proposal::Call(c2)), responder: Responder::Hook("h".into()), remember: false });
+        h.complete(gid, EffectResult::Gated { verdict: Verdict::Rewrite(Proposal::Call(c2)), responder: Responder::Hook("h".into()), remember: false, spend: Default::default() });
     }
     // fourth rewrite exceeds depth 3 → denied, resample
     assert!(h.has("sample"), "{:?}", h.kinds());
@@ -687,7 +687,7 @@ fn hook_allow_cannot_loosen_policy_ask() {
     let w = write_call("w", "/ws/a");
     h.sample(reply("", vec![w]));
     let (gid, _) = h.take("gate");
-    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Hook("h".into()), remember: false });
+    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Hook("h".into()), remember: false, spend: Default::default() });
     let Effect::Gate(req) = &eff[0].1 else { panic!("{eff:?}") };
     assert_eq!(req.ring, Ring::Human);
 }
@@ -707,7 +707,7 @@ fn post_tool_rewrite_keeps_untrusted_trust() {
     let (gid, _) = h.take("gate");
     let mut clean = ok(&r, "cleaned");
     clean.trust = Trust::Guidance;
-    h.complete(gid, EffectResult::Gated { verdict: Verdict::Rewrite(Proposal::Result(clean)), responder: Responder::Hook("h".into()), remember: false });
+    h.complete(gid, EffectResult::Gated { verdict: Verdict::Rewrite(Proposal::Result(clean)), responder: Responder::Hook("h".into()), remember: false, spend: Default::default() });
     let tr = h.log.iter().find(|e| e.body.type_name() == "tool_resulted").unwrap();
     assert!(tr.trust.is_untrusted());
     let Event::ToolResulted { result, .. } = &tr.body else { panic!() };
@@ -723,12 +723,12 @@ fn stop_hook_continue_and_budget() {
     h.submit("go");
     h.sample(reply("done", vec![]));
     let (gid, _) = h.take("gate");
-    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Continue("tests not run".into()), responder: Responder::Hook("s".into()), remember: false });
+    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Continue("tests not run".into()), responder: Responder::Hook("s".into()), remember: false, spend: Default::default() });
     let Effect::Sample(p) = &eff[0].1 else { panic!("{eff:?}") };
     assert!(serde_json::to_string(p.body.last().unwrap()).unwrap().contains("tests not run"));
     h.sample(reply("done again", vec![]));
     let (gid, _) = h.take("gate");
-    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Continue("more".into()), responder: Responder::Hook("s".into()), remember: false });
+    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Continue("more".into()), responder: Responder::Hook("s".into()), remember: false, spend: Default::default() });
     assert!(matches!(&eff[0].1, Effect::Finish(TurnOutcome::Done { .. })), "budget exhausted: {eff:?}");
 }
 
@@ -741,7 +741,7 @@ fn user_submit_hook_blocks() {
     let (gid, Effect::Gate(req)) = eff[0].clone() else { panic!() };
     assert!(matches!(req.subject, GateSubject::UserSubmit { ref text } if text == "rm -rf /"));
     h.pending.clear();
-    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::deny("nope"), responder: Responder::Hook("u".into()), remember: false });
+    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::deny("nope"), responder: Responder::Hook("u".into()), remember: false, spend: Default::default() });
     assert!(matches!(&eff[0].1, Effect::Finish(TurnOutcome::Failed { .. })));
 }
 
@@ -769,14 +769,14 @@ fn defer_suspends_and_resume_reevaluates() {
     let r = read_call("c1", "/ws/a");
     h.sample(reply("", vec![r]));
     let (gid, _) = h.take("gate");
-    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Defer, responder: Responder::Hook("h".into()), remember: false });
+    let eff = h.complete(gid, EffectResult::Gated { verdict: Verdict::Defer, responder: Responder::Hook("h".into()), remember: false, spend: Default::default() });
     assert!(matches!(&eff[0].1, Effect::Finish(TurnOutcome::Suspended { .. })));
     assert_eq!(phase(&h.s), Phase::Suspended);
     let eff = h.control(Control::Resume);
     assert!(matches!(&eff[0].1, Effect::Gate(_)), "re-evaluated from ring 1: {eff:?}");
     // a new submit while suspended closes the pending call
     let (gid, _) = h.take("gate");
-    h.complete(gid, EffectResult::Gated { verdict: Verdict::Defer, responder: Responder::Hook("h".into()), remember: false });
+    h.complete(gid, EffectResult::Gated { verdict: Verdict::Defer, responder: Responder::Hook("h".into()), remember: false, spend: Default::default() });
     h.submit("never mind");
     assert_eq!(h.count("tool_resulted"), 1);
     assert_eq!(phase(&h.s), Phase::Sampling);
@@ -907,4 +907,31 @@ fn outstanding_request_is_the_one_captured_at_issue() {
         assert_eq!(id, sid);
         assert_eq!(serde_json::to_string(o).unwrap(), serde_json::to_string(p).unwrap());
     }
+}
+
+#[test]
+fn hook_spend_is_charged_to_the_session_budget() {
+    let mut c = cfg();
+    c.hooked = vec![HookPoint::PreTool];
+    c.budgets.max_tokens = 100;
+    let mut h = H::new(c);
+    h.submit("go");
+    let r = read_call("c1", "/ws/a");
+    h.sample(reply("", vec![r.clone()]));
+    let (gid, Effect::Gate(req)) = h.take("gate") else { panic!("{:?}", h.kinds()) };
+    assert_eq!(req.ring, Ring::Hook);
+    let spend = Spend { tokens: 150, cost_micros: 7 };
+    h.complete(gid, EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Hook("judge".into()), remember: false, spend });
+    let charged = h.log.iter().find_map(|e| match &e.body {
+        Event::UsageCharged { source, spend } => Some((source.clone(), *spend)),
+        _ => None,
+    });
+    assert_eq!(charged, Some(("hooks:pre_tool".to_string(), spend)));
+    assert_eq!(usage(&h.s), (150, 7));
+    // The hook's spend exhausted the budget: the turn ends instead of sampling again.
+    let (id, _) = h.take("execute");
+    let eff = h.complete(id, EffectResult::Executed(vec![ok(&r, "x")]));
+    assert!(eff.iter().any(|(_, e)| matches!(e, Effect::Finish(TurnOutcome::BudgetExhausted { .. }))), "{eff:?}");
+    // Replay charges it again (it is in the journal, hooks are not re-run).
+    assert_eq!(usage(&h.replay()), (150, 7));
 }

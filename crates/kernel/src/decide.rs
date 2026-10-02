@@ -587,8 +587,14 @@ impl Cx {
                 self.settle(id);
                 self.executed(batch, results);
             }
-            (Effect::Gate(req), EffectResult::Gated { verdict, responder, remember }) => {
+            (Effect::Gate(req), EffectResult::Gated { verdict, responder, remember, spend }) => {
                 self.settle(id);
+                if !spend.is_zero() {
+                    // Hooks that judged with a model or a sub-agent: their
+                    // consumption is the session's (before the verdict, so a
+                    // budget it exhausts already counts for what follows).
+                    self.internal(Event::UsageCharged { source: format!("hooks:{}", point_name(req.point)), spend });
+                }
                 self.gated(req, verdict, responder, remember);
             }
             (
@@ -1441,5 +1447,13 @@ impl Cx {
             return true;
         }
         false
+    }
+}
+
+/// A hook point's wire name (`pre_tool`...).
+fn point_name(p: HookPoint) -> String {
+    match serde_json::to_value(p) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => format!("{p:?}"),
     }
 }

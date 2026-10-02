@@ -185,7 +185,7 @@ impl Decider for Toy {
                         events.push(Draft::internal(Event::EffectSettled { id }));
                         issue(s, 0, Effect::Sample(prompt()), &mut events, &mut effects);
                     }
-                    EffectResult::Gated { verdict, responder, remember } => {
+                    EffectResult::Gated { verdict, responder, remember, .. } => {
                         events.push(Draft::internal(Event::Plugin {
                             kind: "remember".into(),
                             ignorable: true,

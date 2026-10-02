@@ -500,7 +500,7 @@ pub async fn gate(env: &Env, req: &GateRequest, ctx: GateCtx) -> Option<EffectRe
         _ = cancel.cancelled() => return None,
         r = env.gates.evaluate_outcome(req, &ctx) => r,
     };
-    Some(EffectResult::Gated { verdict: out.verdict, responder: out.responder, remember: out.remember })
+    Some(EffectResult::Gated { verdict: out.verdict, responder: out.responder, remember: out.remember, spend: out.spend })
 }
 
 pub async fn checkpoint(env: &Env, scope: &CheckpointScope) -> EffectResult {

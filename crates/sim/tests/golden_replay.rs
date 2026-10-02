@@ -145,7 +145,7 @@ impl World for Recorded {
                 let deny = matches!(&req.subject, GateSubject::Tool { call } if call.input["file"] == "/ws/CHANGELOG.md");
                 let verdict = if deny { Verdict::deny("not now") } else { Verdict::Allow };
                 let responder = if req.question.is_some() { Responder::Human("alice".into()) } else { Responder::Kernel };
-                EffectResult::Gated { verdict, responder, remember: false }
+                EffectResult::Gated { verdict, responder, remember: false, spend: Default::default() }
             }
             Effect::Checkpoint(_) => {
                 self.checkpoints += 1;

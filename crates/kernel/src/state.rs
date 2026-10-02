@@ -823,6 +823,10 @@ pub fn evolve(s: &mut State, ev: &Envelope<Event>) {
                 }
             }
         }
+        Event::UsageCharged { spend, .. } => {
+            s.tokens_used = s.tokens_used.saturating_add(spend.tokens);
+            s.cost_used = s.cost_used.saturating_add(spend.cost_micros);
+        }
         Event::VerdictRecorded { subject, point, ring, verdict, responder } => {
             on_verdict(s, subject, *point, *ring, verdict, responder)
         }

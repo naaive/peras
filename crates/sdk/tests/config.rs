@@ -176,6 +176,29 @@ async fn model_call_hook_judges_tool_calls() {
     assert!(denied_text(&chat.events().await.unwrap()).unwrap().contains("judged unsafe"));
     let judge = serde_json::to_string(&model.requests()[1].body).unwrap();
     assert!(judge.contains("Deny reads of README.") && judge.contains("\\\"pre_tool\\\""), "{judge}");
+    assert_hook_spend_charged(&agent, &chat).await;
+}
+
+/// The judging hook's consumption is journaled and charged to the session.
+async fn assert_hook_spend_charged(agent: &Agent, chat: &Chat) {
+    let events = chat.events().await.unwrap();
+    let charged: u64 = events
+        .iter()
+        .filter_map(|e| match &e.body {
+            Event::UsageCharged { source, spend } if source == "hooks:pre_tool" => Some(spend.tokens),
+            _ => None,
+        })
+        .sum();
+    assert!(charged > 0, "hook spend journaled");
+    let own: u64 = events
+        .iter()
+        .filter_map(|e| match &e.body {
+            Event::AssistantReplied { message, .. } => Some(agent::proto::Spend::of(&message.usage).tokens),
+            _ => None,
+        })
+        .sum();
+    let h = agent.runtime().await.unwrap().session(chat.id()).unwrap();
+    assert_eq!(h.with_state(agent::kernel::usage).0, own + charged, "charged to the session's budget");
 }
 
 #[tokio::test]
@@ -192,6 +215,7 @@ async fn subagent_hook_judges_tool_calls() {
     let chat = agent.session("judged-by-agent");
     assert_eq!(chat.send("read").await.unwrap(), "ok");
     assert!(denied_text(&chat.events().await.unwrap()).unwrap().contains("the judge said no"));
+    assert_hook_spend_charged(&agent, &chat).await;
 }
 
 /// A minimal Streamable HTTP MCP server with one tool, `check`, answering a

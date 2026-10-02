@@ -138,7 +138,21 @@ pub fn answer_to_verdict(a: &Answer) -> Verdict {
 /// the question offered a destination).
 pub fn answer_to_outcome(a: &Answer, responder: Responder) -> GateOutcome {
     let remember = matches!(a, Answer::Allow { remember: true });
-    GateOutcome { verdict: answer_to_verdict(a), responder, remember }
+    GateOutcome { verdict: answer_to_verdict(a), responder, remember, spend: Spend::default() }
+}
+
+tokio::task_local! {
+    /// What the hooks of the gate evaluation in progress consumed.
+    static HOOK_SPEND: Arc<Mutex<Spend>>;
+}
+
+/// Charge consumption to the session whose gate the current hook is
+/// evaluating: hooks that judge with a model or a sub-agent call this, and
+/// the [`GateChain`] reports the total with the verdict
+/// ([`GateOutcome::spend`]), which the kernel charges to the session's budget.
+/// Outside a hook evaluation it does nothing.
+pub fn charge_hook_spend(spend: Spend) {
+    let _ = HOOK_SPEND.try_with(|m| m.lock().unwrap().add(spend));
 }
 
 /// `Control::Answer::responder` string -> [`Responder`] ("code" = embedding code).
@@ -295,7 +309,16 @@ impl GateChain {
         v
     }
 
-    async fn run_hooks(&self, req: &GateRequest) -> (Verdict, Responder) {
+    /// The combined verdict, and what the hooks consumed (counted even when a
+    /// hook times out or fails after spending).
+    async fn run_hooks(&self, req: &GateRequest) -> (Verdict, Responder, Spend) {
+        let meter: Arc<Mutex<Spend>> = Arc::default();
+        let (v, r) = HOOK_SPEND.scope(meter.clone(), self.run_hooks_inner(req)).await;
+        let spend = *meter.lock().unwrap();
+        (v, r, spend)
+    }
+
+    async fn run_hooks_inner(&self, req: &GateRequest) -> (Verdict, Responder) {
         let mut best: Option<(Verdict, Responder)> = None;
         for h in self.hooks.iter().filter(|h| h.points().contains(&req.point)) {
             let name = h.name().to_string();
@@ -442,7 +465,10 @@ impl GateExecutor for GateChain {
                 let o = self.ask_human(req, None).await;
                 (o.verdict, o.responder)
             }
-            _ => self.run_hooks(req).await,
+            _ => {
+                let (v, r, _) = self.run_hooks(req).await;
+                (v, r)
+            }
         }
     }
 
@@ -456,8 +482,8 @@ impl GateExecutor for GateChain {
         match req.ring {
             Ring::Human => self.ask_human(req, Some(ctx)).await,
             _ => {
-                let (v, r) = self.run_hooks(req).await;
-                GateOutcome::new(v, r)
+                let (verdict, responder, spend) = self.run_hooks(req).await;
+                GateOutcome { verdict, responder, remember: false, spend }
             }
         }
     }

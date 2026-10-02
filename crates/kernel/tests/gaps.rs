@@ -8,7 +8,7 @@ use agent_proto::*;
 use common::*;
 
 fn hook(verdict: Verdict) -> EffectResult {
-    EffectResult::Gated { verdict, responder: Responder::Hook("h".into()), remember: false }
+    EffectResult::Gated { verdict, responder: Responder::Hook("h".into()), remember: false, spend: Default::default() }
 }
 
 fn annotate(text: &str, trust: Trust) -> Verdict {
@@ -226,7 +226,7 @@ fn remembered_destination_is_allowlisted_for_the_session() {
         match via {
             Via::Gated => {
                 let verdict = if allow { Verdict::Allow } else { Verdict::deny("no") };
-                h.complete(gid, EffectResult::Gated { verdict, responder, remember });
+                h.complete(gid, EffectResult::Gated { verdict, responder, remember, spend: Default::default() });
             }
             Via::Answer => {
                 let answer = if allow { Answer::Allow { remember } } else { Answer::Deny { reason: None } };

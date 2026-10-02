@@ -36,7 +36,7 @@ impl World for Scripted {
             Effect::Execute(b) => EffectResult::Executed(
                 b.calls.iter().map(|c| ToolResult::text(c.id.clone(), format!("{} ok", c.name), false)).collect(),
             ),
-            Effect::Gate(_) => EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("sim".into()), remember: false },
+            Effect::Gate(_) => EffectResult::Gated { verdict: Verdict::Allow, responder: Responder::Human("sim".into()), remember: false, spend: Default::default() },
             Effect::Checkpoint(_) => EffectResult::Checkpointed(CheckpointInfo { id: CheckpointId::new("cp"), agent_changes: vec![], external_changes: vec![] }),
             Effect::Compact(_) => EffectResult::Compacted { summary: "summary".into(), trust: Trust::Internal },
             Effect::Restore(_) => EffectResult::Restored(RestoreReport::default()),

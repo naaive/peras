@@ -3,7 +3,7 @@
 use crate::config::KernelConfig;
 use crate::effect::{CheckpointInfo, Effect, RestorePlan, RestoreReport, TurnOutcome};
 use crate::ids::{CallId, EffectId, EventId, ModelId, QuestionId, Seq, SessionId};
-use crate::model::{AssistantMessage, SeqHead};
+use crate::model::{AssistantMessage, SeqHead, Spend};
 use crate::signal::Attachment;
 use crate::tool::{ToolCall, ToolResult};
 use crate::verdict::{Answer, HookPoint, Question, Responder, Ring, Verdict};
@@ -131,6 +131,11 @@ pub enum Event {
     SubagentStarted { call: CallId, child: SessionId },
     SubagentFinished { call: CallId, child: SessionId, outcome: TurnOutcome },
 
+    // ---- budget ----
+    /// Consumption outside the session's own samples, charged to its budget:
+    /// hooks judging with a model or a sub-agent (`source` = `hooks:<point>`).
+    UsageCharged { source: String, spend: Spend },
+
     // ---- extensibility ----
     /// Plugin events. `ignorable` ones may be skipped by readers that do not
     /// know `kind`; unknown non-ignorable events refuse the session load.
@@ -183,6 +188,7 @@ impl Event {
             Event::RewindCompleted { .. } => "rewind_completed",
             Event::SubagentStarted { .. } => "subagent_started",
             Event::SubagentFinished { .. } => "subagent_finished",
+            Event::UsageCharged { .. } => "usage_charged",
             Event::Plugin { .. } => "plugin",
             Event::Tombstone { .. } => "tombstone",
         }
