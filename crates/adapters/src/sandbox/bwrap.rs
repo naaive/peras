@@ -288,7 +288,11 @@ impl SandboxPort for BwrapSandbox {
         cancel: CancellationToken,
     ) -> Result<ExecOutput, String> {
         let run = self.run_isolated(argv, spec, cancel).await?;
-        Ok(self.staging.stage(key, run))
+        super::isolate::stage_blocking(&self.staging, key, run).await
+    }
+
+    fn stage_in(&self, dir: &std::path::Path) {
+        self.staging.set_root(dir);
     }
 
     async fn merge(&self, key: &str, apply: bool) -> Result<Vec<String>, String> {

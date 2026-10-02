@@ -200,3 +200,29 @@ async fn approved_diff_over_a_concurrent_edit_is_not_applied() {
     assert!(!d.path().join("out.txt").exists(), "nothing applied");
     assert!(result.contains("changes NOT applied") && result.contains("README.md"), "{result}");
 }
+
+/// Records where it was told to keep staged runs.
+#[derive(Default, Clone)]
+struct StagingProbe(Arc<Mutex<Option<std::path::PathBuf>>>);
+
+#[async_trait]
+impl SandboxPort for StagingProbe {
+    fn report(&self) -> SandboxReport {
+        SandboxReport { implementation: "probe".into(), available: true, isolation: true, ..Default::default() }
+    }
+    async fn run(&self, _argv: &[String], _spec: &SandboxSpec, _cancel: CancellationToken) -> Result<ExecOutput, String> {
+        Ok(ExecOutput::default())
+    }
+    fn stage_in(&self, dir: &std::path::Path) {
+        *self.0.lock().unwrap() = Some(dir.to_path_buf());
+    }
+}
+
+#[agent::test]
+async fn staged_runs_are_kept_in_the_data_directory() {
+    let probe = StagingProbe::default();
+    let agent = Agent::new(Script::new().say("ok")).tools((Bash,)).sandbox(probe.clone());
+    agent.check().await.unwrap();
+    let data = agent::tools::testing::scope().unwrap().data_dir;
+    assert_eq!(probe.0.lock().unwrap().clone(), Some(data.join("staged")), "durable across restarts, keyed by call");
+}

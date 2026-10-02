@@ -11,14 +11,21 @@
 //! `.git/objects` is not copied: the copy gets an empty object store whose
 //! `info/alternates` points at the original (read-only) objects, so git reads
 //! work and new objects land in the copy.
+//!
+//! Runs awaiting review are kept by a [`Staging`] area on disk (durable in the
+//! framework data directory when [`Staging::set_root`] is given one), so a
+//! staged run survives a restart between the run and its merge, and merging
+//! is idempotent: a re-dispatched merge after a crash recognizes changes it
+//! already applied (design: crash recovery re-executes the merge per plan).
 
 use agent_runtime::ExecOutput;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
 /// Kind of change in an isolated run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
     Added,
     Modified,
@@ -26,7 +33,7 @@ pub enum ChangeKind {
 }
 
 /// One change, with a workspace-relative path (`/`-separated).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub path: String,
     pub kind: ChangeKind,
@@ -38,14 +45,14 @@ impl AsRef<str> for Change {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum Kind {
     Dir,
     File,
     Symlink(PathBuf),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Meta {
     kind: Kind,
     size: u64,
@@ -92,6 +99,15 @@ impl Meta {
                 mtime,
                 ctime: mtime,
             }))
+        }
+    }
+
+    /// Like [`Meta::of`], `None` also when `p` does not exist.
+    fn of_opt(p: &Path) -> io::Result<Option<Meta>> {
+        match Meta::of(p) {
+            Ok(m) => Ok(m),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -216,85 +232,316 @@ impl IsolatedCopy {
     pub fn conflicts<S: AsRef<str>>(&self, changes: &[S]) -> io::Result<Vec<String>> {
         let mut out = vec![];
         for c in changes {
-            let rel = c.as_ref();
-            let now = match Meta::of(&self.workspace.join(safe_rel(rel)?)) {
-                Ok(m) => m,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
-            };
-            let same = match (self.originals.get(rel), &now) {
-                (None, None) => true,
-                // A directory's own metadata changes with its entries; the
-                // entries are compared one by one.
-                (Some(a), Some(b)) if a.kind == Kind::Dir && b.kind == Kind::Dir => true,
-                (Some(a), Some(b)) => a.untouched(b),
-                _ => false,
-            };
-            if !same {
-                out.push(rel.to_string());
+            if !untouched_since(&self.workspace, &self.originals, c.as_ref())? {
+                out.push(c.as_ref().to_string());
             }
         }
         Ok(out)
     }
 }
 
-/// Isolated runs whose changes await review, by key (bounded: the oldest
-/// are discarded first, e.g. runs abandoned by a hard interrupt).
+/// `rel` in `workspace` is as it was when the copy was made (`originals`).
+fn untouched_since(workspace: &Path, originals: &BTreeMap<String, Meta>, rel: &str) -> io::Result<bool> {
+    let now = Meta::of_opt(&workspace.join(safe_rel(rel)?))?;
+    Ok(match (originals.get(rel), &now) {
+        (None, None) => true,
+        // A directory's own metadata changes with its entries; the entries
+        // are compared one by one.
+        (Some(a), Some(b)) if a.kind == Kind::Dir && b.kind == Kind::Dir => true,
+        (Some(a), Some(b)) => a.untouched(b),
+        _ => false,
+    })
+}
+
+/// Isolated runs whose changes await review, kept on disk by key until
+/// merged or discarded (bounded: the oldest are discarded first, e.g. runs
+/// abandoned by a hard interrupt).
+///
+/// Layout under the root (one directory per key, named by a hash of it):
+/// `<id>/manifest.json` (key, workspace, change list, the originals'
+/// metadata at copy time) and `<id>/ws/` holding the changed entries of the
+/// copy (a path absent there is a deletion). Once merged or discarded, a
+/// small `<id>.done.json` records the outcome and the copy is removed, so a
+/// merge re-dispatched after a crash reports the same outcome instead of
+/// "no longer available". A merge interrupted by a crash midway is resumed:
+/// paths that already hold the staged content are not re-applied, paths
+/// still as they were are applied, anything else is a conflict.
+///
+/// Without [`Staging::set_root`] the root is a private temporary directory
+/// (removed with the `Staging`): nothing survives a restart.
 #[derive(Debug, Default)]
 pub struct Staging {
-    runs: std::sync::Mutex<std::collections::VecDeque<(String, IsolatedRun)>>,
+    root: std::sync::Mutex<Option<PathBuf>>,
+    /// The temporary root used until one is set.
+    temp: std::sync::OnceLock<tempfile::TempDir>,
+    /// Serializes staging and merging.
+    lock: std::sync::Mutex<()>,
 }
 
 /// Staged runs kept at most.
 pub const MAX_STAGED: usize = 16;
+/// Outcome records kept at most (they are tiny; only needed until the merge
+/// is journaled).
+const MAX_DONE: usize = 256;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    key: String,
+    workspace: PathBuf,
+    /// Staging order (oldest discarded first).
+    created_ns: u128,
+    changes: Vec<Change>,
+    /// Metadata of the changed paths in the workspace when the copy was made.
+    originals: BTreeMap<String, Meta>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Done {
+    key: String,
+    apply: bool,
+    applied: Vec<String>,
+    /// Nothing was applied: why (e.g. conflicting workspace changes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+const NO_LONGER_AVAILABLE: &str = "the staged changes are no longer available (discarded, or lost in a restart)";
 
 impl Staging {
+    /// A staging area kept under `root` (created if missing): staged runs
+    /// survive a restart of the process.
+    pub fn durable(root: impl Into<PathBuf>) -> Self {
+        let s = Staging::default();
+        s.set_root(root);
+        s
+    }
+
+    /// Keep staged runs under `root` from now on (e.g. the framework data
+    /// directory, keyed by call). Runs staged before stay where they are.
+    pub fn set_root(&self, root: impl Into<PathBuf>) {
+        *self.root.lock().unwrap_or_else(|e| e.into_inner()) = Some(root.into());
+    }
+
+    fn root(&self) -> io::Result<PathBuf> {
+        if let Some(r) = self.root.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            std::fs::create_dir_all(&r)?;
+            return Ok(r);
+        }
+        if let Some(t) = self.temp.get() {
+            return Ok(t.path().to_path_buf());
+        }
+        let t = tempfile::Builder::new().prefix("agent-staged-").tempdir()?;
+        Ok(self.temp.get_or_init(|| t).path().to_path_buf())
+    }
+
     /// Keep `run` under `key` when it changed anything; returns its output.
-    pub fn stage(&self, key: &str, run: IsolatedRun) -> ExecOutput {
+    /// A run staged earlier under the same key is replaced.
+    pub fn stage(&self, key: &str, run: IsolatedRun) -> Result<ExecOutput, String> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.stage_locked(key, run).map_err(|e| format!("staging the changes: {e}"))
+    }
+
+    fn stage_locked(&self, key: &str, run: IsolatedRun) -> io::Result<ExecOutput> {
+        let root = self.root()?;
+        let id = entry_id(key);
+        let (dir, done) = (root.join(&id), root.join(format!("{id}.done.json")));
+        remove_any(&dir)?;
+        remove_any(&done)?;
         let out = run.output.clone();
         if run.changes.is_empty() {
-            return out;
+            return Ok(out);
         }
-        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        runs.retain(|(k, _)| k != key);
-        while runs.len() >= MAX_STAGED {
-            runs.pop_front();
+        // Built aside, then renamed into place: a crash never leaves a
+        // half-written entry under the key's name.
+        let tmp = tempfile::Builder::new().prefix(".staging-").tempdir_in(&root)?;
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws)?;
+        for c in &run.changes {
+            let rel = safe_rel(&c.path)?;
+            keep_entry(&run.copy.path().join(&rel), &ws.join(&rel))?;
         }
-        runs.push_back((key.to_string(), run));
-        out
+        let originals = run
+            .changes
+            .iter()
+            .filter_map(|c| run.copy.originals.get(&c.path).map(|m| (c.path.clone(), m.clone())))
+            .collect();
+        let created_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let m = Manifest { key: key.to_string(), workspace: run.copy.workspace().to_path_buf(), created_ns, changes: run.changes, originals };
+        write_json(&tmp.path().join("manifest.json"), &m)?;
+        std::fs::rename(tmp.keep(), &dir)?;
+        self.bound(&root)?;
+        Ok(out)
+    }
+
+    /// Discard the oldest staged runs beyond [`MAX_STAGED`] and the oldest
+    /// outcome records beyond [`MAX_DONE`].
+    fn bound(&self, root: &Path) -> io::Result<()> {
+        let mut staged = vec![];
+        let mut done = vec![];
+        for e in std::fs::read_dir(root)? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.ends_with(".done.json") {
+                let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                done.push((t, e.path()));
+            } else if let Ok(m) = read_json::<Manifest>(&e.path().join("manifest.json")) {
+                staged.push((m.created_ns, e.path()));
+            }
+        }
+        staged.sort();
+        for (_, p) in staged.iter().take(staged.len().saturating_sub(MAX_STAGED)) {
+            remove_any(p)?;
+        }
+        done.sort();
+        for (_, p) in done.iter().take(done.len().saturating_sub(MAX_DONE)) {
+            remove_any(p)?;
+        }
+        Ok(())
     }
 
     /// Apply (after checking for conflicting workspace changes) or discard
-    /// the run staged under `key`. Either way it is gone afterwards.
+    /// the run staged under `key`. Idempotent: merging again (e.g. the merge
+    /// re-dispatched after a crash) returns the same outcome.
     pub fn merge(&self, key: &str, apply: bool) -> Result<Vec<String>, String> {
-        let run = {
-            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-            let i = runs.iter().position(|(k, _)| k == key);
-            i.and_then(|i| runs.remove(i)).map(|(_, r)| r)
-        };
-        let Some(run) = run else {
-            return Err("the staged changes are no longer available (discarded, or the process restarted)".into());
-        };
-        if !apply {
-            return Ok(vec![]);
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let root = self.root().map_err(|e| e.to_string())?;
+        let id = entry_id(key);
+        let (dir, done_path) = (root.join(&id), root.join(format!("{id}.done.json")));
+        if let Ok(d) = read_json::<Done>(&done_path) {
+            if d.key == key {
+                return match (d.apply, apply) {
+                    (true, true) => d.error.map_or(Ok(d.applied), Err),
+                    (false, false) => Ok(vec![]),
+                    (true, false) => Err("the staged changes were already applied".into()),
+                    (false, true) => Err(NO_LONGER_AVAILABLE.into()),
+                };
+            }
         }
-        let conflicts = run.copy.conflicts(&run.changes).map_err(|e| e.to_string())?;
-        if !conflicts.is_empty() {
-            return Err(format!(
-                "the workspace changed since the command ran, nothing applied; conflicting: {}",
-                conflicts.join(", ")
-            ));
-        }
-        apply_isolated_changes(run.copy.path(), run.copy.workspace(), &run.changes).map_err(|e| e.to_string())
+        let m = match read_json::<Manifest>(&dir.join("manifest.json")) {
+            Ok(m) if m.key == key => m,
+            _ => return Err(NO_LONGER_AVAILABLE.into()),
+        };
+        // Either way the run is gone afterwards; the outcome is recorded first.
+        let r = if apply { apply_staged(&dir.join("ws"), &m) } else { Ok(vec![]) };
+        let done = Done { key: key.to_string(), apply, applied: r.clone().unwrap_or_default(), error: r.clone().err() };
+        write_json(&done_path, &done).map_err(|e| e.to_string())?;
+        remove_any(&dir).map_err(|e| e.to_string())?;
+        r
     }
 
+    /// Staged runs awaiting review.
     pub fn len(&self) -> usize {
-        self.runs.lock().map(|r| r.len()).unwrap_or(0)
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(root) = self.root() else { return 0 };
+        std::fs::read_dir(root)
+            .map(|rd| rd.filter_map(Result::ok).filter(|e| e.path().join("manifest.json").is_file()).count())
+            .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// [`Staging::stage`] off the async runtime.
+pub(crate) async fn stage_blocking(staging: &std::sync::Arc<Staging>, key: &str, run: IsolatedRun) -> Result<ExecOutput, String> {
+    let (staging, key) = (staging.clone(), key.to_string());
+    tokio::task::spawn_blocking(move || staging.stage(&key, run)).await.map_err(|e| e.to_string())?
+}
+
+/// Apply the staged entries (`ws`, the changed paths only) of `m`. Paths
+/// already holding the staged result (a merge interrupted by a crash) are
+/// kept and reported applied; the others must be as they were when the copy
+/// was made, else nothing more is applied.
+fn apply_staged(ws: &Path, m: &Manifest) -> Result<Vec<String>, String> {
+    let mut already = vec![];
+    let mut pending = vec![];
+    let mut conflicts = vec![];
+    for c in &m.changes {
+        let rel = safe_rel(&c.path).map_err(|e| e.to_string())?;
+        if holds_staged(ws, &m.workspace, &rel).map_err(|e| e.to_string())? {
+            already.push(c.path.clone());
+        } else if untouched_since(&m.workspace, &m.originals, &c.path).map_err(|e| e.to_string())? {
+            pending.push(c.path.clone());
+        } else {
+            conflicts.push(c.path.clone());
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "the workspace changed since the command ran, nothing applied; conflicting: {}",
+            conflicts.join(", ")
+        ));
+    }
+    let mut applied = already;
+    applied.extend(apply_isolated_changes(ws, &m.workspace, &pending).map_err(|e| e.to_string())?);
+    Ok(applied)
+}
+
+/// `workspace/rel` already equals the staged entry (`ws/rel`; absent there =
+/// deleted).
+fn holds_staged(ws: &Path, workspace: &Path, rel: &Path) -> io::Result<bool> {
+    let staged = ws.join(rel);
+    let current = workspace.join(rel);
+    Ok(match (Meta::of_opt(&staged)?, Meta::of_opt(&current)?) {
+        (None, None) => true,
+        (Some(s), Some(c)) => match (&s.kind, &c.kind) {
+            (Kind::Dir, Kind::Dir) => s.mode == c.mode,
+            (Kind::Symlink(a), Kind::Symlink(b)) => a == b,
+            (Kind::File, Kind::File) => s.mode == c.mode && s.size == c.size && files_equal(&staged, &current)?,
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+/// Keep one changed entry of the copy: files are moved when possible (same
+/// file system), else copied; directories keep their permissions; symlinks
+/// are recreated.
+fn keep_entry(src: &Path, dst: &Path) -> io::Result<()> {
+    let m = match std::fs::symlink_metadata(src) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // a deletion
+        Err(e) => return Err(e),
+    };
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if m.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        std::fs::set_permissions(dst, m.permissions())?;
+    } else if m.file_type().is_symlink() {
+        symlink(&std::fs::read_link(src)?, dst)?;
+    } else if m.is_file() {
+        if std::fs::hard_link(src, dst).is_err() {
+            copy_file(src, dst)?;
+        }
+        std::fs::set_permissions(dst, m.permissions())?;
+    }
+    Ok(())
+}
+
+/// Directory name for `key`: its SHA-256 (keys contain `/`).
+fn entry_id(key: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(key.as_bytes()))[..32].to_string()
+}
+
+fn write_json<T: Serialize>(path: &Path, v: &T) -> io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new().prefix(".tmp-").tempfile_in(dir)?;
+    serde_json::to_writer(&mut tmp, v).map_err(io::Error::other)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
 /// Result of an isolated run: the output, the typed change list and the copy
@@ -620,36 +867,96 @@ mod tests {
         w(&root.join("a"), "1");
         let staging = Staging::default();
         // Nothing changed: nothing staged.
-        staging.stage("s/none", run_in_copy(root, |_| {}));
+        staging.stage("s/none", run_in_copy(root, |_| {})).unwrap();
         assert!(staging.is_empty());
+        assert!(staging.merge("s/none", true).unwrap_err().contains("no longer available"));
         // Staged, then merged.
-        let out = staging.stage("s/c1", run_in_copy(root, |c| w(&c.join("a"), "2")));
+        let out = staging.stage("s/c1", run_in_copy(root, |c| w(&c.join("a"), "2"))).unwrap();
         assert_eq!(out.overlay_changes, vec!["a"]);
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "1", "staged only");
         assert_eq!(staging.merge("s/c1", true).unwrap(), vec!["a"]);
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "2");
-        assert!(staging.merge("s/c1", true).unwrap_err().contains("no longer available"));
+        assert!(staging.is_empty());
+        // Merging again (re-dispatched after a crash) reports the same outcome.
+        assert_eq!(staging.merge("s/c1", true).unwrap(), vec!["a"]);
+        assert!(staging.merge("s/c1", false).is_err(), "already applied");
         // Discarded.
-        staging.stage("s/c2", run_in_copy(root, |c| w(&c.join("b"), "new")));
+        staging.stage("s/c2", run_in_copy(root, |c| w(&c.join("b"), "new"))).unwrap();
         assert_eq!(staging.merge("s/c2", false).unwrap(), Vec::<String>::new());
         assert!(!root.join("b").exists());
         // The original changed meanwhile: nothing applied.
         staging.stage("s/c3", run_in_copy(root, |c| {
             w(&c.join("a"), "3");
             w(&c.join("c"), "x");
-        }));
+        }))
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         w(&root.join("a"), "user");
         let e = staging.merge("s/c3", true).unwrap_err();
         assert!(e.contains("conflicting: a"), "{e}");
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "user");
         assert!(!root.join("c").exists());
+        assert_eq!(staging.merge("s/c3", true).unwrap_err(), e, "the same outcome again");
         // Bounded: the oldest are dropped.
         for i in 0..MAX_STAGED + 2 {
-            staging.stage(&format!("s/{i}"), run_in_copy(root, |c| w(&c.join("d"), "d")));
+            staging.stage(&format!("s/{i}"), run_in_copy(root, |c| w(&c.join("d"), "d"))).unwrap();
         }
         assert_eq!(staging.len(), MAX_STAGED);
         assert!(staging.merge("s/0", false).is_err());
+    }
+
+    #[test]
+    fn durable_staging_survives_restarts_and_merges_idempotently() {
+        let ws = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let (root, dir) = (ws.path(), data.path().join("staged"));
+        w(&root.join("a"), "1");
+        w(&root.join("gone"), "g");
+        let change = |c: &Path| {
+            w(&c.join("a"), "2");
+            w(&c.join("new/f"), "n");
+            std::fs::remove_file(c.join("gone")).unwrap();
+        };
+        // Staged, then the process "restarts": a new staging area on the
+        // same directory still has the run.
+        Staging::durable(&dir).stage("s/c1", run_in_copy(root, change)).unwrap();
+        let staging = Staging::durable(&dir);
+        assert_eq!(staging.len(), 1);
+        let applied = staging.merge("s/c1", true).unwrap();
+        assert_eq!(applied, vec!["gone", "a", "new", "new/f"]);
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "2");
+        assert!(!root.join("gone").exists());
+        // Crash after applying, before the merge was journaled: the merge is
+        // re-dispatched after a restart and reports the same outcome.
+        assert_eq!(Staging::durable(&dir).merge("s/c1", true).unwrap(), applied);
+        assert_eq!(std::fs::read_to_string(root.join("new/f")).unwrap(), "n");
+
+        // Crash in the middle of applying: what was applied is recognized,
+        // the rest is applied.
+        Staging::durable(&dir).stage("s/c2", run_in_copy(root, |c| {
+            w(&c.join("a"), "3");
+            w(&c.join("b"), "b");
+        }))
+        .unwrap();
+        w(&root.join("a"), "3"); // applied before the crash
+        let mut applied = Staging::durable(&dir).merge("s/c2", true).unwrap();
+        applied.sort();
+        assert_eq!(applied, vec!["a", "b"]);
+        assert_eq!(std::fs::read_to_string(root.join("b")).unwrap(), "b");
+        // ...but a path changed by someone else is still a conflict.
+        Staging::durable(&dir).stage("s/c3", run_in_copy(root, |c| w(&c.join("a"), "4"))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        w(&root.join("a"), "user");
+        assert!(Staging::durable(&dir).merge("s/c3", true).unwrap_err().contains("conflicting: a"));
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "user");
+        // Discarding is idempotent too; the copies are gone afterwards.
+        Staging::durable(&dir).stage("s/c4", run_in_copy(root, |c| w(&c.join("z"), "z"))).unwrap();
+        assert_eq!(Staging::durable(&dir).merge("s/c4", false).unwrap(), Vec::<String>::new());
+        assert_eq!(Staging::durable(&dir).merge("s/c4", false).unwrap(), Vec::<String>::new());
+        assert!(!root.join("z").exists());
+        assert!(Staging::durable(&dir).is_empty());
+        // Unknown keys: nothing to merge.
+        assert!(Staging::durable(&dir).merge("s/other", true).unwrap_err().contains("no longer available"));
     }
 
     #[cfg(unix)]

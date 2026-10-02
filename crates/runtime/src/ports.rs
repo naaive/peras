@@ -182,6 +182,10 @@ pub trait SandboxPort: Send + Sync {
     async fn merge(&self, _key: &str, _apply: bool) -> Result<Vec<String>, String> {
         Err("no staged changes".into())
     }
+    /// Keep staged runs under `dir` (durable across restarts, keyed by
+    /// call), so a merge after a crash still finds them. Default: no-op.
+    /// (ADDITIVE)
+    fn stage_in(&self, _dir: &std::path::Path) {}
 }
 
 /// Key under which a call's isolated run is staged.

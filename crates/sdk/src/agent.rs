@@ -691,6 +691,9 @@ async fn build(cfg: Config) -> Result<Arc<Built>, Error> {
     };
     let report = sandbox.report();
     agent_adapters::check_required(choice.require, &report).map_err(Error::Config)?;
+    // Isolated runs awaiting review are kept in the data directory, keyed by
+    // call: a crash between the run and its merge loses nothing.
+    sandbox.stage_in(&data_dir().join("staged"));
 
     // ---- tools
     let link = Arc::new(Link::default());
