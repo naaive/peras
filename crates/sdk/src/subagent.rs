@@ -125,8 +125,11 @@ pub(crate) fn from_definitions(
         c.name = def.name.clone();
         c.description = def.description.clone();
         c.fork = def.fork;
-        // The parent's checkpointer covers the workspace.
+        // The parent's checkpointer covers the workspace; the parent's
+        // reload covers the configuration (a child's sessions keep the
+        // configuration narrowed at spawn).
         c.shadow = false;
+        c.hot_reload = false;
         out.insert(def.name.clone(), Agent::from_config(c));
     }
     out
@@ -205,7 +208,7 @@ fn from_parent(link: &Link, session: &SessionId, fork: bool, own: &Budgets) -> R
 enum Resume {
     /// The task still has to be sent.
     Fresh,
-    /// A turn is running (or suspended): wait for its end.
+    /// A turn is running: wait for its end.
     Running,
     /// The task's turn already ended.
     Ended(TurnOutcome),
@@ -216,8 +219,9 @@ fn resume_state(events: &[Envelope<Event>]) -> Resume {
     let ended = events.iter().rposition(|e| matches!(e.body, Event::TurnEnded { .. }));
     match (started, ended) {
         (None, _) => Resume::Fresh,
+        // A suspended child ended its turn as far as the parent is concerned
+        // (the same outcome the first dispatch would have reported).
         (Some(s), Some(e)) if e > s => match &events[e].body {
-            Event::TurnEnded { outcome: TurnOutcome::Suspended { .. } } => Resume::Running,
             Event::TurnEnded { outcome } => Resume::Ended(outcome.clone()),
             _ => unreachable!(),
         },

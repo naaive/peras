@@ -94,7 +94,7 @@ pub(crate) struct Config {
     /// A precompiled profile (sub-agent definitions): no discovery, no MCP.
     pub(crate) preset: Option<Profile>,
     /// Watch configuration files and reconfigure sessions on change.
-    hot_reload: bool,
+    pub(crate) hot_reload: bool,
     /// Look for instruction files in the subdirectories tools access (`None`
     /// = only in discover mode).
     instructions_on_access: Option<bool>,
